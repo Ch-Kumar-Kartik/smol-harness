@@ -199,7 +199,7 @@ The harness's provider vocabulary is deliberately tiny. It maps 1:1 to effGen ca
 
 | Tool name (ours) | Backing effGen tool | Boundary |
 |---|---|---|
-| `file_operations` | `FileOperations(allowed_directories=[workspace])` | Path containment and credential deny-list (effGen) |
+| `file_operations` | `FileOperations(allowed_directories=[workspace])`, built by `tools.build_tools` (T4.1) | Path containment and credential deny-list (effGen). The factory validates the workspace and checks effGen kept it as the root, since effGen silently falls back to the cwd for a missing directory. Path validation only, not a sandbox (check-then-use race, hard links). |
 | `shell` | Thin subclass of `CodeExecutor(workdir=workspace)`. Exposes only `command` (+ optional `timeout` ≤ cap). Pins `language="bash"` and `network_enabled=False`, plus a configured memory limit. Process env sets `EFFGEN_SANDBOX_BACKEND=subprocess`. | Linux user + mount + net (+ pid) namespaces: writes only inside the workspace, private `/tmp`, no network, timeout. **Reads are not confined.** This is not a VM or container boundary. |
 | `delegate` | ours | Orchestrator only |
 

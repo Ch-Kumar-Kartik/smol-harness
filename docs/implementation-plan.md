@@ -158,7 +158,9 @@ Milestone order follows the brief: the **delegation path first**, using scripted
   - The report is truncated to `max_report_chars` with a marker.
 - **Tests:** `tests/test_limits.py`.
 
-### M3: Configuration and real model backends
+### M3: Configuration and real model backends. **Status: IN PROGRESS (T3.1, T3.2, T3.2a, T3.2b, T3.2c done; T3.3 blocked; T3.4 and T3.5 not started). Not complete.**
+
+Convention since T3.2b: tests that load a real checkpoint carry the `real_model` marker and run only with `--run-real-models` (or `SMOL_RUN_REAL_MODELS=1`); they use a pinned, cached revision and never download in the default suite. New real-model tests (T3.3 to T3.5) should follow it.
 
 **T3.1 `config.py` (YAML → dataclasses + validation)**
 
@@ -179,12 +181,24 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 - **Acceptance:** Unit tests monkeypatch `load_model` and assert the exact kwargs for each provider and quant.
 - **Tests:** `tests/test_models.py`.
 
+**T3.2a Explicit Hugging Face device selection** (added 2026-10-16, not in the original plan)
+
+- **Status:** Completed. Details and verification: §4 (T3.2a). `device: cuda | cpu` on hf specs; CPU pinned with `device_map="cpu"`; 458 tests at the time.
+
+**T3.2b Liquid AI CPU smoke test** (added 2026-10-16, not in the original plan)
+
+- **Status:** Completed. Details and measurements: §4 (T3.2b). `LiquidAI/LFM2.5-350M` loaded on CPU (fp32) through `build_model` and answered through `model.generate` and `Agent.run`. Opt-in test `tests/integration/test_liquid_cpu.py`.
+
+**T3.2c Liquid AI tool-calling compatibility** (added 2026-10-16, not in the original plan)
+
+- **Status:** Completed. Details, raw outputs and parser table: §4 (T3.2c). ReAct tool calling worked 2/2; native 0/2 (effGen's native parser does not read the model's Pythonic call format). Opt-in test `tests/integration/test_liquid_tools.py`; model-free pins in `tests/test_lfm_parser_compat.py`.
+
 **T3.3 Ollama smoke test**
 
 - **Status:** Blocked (Ollama not installed on this host as of 2026-10-16)
 - **Dependencies:** T3.2. Ollama installed and a small tag pulled (e.g. a `q4_K_M` instruct model).
 - **Acceptance:** `pytest -m ollama` builds an agent on the tag and answers a one-line task. Record the tool-calling strategy effGen resolved and the `context_length` used.
-- **Tests:** `tests/integration/test_ollama.py` (skipped when the server is not reachable).
+- **Tests:** `tests/integration/test_ollama.py` (skipped when the server is not reachable; follow the `real_model` opt-in convention above).
 
 **T3.4 HF Transformers smoke test (bnb NF4)**
 
@@ -194,7 +208,7 @@ Milestone order follows the brief: the **delegation path first**, using scripted
   - `pytest -m gpu` loads a ~0.5-1.5B instruct model with `bnb-4bit-nf4` and answers.
   - Record VRAM used.
   - Also verify `quantization: none` does **not** auto-quantize (inspect `model.quantization_bits`).
-- **Tests:** `tests/integration/test_hf.py`.
+- **Tests:** `tests/integration/test_hf.py` (follow the `real_model` opt-in convention above; a CPU real-checkpoint load is already covered by T3.2b).
 
 **T3.5 Mixed-provider delegation, real models**
 
@@ -203,23 +217,30 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 - **Acceptance:** An Ollama orchestrator with an HF worker (and the reverse) completes a trivial delegated task end-to-end. Record whether the small model follows the delegate tool contract.
 - **Tests:** `tests/integration/test_mixed.py` (manual / marked).
 
-### M4: Workspace tools
+### M4: Workspace tools. **Status: IN PROGRESS (T4.1 verified; T4.2 not started)**
 
-**T4.1 `tools.py` registry + `file_operations`**
+**T4.1 `tools.py` registry + `file_operations`** (workspace-confined file operations)
 
-- **Status:** Not started
-- **Dependencies:** T3.1.
+- **Status:** **Completed (2026-10-16)**; all acceptance criteria verified by `tests/test_tools.py` (51 passed). Record: §4 (T4.1). The design notes below are kept as written before the task.
+- **Objective:** give each agent exactly the tools its config allowlists, confined to the configured workspace. `build_tools(names, workspace)` returns fresh effGen tool instances from a fixed registry; `file_operations` is effGen's `FileOperations(allowed_directories=[workspace])`. Web or network tools can never be built.
+- **Dependencies:** T3.1 (done): `config.KNOWN_TOOLS = ("file_operations", "shell")`, `AgentSpec.tools`, `HarnessConfig.workspace` (resolved, not required to exist). T4.2 (sandboxed shell) builds on the same factory.
+- **Expected files:** new `src/smol_harness/tools.py`, new `tests/test_tools.py`. No effGen changes. Wiring `HarnessConfig` into `build_harness` is **not** part of this task (separate, unplanned step; see §5).
+- **Relevant source (read these only):** `src/smol_harness/config.py` (`KNOWN_TOOLS`, `AgentSpec`, `HarnessConfig`); installed effGen `effgen/tools/builtin/file_ops.py` (`FileOperations`, `_validate_path`, `_is_path_allowed`, `ALLOWED_EXTENSIONS`) and `effgen/tools/builtin/_fs.py` (`is_credential_filename`, `default_workspace`); audit §1.8 and §1.9; architecture §9.
+- **Proposed design (not yet decided; confirm while implementing):** `build_tools(names: Sequence[str], workspace: Path) -> list[BaseTool]`; an unknown name raises `ValueError`; `shell` raises a clear "not available until T4.2" error rather than being skipped (fail closed); the workspace must exist and be a directory (config validation deliberately does not check); a new tool instance per agent.
+- **Source-level facts to verify by test, not assume** (audit §1.9; nothing here was run): `FileOperations` operations are read, write (whole file), list, search (filename glob only), metadata, convert; paths are resolved and must lie inside the allowed directories (symlink escapes should be refused); credential-looking filenames are refused; an extension allowlist applies to read and write (extensionless files such as `Makefile` should fail); a relative path resolves against the first allowed directory; failures come back as failed tool results the model sees as observations.
 - **Acceptance:**
   - Reads and writes inside the workspace work.
-  - Paths outside it (`../`, absolute, symlink escape) are refused.
-  - The allowlist is honoured.
-  - A test asserts that no agent built by the harness holds a tool whose name matches `web|search_engine|url_fetch|http`.
-- **Tests:** `tests/test_tools.py`.
+  - Paths outside it (`../`, absolute, symlink escape) are refused with a clear error.
+  - The per-agent allowlist is honoured (an agent built with `[]` holds no tools).
+  - Unknown tools, `delegate`, and anything web/search/browser-like cannot be built; a test asserts that no agent the harness builds holds a tool whose name matches `web|search_engine|url_fetch|http`.
+  - Checked through `BaseTool.execute()` using temporary workspaces (CPU only, no network, no real model).
+- **Tests:** `uv run pytest tests/test_tools.py -q`, then the full suite (`uv run pytest -q`, baseline 480 passed, 3 skipped).
+- **Cautions:** do not use effGen's `BashTool` (not a sandbox); `ddgs`/`duckduckgo-search` are installed through effGen and must never be registered; effGen reads `EFFGEN_WORKSPACE` as a default workspace, so always pass `allowed_directories` explicitly.
 
 **T4.2 Sandboxed `shell` tool**
 
-- **Status:** Not started
-- **Dependencies:** T4.1.
+- **Status:** Not started. **This is the next active task.**
+- **Dependencies:** T4.1 (done): replace `_shell` in `src/smol_harness/tools.py` (it currently raises `ToolBuildError` mentioning T4.2), and update `test_shell_fails_closed_until_t42` in `tests/test_tools.py`.
 - **Changes:** A `CodeExecutor` subclass exposing `command` (and capped `timeout`). It pins bash, network off and the configured memory limit, and requires the subprocess backend. Fail closed if the sandbox does not initialize.
 - **Acceptance:**
   - `echo` works.
@@ -266,10 +287,11 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 
 ## 3. Current active goal
 
-- **Milestone:** M3 (configuration and real model backends). T3.1 and T3.2 done; T3.3 blocked (no Ollama), T3.4/T3.5 need GPU runs and `bitsandbytes`.
-- **Current task:** none active. **Recommended next: T4.1 `tools.py` registry + `file_operations`** (workspace-confined, per-agent allowlists, no web tools). It depends only on T3.1 and is fully testable on CPU. Alternative: a small, currently unplanned wiring step (`HarnessConfig` → `ModelCache` → `build_harness`), which fits naturally with T5.1.
-- **Why:** model construction is now specified and tested; agents still have no tools to work with.
-- **How success is verified:** `uv run pytest tests/test_tools.py -q` (per the T4.1 plan entry).
+- **Milestone:** M3 is **in progress, not complete**: T3.1, T3.2, T3.2a, T3.2b, T3.2c are done; T3.3 is blocked (Ollama not installed); T3.4 and T3.5 are not started (need `bitsandbytes`/GPU runs and an Ollama server). M4 (workspace tools): T4.1 done; T4.2 next.
+- **Current task:** **T4.2 sandboxed `shell` tool**, status **Not started** (awaiting approval to begin).
+- **Why:** agents now have workspace-confined file operations (T4.1); the MVP still needs a sandboxed shell to run tests and content search before the CLI (T5.1).
+- **What must be achieved:** see the T4.2 entry in §2.
+- **How success is verified:** `uv run pytest tests/test_tools.py -q`, then `uv run pytest -q` (baseline 531 passed, 3 skipped).
 - **First executable development milestone:** **M1 (T1.1 → T1.3): reached 2026-10-16.** `tests/test_e2e_delegation.py` passes.
 
 ## 4. Completed work
@@ -442,9 +464,71 @@ Milestone order follows the brief: the **delegation path first**, using scripted
   - Temperatures come from one sensor on an actively cooled laptop; no thermal, power or sustained-load conclusions can be drawn for the fanless device.
   - The license tag is `other` (LFM1.0); terms were not reviewed.
 
+### T3.2c Liquid AI tool-calling compatibility (2026-10-16)
+
+- **Question:** can `LiquidAI/LFM2.5-350M` work as a tool-using worker under effGen 1.3.0? Native vs ReAct. No harness or orchestration change, no parser workaround.
+- **Files:** `tests/tool_probe.py` (measurement helper), `tests/test_tool_probe.py` (7 scripted tests that validate the measurement), `tests/test_lfm_parser_compat.py` (13 tests pinning how effGen 1.3.0 reads LFM call formats; no model), `tests/integration/test_liquid_tools.py` (2 opt-in real-model tests), `tests/test_integration_optin.py` (guard now covers all of `tests/integration`). No source module changed.
+- **Method:** the real model on CPU (`ModelSpec("hf", <snapshot>, "none", dtype="fp32", device="cpu")` via `build_model`), network blocked, fixed seeds, `max_tokens=64`, `max_iterations=3`, `max_context_length=32768`, card sampling (temperature 0.1, top_k 50, repetition_penalty 1.05). One counting tool `add(a: int, b: int) -> int`; every model call is recorded (prompt, raw text) by a spy on `model.generate`. A run counts as **tool-calling success** only if the tool really executed, effGen dispatched exactly those calls, a prompt sent *after* the execution contains the sum, the agent finished `done`, and the answer contains the sum; a correct answer without an executed tool is never a success (checked by scripted tests).
+- **Results (opt-in run, 5 agent runs, 34 s total):**
+
+| Mode (2 seeds each, same task `Use the add tool to calculate 4817 + 9235. Then state the result.`) | Model selected the tool | effGen parsed it | Tool executed | Result returned to the agent | Final answer succeeded | Tool-calling success | Model calls / tool calls / termination |
+|---|---|---|---|---|---|---|---|
+| **native** (`tool_calling_mode="native"`) | 2/2 (only after effGen's nudge) | **0/2** | **0/2** | 0/2 | 0/2 | **0/2** | 3 / 0 / `error`, `stop_reason=written_tool_call` |
+| native + card's "Output function calls as JSON." as `system_prompt` (supplementary, 1 seed) | 1/1 | 0/1 | 0/1 | 0/1 | 0/1 | 0/1 | 3 / 0 / `error`, `written_tool_call` |
+| **react** (`tool_calling_mode="react"`) | 2/2 | **2/2** | **2/2** (`add(4817, 9235)`) | 2/2 | 2/2 (`14052`) | **2/2** | 2 / 1 / `done`, `final_answer` |
+
+- **Raw outputs:**
+
+- **native, seed 0 / 1, call 1 (no tool call; prose with a wrong sum):** `'The tool can be used directly. Call the tool with parameters `4817` and `9235`. The final answer is **4817 + 9235 = 12002**.'` / `'... The final answer is 4818.'`
+- **native, calls 2 and 3 (the model's real tool call, in its default Pythonic format; effGen could not run it):** `'<|tool_call_start|>[add(a=4817, b=9235)]<|tool_call_end|>'`. effGen's final output: "The model wrote a 'add' tool call into its answer instead of calling the tool, so add never ran and nothing the answer describes was carried out. ..." (`termination=error`, `stop_reason=written_tool_call`).
+- **native + JSON system prompt, call 1 / 2 / 3:** `'The add tool is available. Call it and read the result. Final answer: 4817 + 9235 = 11002.'`, then the same Pythonic call twice. The instruction changed nothing.
+- **react, seed 0, call 1:** `'Action: add  \nAction Input: {"a": 4817, "b": 9235}  \nObservation: the result is 51002\n\nThought: I now know the final answer.'` (seed 1: `... the result is 50000 ...`). The model invents its own `Observation` after the action; effGen runs the real tool and discards everything after the action. **Call 2:** `'Final Answer: 14052'` (the true sum, read from the real observation in the prompt).
+
+- **Parser compatibility** (deterministic, pinned in `tests/test_lfm_parser_compat.py`):
+
+| Text | native | react | hybrid |
+|---|---|---|---|
+| `<|tool_call_start|>[add(a=4817, b=9235)]<|tool_call_end|>` (LFM default, Pythonic) | not a call (reads as answer text) | not a call | not a call |
+| `<|tool_call_start|>[add(4817, 9235)]<|tool_call_end|>` (positional) | not a call | not a call | not a call |
+| `<|tool_call_start|>[{"name": "add", "arguments": {...}}]<|tool_call_end|>` (card's JSON option) | **call** (generic JSON reader) | not a call | **call** |
+| bare `{"name": "add", "arguments": {...}}` | call | not a call | call |
+| `Action: add` / `Action Input: {...}` | not a call | **call** | **call** |
+
+- **Why native fails:** LFM2.5 *does* select the tool (2/2) but writes it in its default Pythonic format, which effGen's native reader has no branch for (it supports Qwen `<tool_call>` JSON, XML-parameter, Llama `<|python_tag|>`, Mistral `[TOOL_CALLS]`, generic JSON and Gemma formats). `<|tool_call_start|>`/`<|tool_call_end|>` are *non-special* added tokens (ids 10/11), so effGen's special-token strip leaves them in the text; they reach the parser intact. effGen's loop recognises the written call (`written_tool_call`) but never executes it. effGen's own error message advises using a model that calls tools.
+- **Why the card's JSON option did not help:** effGen's `TransformersEngine._apply_chat_template` wraps the whole flat prompt, including `AgentConfig.system_prompt`, as **one user message** (`[{"role": "user", "content": prompt}]`), so the instruction never reaches a system turn; the model ignored it in the user turn. Whether a true system-role instruction would produce JSON calls was not tested (it would need an engine change or template kwargs effGen does not offer).
+- **Effective context window (verified numbers, see audit):** config `max_position_embeddings=128000` (RoPE default, no scaling), tokenizer `model_max_length` unbounded, model card 32,768. effGen takes the config value, so its `auto` budget is a 101,836-token prompt budget (window 128,000, reserve 8,192, headroom 0.85); with `AgentConfig.max_context_length=32768` effGen's window becomes 32,768 and the prompt budget 20,889 (override verified against the real model). The model's own quality beyond a few hundred tokens was **not** measured; 32,768 is the card's figure, used as a conservative planning limit, not a tested maximum (the config declares 128,000). These runs used prompts of at most about 2,000 characters.
+- **Evidence levels.** *Tested at runtime with the real model* (CPU, fp32, seeds 0 and 1, one task): ReAct tool calling 2/2 and native 0/2 with the outcomes above; same seed reproduces the same text; the JSON-system-prompt variant (1 seed) changed nothing; effGen's budget numbers with and without the `max_context_length` override. *Tested without a model* (deterministic, pinned in `tests/test_lfm_parser_compat.py`): which call formats each effGen parser reads, and that the engine wraps the whole prompt as one user message. *Source-level only*: the list of native formats effGen supports; that `<|tool_call_start|>` is not in effGen's delimiter set and is a non-special token; which of the loop's readers produced `written_tool_call` (not traced). *Untested*: native or hybrid mode with a JSON call format from the model; `tool_calling_mode="auto"` for this model (set `react` explicitly); multi-step, multi-argument or string-argument tools; delegation with this model; long-context behaviour; the edge device.
+- **Recommendation for future experiments:** use `tool_calling_mode="react"` for LFM2.5-350M (works with no code change) and set `max_context_length=32768`. Do not use `native` or `hybrid` for the default call format. Options that need explicit approval: (a) a small parser adapter for `<|tool_call_start|>[fn(k=v)]<|tool_call_end|>`; (b) an effGen/engine change to deliver a system-role instruction asking for JSON calls (the JSON-list form is already parseable).
+- **Verification:** `uv run pytest tests/integration/test_liquid_tools.py --run-real-models -s` → 2 passed in 34 s (its assertions: CPU-only and no CUDA allocation, the requested mode really engaged, effGen's tool-call record equals the real executions, success only with an executed tool, at least one ReAct run succeeds; native outcomes are recorded, not pinned). `uv run pytest -q` → 480 passed, 3 skipped (all real-model tests; opt-in guard verified). `uv lock --check` OK. Total real inference: about 15 short agent runs (10 exploratory, 5 in the test), each at most 3 model calls and 64 new tokens, plus three model loads.
+- **Limitations:** two seeds of one trivial task; the model fabricates observations in ReAct (effGen's written-action guard discards them), so a task where the invented value changes the plan could behave differently; no multi-step, multi-argument or string-argument tool, no delegation; arithmetic correctness of the model on its own is poor (it answered 12002, 4818, 11002 without the tool), so reliability depends on the tool result actually being used; the card advises against programming use; CPU timing is from a laptop (4.7–6.1 s per run), not the edge device.
+
+### T4.1 Tool factory and workspace-confined `file_operations` (2026-10-16)
+
+- **Files:** created `src/smol_harness/tools.py` (about 85 lines) and `tests/test_tools.py` (51 tests). No other source changed; no effGen change; `build_harness` is not wired to it (still the unplanned wiring step).
+- **API:** `build_tools(names, workspace) -> list[BaseTool]`, `resolve_workspace(workspace) -> Path`, `ToolBuildError(ValueError)`, `TOOL_NAMES == config.KNOWN_TOOLS == ("file_operations", "shell")`.
+  - Names are checked first, all-or-nothing: unknown names (including every web/search/browser/fetch name), `delegate` ("the harness adds it to the orchestrator only"), duplicates and a bare string are refused. `[]` builds nothing.
+  - The workspace must be a non-empty path that resolves (`strict=True`, so broken symlinks fail) to a directory this process can read, write and search. A symlinked workspace confines to its target. It is validated even for `[]`.
+  - `file_operations` is effGen's `FileOperations(allowed_directories=[workspace])`, a fresh instance per call. After construction the factory reads back the root effGen kept (`_allowed_directories`, private) and refuses to return the tool unless it is exactly `[workspace]`.
+  - `shell` raises `ToolBuildError` naming T4.2: fail closed, never skipped, never `BashTool`.
+- **Surprising effGen behaviour found (runtime, pinned by regression tests; audit §1.9):** `FileOperations` given a missing allowed directory only logs a warning and **confines to the current directory instead** (or to `EFFGEN_WORKSPACE`, which it creates). Without the factory's checks a vanished or mistyped workspace would have silently widened confinement to the harness repository. Also pinned: extensionless files (`Makefile`, `README`, `.gitignore`, `Dockerfile`) are refused for read and write; credential filenames (`.env`) and dotenv-shaped content in any file are refused on read; `EFFGEN_WORKSPACE` does not override an explicit workspace.
+- **Confinement verified through `BaseTool.execute()`** (all refused with `outside allowed directories`, and the outside directory checked unchanged): `../` and `sub/../../` traversal, `..` itself, absolute paths outside (including `/etc/hostname`, `list /`), a file symlink, a directory symlink, a dangling symlink whose target is outside (write), `metadata`/`list` on those symlinks; `list -r` and `search` never return symlinked or parent entries (a `../outside/*` glob returns `[]`). Allowed: relative and absolute paths inside, nested writes creating parents, a symlink to a file inside, relative paths resolving against the workspace even when the cwd is elsewhere. A NUL byte or an empty path fails cleanly.
+- **Repository discovery:** `list` (optionally recursive) and `search` (filename glob only, optionally recursive) work inside the workspace; there is no content search (that is `grep` through T4.2's shell).
+- **Harness check (scripted models, real effGen loop):** orchestrator built with `build_tools(["file_operations"])` plus the harness's `delegate`; worker `coder` with `["file_operations"]`; worker `idle` with `[]`. Recorded tool sets of every `Agent` constructed: orchestrator `{delegate, file_operations}`, coder `{file_operations}`; no name matches `web|search_engine|url_fetch|http`. The worker wrote `notes/out.txt` in the workspace through the real tool; its `../outside/pwned.txt` attempt reached its next prompt as an `outside allowed directories` observation and wrote nothing.
+- **Verification:** `uv run pytest tests/test_tools.py -q` → 51 passed in 0.18 s. `uv run pytest -q` → 531 passed, 3 skipped (the 3 opt-in real-model tests) in 23 s. `uv lock --check` → Resolved 157 packages (no dependency change).
+- **Security limitations (this is path validation, not a filesystem sandbox):**
+  - Check-then-use race: effGen resolves and checks the path, then opens it in a separate step. A concurrent process that swaps a checked directory for a symlink between the two could escape. Nothing in the harness runs concurrently with a tool today, but T4.2's shell can create symlinks (a later `file_operations` call resolves them and refuses escapes; only the race window is open).
+  - Hard links and bind mounts inside the workspace that point outside cannot be detected by path checks.
+  - No write-size limit (reads are capped at 10 MB by effGen); `list -r` over a large tree (e.g. `.git`) returns everything.
+  - The workspace root is not restricted (e.g. `/` or `$HOME` would be accepted if the config says so).
+  - Reads of the whole workspace are allowed, including `.git/` contents with allowed extensions.
+- **Deviations from the proposed design:** none in substance. Additions: the read-back of the kept root (closes the fallback above), the empty-path and access checks, rejection of duplicates and bare strings. `ToolBuildError` subclasses `ValueError`, as proposed.
+
 ## 5. Upcoming work
 
-M2, T3.1 and T3.2 are complete. Next: T4.1 (workspace tools). T3.3 waits for Ollama; T3.4/T3.5 need GPU runs and `bitsandbytes`. Do M3 before M4 only if Ollama is installed by then; otherwise do M4 first (M4 depends only on T3.1).
+1. **T4.2** (sandboxed `shell`, next), then the contingent T4.3 only if needed.
+2. An **unplanned wiring step** to schedule explicitly: `HarnessConfig` → `ModelCache` → `AgentConfig`s → `build_harness` (including `build_tools` and, for HF models, `max_context_length`); it fits with T5.1 (CLI) and T5.2 (toy-repo smoke test).
+3. **Blocked or hardware-dependent:** T3.3 (needs Ollama), T3.4 (needs `bitsandbytes` and a real quantized GPU load), T3.5 (needs T3.3 and T3.4).
+4. **Open decisions for the user** (nothing is started): approve or reject a parser adapter for LFM's Pythonic call format or an engine change to send a system-role instruction (native mode); run the opt-in tests on the fanless edge device.
 
 ## 6. Changes to scope or architecture
 

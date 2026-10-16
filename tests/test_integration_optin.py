@@ -18,12 +18,12 @@ def _pytest(*args: str, extra_env: dict[str, str] | None = None) -> subprocess.C
 
 
 def test_real_model_tests_are_skipped_without_the_flag():
-    run = _pytest("tests/integration/test_liquid_cpu.py", "-rs")
+    run = _pytest("tests/integration", "-rs")  # every real-model test, including future ones
     assert run.returncode == 0, run.stdout + run.stderr
-    assert "1 skipped" in run.stdout and "--run-real-models" in run.stdout
+    assert "3 skipped" in run.stdout and "--run-real-models" in run.stdout
     assert "passed" not in run.stdout and "failed" not in run.stdout
 
 
 def test_the_marker_alone_does_not_opt_in():
-    run = _pytest("tests/integration/test_liquid_cpu.py", "-m", "real_model")
-    assert run.returncode == 0 and "1 skipped" in run.stdout
+    run = _pytest("tests/integration", "-m", "real_model")
+    assert run.returncode == 0 and "3 skipped" in run.stdout
