@@ -70,13 +70,13 @@ Milestone order follows the brief: the **delegation path first**, using scripted
   - effGen's base install is heavy (torch, google SDKs, docker, ddgs).
   - The torch/CUDA wheel must match the driver. Record the actual install command in `docs/new-session.md` Quick Start.
 
-### M1: First executable milestone, the delegation path (scripted models, CPU only)
+### M1: First executable milestone, the delegation path (scripted models, CPU only). **Status: COMPLETE (T1.1–T1.3 verified)**
 
 > Goal: an effGen orchestrator delegates a task to an independent effGen worker, receives a structured result, and continues execution.
 
 **T1.1 Scripted-model test fixture**
 
-- **Status:** Not started
+- **Status:** Completed (2026-10-16). Verification: see §4.
 - **Objective:** A deterministic effGen `BaseModel` fake that replays scripted ReAct turns.
 - **Modules:** `tests/conftest.py`.
 - **Dependencies:** T0.1.
@@ -87,7 +87,7 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 
 **T1.2 `WorkerResult` + `DelegateTool` + `WorkerRegistry`**
 
-- **Status:** Not started
+- **Status:** Completed (2026-10-16), with scope deviations listed in §4. Verification: see §4.
 - **Objective:** The smallest delegation unit.
 - **Modules:** `src/smol_harness/delegation.py`.
 - **Dependencies:** T1.1.
@@ -109,7 +109,7 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 
 **T1.3 End-to-end orchestrator → worker → orchestrator (scripted)**
 
-- **Status:** Not started
+- **Status:** Completed (2026-10-16). All 7 acceptance points verified; see §4.
 - **Objective:** Prove the M1 goal.
 - **Modules:** `src/smol_harness/harness.py` (minimal `build_harness` taking in-code specs with model *instances*), `tests/test_e2e_delegation.py`.
 - **Dependencies:** T1.2.
@@ -130,7 +130,7 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 
 **T2.1 `DeadlineMiddleware` per-worker timeout**
 
-- **Status:** Not started
+- **Status:** Completed (2026-10-16). Verification: see §4. (Test names differ from the plan's `test_worker_timeout`; the acceptance is covered by `test_orchestrator_continues_after_worker_timeout_real_clock` and the `test_deadline_exceeded_*` tests.)
 - **Modules:** `delegation.py`.
 - **Dependencies:** T1.3.
 - **Changes:** The middleware raises `WorkerTimeout` in `before_model_call` / `before_tool_call` after the deadline. `DelegateTool` maps it to `status="timeout"`.
@@ -266,12 +266,12 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 
 ## 3. Current active goal
 
-- **Milestone:** M0, then M1.
-- **Current task:** **T1.1 Scripted-model test fixture** (Not started; awaiting approval to begin M1).
-- **Why:** T1.2/T1.3 need a deterministic fake `BaseModel` to drive effGen agents on CPU.
-- **What must be achieved:** see T1.1 acceptance criteria.
-- **How success is verified:** `uv run pytest tests/test_scripted_model.py -q`.
-- **First executable development milestone:** **M1 (T1.1 → T1.3)**. It is CPU-only, uses scripted models, and ends when `tests/test_e2e_delegation.py` passes.
+- **Milestone:** M2 (execution controls and failure propagation, scripted). T2.1 done.
+- **Current task:** **T2.2 Failure propagation** (Not started; awaiting approval).
+- **Why:** M2 completes Feature F; T2.2 maps remaining worker failure kinds and re-verifies that none ends the orchestrator as `tool_failed`.
+- **What must be achieved:** see T2.2 acceptance criteria. Note that part of T2.2 is already covered (see §4, T1.3 and T2.1): re-check its scope against the existing tests before writing new ones.
+- **How success is verified:** `uv run pytest tests/test_limits.py -q`.
+- **First executable development milestone:** **M1 (T1.1 → T1.3): reached 2026-10-16.** `tests/test_e2e_delegation.py` passes.
 
 ## 4. Completed work
 
@@ -288,9 +288,67 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 - **Deviations:** none from the plan. Added `.python-version` and `.gitignore` (minimal packaging). The directory is still not a git repo.
 - **Findings:** the default install resolved `torch 2.14.1+cu130` (`torch.cuda.is_available()` is True, driver 615.71.09) and `transformers 5.20.0`. `bitsandbytes` is **not** installed (needed from T3.4). `ddgs` and `duckduckgo-search` are installed (never register them as tools).
 
+### T1.1 Scripted-model test fixture (2026-10-16)
+
+- **Files:** `tests/conftest.py` (`ScriptedModel`, `ModelCall`, `ScriptExhaustedError`, `scripted_model` fixture), `tests/test_scripted_model.py` (15 tests).
+- **Implemented:** `ScriptedModel(BaseModel)` replays scripted turns, records every call (`model.calls`: prompt, config, kwargs, response), supports `generate` and `generate_stream`, and has `on_exhausted="repeat_last"` (default) or `"raise"`.
+- **Verification (all run):** `uv run pytest tests/test_scripted_model.py -q` → 15 passed. `uv run pytest -q` → 17 passed. The tests drive the real `effgen.Agent` loop in ReAct mode with no mocking of effGen.
+- **Verified ReAct format** (the acceptance case makes exactly 2 model calls, 1 tool call, `success=True`):
+  - tool turn: `Thought: ...\nAction: <tool>\nAction Input: {"a": 2, "b": 3}`
+  - answer turn: `Thought: ...\nFinal Answer: <text>`
+  - the next prompt carries `Observation: <tool result>`.
+- **Deviations:** the fake declares no native tool calling, so no `generate_with_tools` / `supports_*` overrides were needed (upstream's `_Scripted` declares native). Plan §T1.1's "records the prompts" is implemented as `calls`.
+- **Debt/limits:** ReAct text only. A native tool-calling script is not covered. Add it only if a later task needs it.
+
+### T1.2 `WorkerResult` + `DelegateTool` + `WorkerRegistry` (2026-10-16)
+
+- **Files:** `src/smol_harness/delegation.py`, `tests/test_delegation.py` (22 tests).
+- **Implemented:**
+  - `WorkerResult` (worker, status `completed|failed`, output, error, error_type, termination, iterations, tool_calls, tokens_used; `to_json()`).
+  - `WorkerRegistry` (`register`, `names`, `description`, `get_config`, `create`; `UnknownWorkerError`). A definition is an `AgentConfig` with an already-loaded `BaseModel`; `create` builds a fresh `Agent` from a per-agent shallow copy (`enable_sub_agents=False`).
+  - `DelegateTool(BaseTool)`: params `worker`, `task`, `context?`; returns a JSON string; every worker failure is a structured result.
+- **Verification (all run):** `uv run pytest tests/test_delegation.py -q` → 22 passed. `uv run pytest -q` → 39 passed. Mutation check: making the registry cache and reuse one agent fails 3 isolation tests (restored afterwards).
+- **Demonstrated, not assumed:**
+  - The second delegation's prompt does not contain the first task.
+  - A control test shows a *reused* `Agent` does leak the earlier task, so the fresh-agent design is what provides isolation.
+  - Agents created for one or several workers share the same model object (`is`).
+  - The report holds only the `WorkerResult` fields: no worker thoughts, observations or thread.
+- **Deviations from the plan text (per the T1.2 request):**
+  - No `WorkerRecord` / lifecycle status tracking, and so no "registry shows `completed`". That belongs to a later task. **Open:** schedule it (M2) or drop it; `docs/architecture.md` §6 still describes it.
+  - No `delegation_id`, `duration_s`, `timeout` status or report truncation (T2.1 / T2.3).
+  - The registry takes `AgentConfig` definitions, not an injected `Callable[[str], Agent]` factory, so model sharing is checked at registration.
+  - An unknown worker returns a structured failure (`error_type="unknown_worker"`), not a bare error string. Malformed arguments (missing, empty or non-string `worker`/`task`) are rejected by effGen's own validation as a failed `ToolResult` (see audit Part 3); a blank task is a structured failure.
+- **Debt / limitations:** the orchestrator has not yet been driven through this tool (T1.3). Whether a *failed* `ToolResult` from effGen's argument validation can end a parent run as `tool_failed` is unverified (U3 covers worker failures only).
+
+### T1.3 End-to-end orchestrator → worker → orchestrator (2026-10-16)
+
+- **Files:** `src/smol_harness/harness.py` (new: `Harness`, `HarnessResult`, `build_harness`), `src/smol_harness/delegation.py` (added `WorkerRecord`; `DelegateTool(registry, records=None)` appends one record per delegation), `tests/test_e2e_delegation.py` (22 tests).
+- **Implemented:**
+  - `build_harness(orchestrator_config, {name: worker_config}, descriptions)`. Inputs are `AgentConfig`s holding model *instances*.
+  - `Harness.run(task)` builds a **fresh orchestrator `Agent` and a fresh record list per call**, with `DelegateTool` appended to the orchestrator's tools. Returns `HarnessResult(output, success, termination, response, workers)`.
+  - `WorkerRecord(worker, task, context, result)` with `.status`. Terminal states only (`completed` / `failed`), no state machine.
+- **Verification (all run):** `uv run pytest tests/test_e2e_delegation.py -q` → 22 passed. `uv run pytest -q` → 61 passed. Mutations (a record list shared across runs; a reused orchestrator agent) make the independence test fail; both were restored.
+- **Acceptance (all verified by tests):** (1) the worker ran once and its prompt carries the templated task and context; (2) the orchestrator's next prompt contains the worker's JSON report as the `Observation`; (3) final `success=True`, output contains the worker answer, exactly 2 orchestrator model calls; (4) worker prompts contain none of the orchestrator system prompt, user task or thoughts (and the marker is shown to be present in the parent's own prompt, so the check is not vacuous); (5) orchestrator prompts contain no worker thought or tool observation; (6) the worker holds no `delegate` tool and its prompt never mentions it; (7) `result.workers[0].status == "completed"`.
+- **Also verified:** two delegations create two distinct `Agent`s sharing one model object, with no history carried; a failing worker is recorded `failed` and the parent still finishes `done` (U3 confirmed for a worker whose model raises); an unknown worker is recorded `failed`; independent runs do not share records or orchestrator memory.
+- **U11 (invalid `delegate` arguments), observed:** see audit Part 3. The parent always gets an error observation and may continue; it was never ended as `tool_failed`; repeated invalid calls end it as `stuck`.
+- **Deviations / notes:** `build_harness` takes `AgentConfig`s rather than bare model instances (so tools, prompts and limits are carried). No `delegation_id`/`duration_s`/`timeout`/truncation yet (T2.x). Invalid calls rejected by effGen never reach `_execute`, so they produce **no** `WorkerRecord`.
+- **Debt / limitations:** only ReAct text mode is exercised; `Harness.run` propagates orchestrator exceptions when its config has `raise_on_error=True`; worker failure reporting is only as detailed as `WorkerResult`.
+
+### T2.1 Worker deadline enforcement (2026-10-16)
+
+- **Preliminary correction:** added `test_orchestrator_memory_does_not_carry_across_runs` (no delegation involved, so only orchestrator memory can leak). Verified by mutation: with the orchestrator `Agent` deliberately reused, the assertion `"USER-RUN-ONE" not in second_prompt` fails (it is the first failing assertion in that test); harness restored, no refactor.
+- **Files:** `src/smol_harness/delegation.py` (`WorkerTimeout`, `DeadlineMiddleware`, `status="timeout"`, `DelegateTool(..., worker_timeout_s, clock)`), `src/smol_harness/harness.py` (`build_harness(..., worker_timeout_s)`, `Harness(..., worker_timeout_s)`), `tests/test_limits.py` (15 tests), `tests/test_e2e_delegation.py` (+1 regression test).
+- **Implemented:** a fresh `DeadlineMiddleware` per delegation, passed as per-call middleware (`agent.run(prompt, middleware=[deadline])`). It raises `WorkerTimeout` from `before_model_call` / `before_tool_call` once a monotonic deadline has passed and sets `expired`. `DelegateTool` reports `status="timeout"` (`error_type="WorkerTimeout"`, no output) whenever `deadline.expired` is set, whether effGen raised the exception or folded it into a failed response. `None` timeout = no deadline (M1 behaviour).
+- **COOPERATIVE, not a hard wall-clock timeout.** The deadline is checked only before a model call or a tool call. An in-flight generation or tool is never interrupted (shown by a real-clock test: a 0.1 s deadline did not cut a 0.3 s tool short; the delegation took at least 0.3 s). Worst-case overrun is one model call or tool call. No thread/process cancellation.
+- **Verification (all run):** `uv run pytest tests/test_limits.py -q` → 15 passed. `uv run pytest -q` → 77 passed. Mutations each fail tests and were restored: no post-run `expired` check (breaks the `raise_on_error=False` path), one deadline shared across delegations (breaks the leak test), middleware never passed to `run()` (8 failures).
+- **Acceptance:** a worker whose tool outlives the deadline yields `status="timeout"` (fake clock and real clock), and the orchestrator still completes (`success=True`, `termination="done"`, record `timeout`). Timeout state does not leak between delegations or runs. The timeout result is valid JSON with the common `WorkerResult` schema.
+- **U4 answer:** see audit Part 3. Middleware exceptions propagate on the model and tool paths.
+- **Deviations / notes:** the timeout is one value for all workers (`Limits.worker_timeout_s` shape), not per worker. `clock` is an injectable parameter on `DelegateTool` for deterministic tests; `Harness` does not expose it. No `duration_s` or `delegation_id` yet. `Harness`/`build_harness` expose `worker_timeout_s`, which is a small addition beyond the plan text so the limit is reachable end to end.
+- **Debt / limitations:** the orchestrator has no deadline (post-MVP). `max_delegations` and report truncation remain (T2.3).
+
 ## 5. Upcoming work
 
-After T0.1: T1.1 → T1.2 → T1.3, then M2. Do M3 before M4 only if Ollama is installed by then; otherwise do M4 first (M4 depends only on T3.1).
+After T2.1: T2.2 → T2.3. Do M3 before M4 only if Ollama is installed by then; otherwise do M4 first (M4 depends only on T3.1).
 
 ## 6. Changes to scope or architecture
 

@@ -208,15 +208,15 @@ The user-namespace prerequisite was checked on this host on 2026-10-16: `unshare
 
 | Capability | effGen support | Our implementation | Verification | Notes |
 |---|---|---|---|---|
-| Agent execution | Verified (source) | Not started | Not tested | `Agent` + `AgentConfig`; see 1.1 |
-| Subagent spawning | Partial: agent-as-tool supported; built-in managers unsuitable | Not started | Not tested | Custom `delegate` tool (see architecture.md) |
-| Context isolation | Verified (source) | Not started | Not tested | Fresh worker `Agent` per delegation around a shared model |
+| Agent execution | Verified (source + runtime) | Implemented (orchestrator + worker `Agent`s via `Harness`) | Tested with scripted models (T1.1–T1.3) | `Agent` + `AgentConfig`; see 1.1 |
+| Subagent spawning | Partial: agent-as-tool supported; built-in managers unsuitable | Implemented (T1.2–T1.3) | Tested end-to-end with scripted models (T1.3); real models pending | Custom `delegate` tool (see architecture.md) |
+| Context isolation | Verified (source + runtime control test) | Implemented for workers (fresh `Agent` per delegation) | Tested at unit level (T1.2) | Fresh worker `Agent` per delegation around a shared model |
 | Ollama loading | Verified (source), via `openai_compatible` | Not started | Not tested | Ollama not installed on this host |
 | Hugging Face loading | Verified (source) | Not started | Not tested | Must pass `quantization_bits` explicitly |
 | Mixed providers | Plausible (independent `BaseModel` instances per agent) | Not started | Not tested | Unverified on a real run |
 | Quantization | Verified (source): bf16/fp16, bnb 8-bit, bnb NF4, Ollama GGUF tags | Not started | Not tested | FP4 not supported by effGen API |
 | Tool execution | Verified (source) | Not started | Not tested | `FileOperations` + sandboxed shell |
-| Execution limits | Partial: steps yes, wall clock no | Not started | Not tested | Deadline middleware needed |
+| Execution limits | Partial: steps yes, wall clock no (hooks verified) | Worker deadline implemented (cooperative); iteration caps are effGen's; `max_delegations`/truncation pending (T2.3) | Tested with scripted models (T2.1) | Deadline middleware needed |
 
 Status values: Not started, In progress, Implemented (unverified), Tested, Blocked.
 
@@ -233,6 +233,75 @@ Status values: Not started, In progress, Implemented (unverified), Tested, Block
 - Files: `pyproject.toml`, `uv.lock`, `tests/test_import.py`.
 - Tests: `uv run pytest -q` → 2 passed; `uv sync --locked` reproduced the environment from a deleted `.venv`.
 - Limitations: none found.
+
+### 2026-10-16 – T1.1 Scripted-model test fixture
+- Added: `ScriptedModel` fake `BaseModel` for deterministic CPU tests.
+- effGen APIs used: `effgen.models.base.BaseModel` (`generate`, `generate_stream`, `count_tokens`, `get_context_length`, `load`, `unload`; `GenerationResult`, `TokenCount`, `ModelType.OPENAI`), `Agent` / `AgentConfig`, `@tool`.
+- Files: `tests/conftest.py`, `tests/test_scripted_model.py`.
+- Tests: `uv run pytest -q` → 17 passed.
+- **Verified at runtime (effGen 1.3.0, ReAct mode with `tool_calling_mode="react"`, `capability_probe=False`, `enable_sub_agents=False`, `enable_memory=False`, `raise_on_error=False`):**
+  - A `BaseModel` subclass needs only the six methods above. The abstract set is smaller than the upstream fake's overrides.
+  - ReAct text that works: `Thought: ...\nAction: <tool>\nAction Input: {json}`, then `Thought: ...\nFinal Answer: <text>`. The agent makes exactly 2 model calls and 1 tool call.
+  - The prompt is a flat string (`str`) and carries `Observation: <result>` on the next call. `tools=` is not passed to `generate` in react mode.
+  - Unknown tool → observation `No tool named '<x>' is available. The tools you can use are: <list>. ...`; the nudge consumes an extra model turn.
+  - Tool exception → observation `Error executing tool '<name>': Tool execution failed: <msg>`; the run continues.
+  - A model exception → `AgentResponse(success=False, termination="error")` with `output` starting `Generation failed: ...`. It is not raised under `raise_on_error=False`.
+  - A repeated identical tool call is stopped by effGen: `termination="stuck"`; the repeated call is not re-executed.
+  - `AgentResponse.tool_calls` is a `ToolCallList` (not an int); `.iterations`, `.termination` are populated.
+- Limitations: native (non-ReAct) tool calling is untested.
+- Decisions: `on_exhausted="repeat_last"` default (plan T1.1 risk); `"raise"` for exact-count assertions.
+
+### 2026-10-16 – T1.2 Delegation contract (`WorkerResult`, `WorkerRegistry`, `DelegateTool`)
+- Added: agent-as-tool delegation layer with fresh worker `Agent` per call.
+- effGen APIs used: `BaseTool`, `ToolMetadata`, `ParameterSpec`, `ToolCategory.COMMUNICATION`, `BaseTool.execute()` → `ToolResult`; `Agent`, `AgentConfig` (`dataclasses.replace`), `Agent.run`, `Agent.close` (via `with agent`); `AgentResponse` (`success`, `output`, `termination`, `iterations`, `tool_call_count`, `tokens_used`).
+- Files: `src/smol_harness/delegation.py`, `tests/test_delegation.py`.
+- Tests: `uv run pytest -q` → 39 passed.
+- **Verified at runtime (effGen 1.3.0):**
+  - `BaseTool.execute(**kw)` validates before `_execute`. Missing required, empty (`min_length`), or wrong-type (`5` for a string, `3` for `worker`) arguments return `ToolResult(success=False, error="Parameter validation failed: Parameter 'x' is required. Pass the parameters ...")` and `_execute` never runs. Unknown extra parameters are dropped with a warning.
+  - A tool returning a `str` is passed through as the observation text; JSON strings are fine.
+  - Reusing one `Agent` across `run()` calls **does** leak the earlier task into the next prompt (control test), confirming §1.4: fresh `Agent` per delegation is required. `Agent(replace(config, tools=list(...)))` with a shared `BaseModel` instance keeps `agent.model is model`, with per-agent `short_term_memory` and `state`.
+  - `agent.run()` on a worker with `raise_on_error=True` and a failing model raises `RuntimeError` (message contains the model's error); with `False` it returns `success=False`. Both are caught and reported as `failed`.
+  - A worker that repeats a tool call ends `success=False`, `termination="stuck"`.
+  - `AgentResponse.tool_call_count` is the plain int (`tool_calls` is a `ToolCallList`).
+  - `ToolCategory.COMMUNICATION` → general contract, `ToolUsePolicy.AUTO` (`prompts/tool_contract.py:130-201`). `SYSTEM` and `CODE_EXECUTION` are `REQUIRED`.
+- **Source-level only (not exercised):** when `Agent.run` is called under a running event loop (e.g. `run_async`), effGen's coroutine bridge `run_coroutine_sync` (`utils/async_bridge.py`) gives sync-dispatched async tools a **120 s** default timeout. A plain synchronous `agent.run()` uses `asyncio.run` with no cap. Keep the orchestrator on the sync entry point, or revisit before using `run_async`.
+- Limitations / workarounds: workers are built with `enable_sub_agents=False` by the registry; `DelegateTool` runs `Agent.run` in an executor with the caller's `contextvars` copied (as effGen's `FunctionTool` does).
+- Decisions: structured failure for unknown worker, blank task and any worker failure; effGen's validation handles malformed arguments.
+
+### 2026-10-16 – T1.3 End-to-end orchestrator → worker → orchestrator
+- Added: `Harness` / `build_harness` / `HarnessResult`, `WorkerRecord`.
+- effGen APIs used: `Agent`/`AgentConfig` (orchestrator with `DelegateTool` in `tools`), `Agent.run`, `AgentResponse` (`success`, `output`, `termination`, `stop_reason`).
+- Files: `src/smol_harness/harness.py`, `src/smol_harness/delegation.py`, `tests/test_e2e_delegation.py`.
+- Tests: `uv run pytest -q` → 61 passed.
+- **Verified at runtime (effGen 1.3.0, ReAct mode, scripted models):**
+  - A parent ReAct turn `Action: delegate` / `Action Input: {json}` runs `DelegateTool` through the normal loop; the returned JSON string appears verbatim as `Observation: {...}` in the parent's next prompt. The parent made exactly 2 model calls (delegate turn + final turn).
+  - A custom `system_prompt` on the orchestrator appears in its own first ReAct prompt, so isolation checks against it are meaningful.
+  - A worker run *inside* the parent's tool call works: the worker is a separate `Agent` with its own prompts, and the parent's prompts never contain the worker's thoughts or observations.
+  - Parent tool failure handling (**U11**):
+    - Missing required argument (`worker` or `task` absent): effGen does not dispatch; the observation is `[Your tool call could not be run: it did not carry the required argument(s) task. Make the call again as a tool call with its arguments as a JSON object.]`
+    - Present but invalid (empty `task`, non-string `task`/`worker`): `Error executing tool 'delegate': Tool execution failed: Parameter validation failed: Parameter 'task' must have length >= 1. Pass the parameters 'delegate' requires: worker (string), task (string).`
+    - In both cases the parent continues and can finish (`success=True`; `termination` was `done`, or `not_possible` once after two consecutive missing-argument calls). `_execute` is never reached, so no `WorkerRecord` is created.
+    - The same invalid call repeated endlessly ends the parent with `termination="stuck"`, `stop_reason="loop_detected"` after 3 calls. Different invalid calls repeated until the limit end with `stuck` / `max_iterations_exhausted` after `max_iterations` calls. **`tool_failed` was never produced.**
+  - A worker whose model raises (parent unaffected): recorded `failed`, parent finishes `done` (**U3** for this failure kind).
+  - **Worker nudge:** a worker that holds a tool but answers `Final Answer:` without calling it gets an extra turn: `Observation: You have not run a tool yet. Run the <tool> tool and answer from what it returns, not from what you expect it to return.` The run then continues and makes a second model call (`iterations` 2). Script worker turns accordingly, and expect small workers that skip tools to cost extra calls. Applies to `@tool`-decorated tools (default category).
+- Limitations: ReAct text only; native tool-calling path not exercised.
+- Decisions: orchestrator `Agent` and record list are created per `Harness.run` because effGen agents keep memory across runs (§1.4).
+
+### 2026-10-16 – T2.1 Worker deadline enforcement (cooperative)
+- Added: `DeadlineMiddleware`, `WorkerTimeout`, `WorkerResult.status="timeout"`; `worker_timeout_s` on `DelegateTool` / `Harness`.
+- effGen APIs used: `effgen.AgentMiddleware` (`before_model_call`, `before_tool_call`), per-call `Agent.run(task, middleware=[...])`, `AgentResponse.success/termination/metadata["error"]`.
+- Files: `src/smol_harness/delegation.py`, `src/smol_harness/harness.py`, `tests/test_limits.py`.
+- Tests: `uv run pytest -q` → 77 passed.
+- **U4, verified at runtime (effGen 1.3.0, ReAct loop):**
+  - An exception raised from `before_model_call` or `before_tool_call` is **not swallowed**; it stops the run, and no further model calls are made afterwards (the loop's closing request does not retry).
+  - With `raise_on_error=True`, `run()` re-raises the **original exception object** (`WorkerTimeout`, not wrapped).
+  - With `raise_on_error=False`, `run()` returns `success=False`, `termination="error"`, `output="Error: <message>"`, and `metadata["error"]` = `{"type": "WorkerTimeout", "category": "timeout", ...}`. effGen classifies it itself, but the harness does not rely on that: it uses its own `expired` flag.
+  - `before_tool_call` raising prevents the tool from running.
+  - Per-call middleware (`run(middleware=[...])`) fires both hooks, the same as `AgentConfig(middleware=[...])`.
+  - The hooks only run at call boundaries: a tool or generation already running is never interrupted. A tool that sleeps 0.3 s completes under a 0.1 s deadline; the stop happens at the next model-call hook.
+- Source-level only: native tool calling, streaming and `run_async` dispatch through the same `_generate` / `_execute_tool` wrappers (`agent_generation.py:_generate`, `agent_tool_execution.py:_execute_tool`), so the hooks should apply there, but this was not run.
+- Limitations: **cooperative timeout only**; worst-case overrun is one model call or one tool call. `ToolMetadata.timeout_seconds` remains unenforced by effGen's core loop (§1.8).
+- Decisions: detect timeouts by the middleware's `expired` flag, not by parsing effGen's error text or type, so both `raise_on_error` modes work.
 
 (Further entries follow this format.)
 

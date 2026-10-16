@@ -141,7 +141,7 @@ sequenceDiagram
     H-->>User: final output + worker records
 ```
 
-### Delegate tool contract (proposed)
+### Delegate tool contract (T1.2 implements the fields below except `delegation_id`, `duration_s`, the `timeout` status and truncation)
 
 - **Input:**
   - `worker`: enum of configured worker names.
@@ -155,7 +155,7 @@ sequenceDiagram
   ```
 - **Failure semantics:**
   - The tool itself does **not** report `success: False` to effGen. A failed worker is a *successful* tool call whose payload says `status: "failed"`. This keeps effGen's `tool_failed` termination from ending the orchestrator run because of a worker failure. The orchestrator decides whether to retry, re-delegate or answer. **Verify in T2.2.**
-  - Only harness bugs (an invalid worker name, or delegations over `max_delegations`) return an error string.
+  - **As implemented in T1.2:** an unknown worker name or a blank task is also a structured `status: "failed"` result (`error_type` `unknown_worker` / `invalid_arguments`). Missing or non-string `worker`/`task` are rejected by effGen's own parameter validation, which returns a failed `ToolResult` (error text, not JSON). `max_delegations` (T2.3) is not built yet.
 - **Task envelope:** a smolagents-style template. It says who the worker is and that it is helping a manager, then gives the task and context, and asks for an outcome with a short summary, details, files touched, and anything unresolved.
 
 ## 6. Subagent spawning strategy
@@ -165,7 +165,7 @@ sequenceDiagram
   - Only the orchestrator holds `delegate`.
   - Workers are built with `enable_sub_agents=False` and `mode=AgentMode.SINGLE`, and `config.py` rejects `delegate` in a worker tool list.
 - **Execution is sequential.** effGen runs a turn's tool calls through `_execute_tool` one by one, and the Transformers engine serializes generation anyway. Parallel execution is post-MVP; effGen's `SubAgentManager.execute_parallel` / thread executors are the pattern to study then.
-- **Lifecycle:** `WorkerRegistry` keeps an in-memory list of `WorkerRecord(delegation_id, worker, task, status, started_at, ended_at, result)`. It is exposed on `HarnessResult`. No persistence.
+- **Lifecycle (as implemented in T1.3):** the registry holds definitions only. `DelegateTool` appends one `WorkerRecord(worker, task, context, result)` per finished delegation (`completed` or `failed`) to a **per-run** list owned by `Harness.run`, which also builds a fresh orchestrator `Agent` per run. Exposed as `HarnessResult.workers`. No persistence. Still planned for M2: `delegation_id`, timing and the `timeout` status.
 
 ## 7. Context isolation strategy
 
@@ -208,7 +208,7 @@ The harness's provider vocabulary is deliberately tiny. It maps 1:1 to effGen ca
 | Limit | Where | Mechanism |
 |---|---|---|
 | Max steps per agent | `AgentSpec.max_iterations` | `AgentConfig.max_iterations` (effGen) |
-| Per-worker timeout | `Limits.worker_timeout_s` | `DeadlineMiddleware`: `before_model_call` / `before_tool_call` raise `WorkerTimeout` once the deadline has passed, which stops the worker run (middleware exceptions propagate, audit §1.8). Plus the HTTP `timeout` on Ollama and shell timeouts. **Cooperative:** it cannot pre-empt an in-flight Transformers `generate()`, so worst-case overrun is one generation. |
+| Per-worker timeout | `Limits.worker_timeout_s` | `DeadlineMiddleware`: `before_model_call` / `before_tool_call` raise `WorkerTimeout` once the deadline has passed, which stops the worker run (middleware exceptions propagate, audit §1.8). Plus the HTTP `timeout` on Ollama and shell timeouts. **Cooperative:** it cannot pre-empt an in-flight Transformers `generate()` or a running tool, so worst-case overrun is one call. As built (T2.1): a fresh instance per delegation passed via `agent.run(middleware=[...])`; a timeout is recognised by the instance's `expired` flag, giving `WorkerResult.status="timeout"`. |
 | Max depth | structural (= 1) | see §6 |
 | Max delegations per run | `Limits.max_delegations` | Counter in `DelegateTool` |
 | Report size | `Limits.max_report_chars` | Truncation in `DelegateTool` |
