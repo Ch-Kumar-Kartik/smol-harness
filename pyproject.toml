@@ -22,4 +22,5 @@ testpaths = ["tests"]
 markers = [
     "ollama: needs a reachable Ollama server",
     "gpu: needs a CUDA GPU",
+    "real_model: loads a real checkpoint (may download weights); skipped unless --run-real-models is given",
 ]

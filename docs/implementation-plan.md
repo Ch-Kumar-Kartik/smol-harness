@@ -171,7 +171,7 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 
 **T3.2 `models.py` `build_model` + cache**
 
-- **Status:** Not started
+- **Status:** Completed (2026-10-16). Verification: see §4.
 - **Dependencies:** T3.1.
 - **Changes:**
   - Map `ModelSpec` to `effgen.models.load_model` kwargs, always passing `quantization_bits` for hf.
@@ -266,10 +266,10 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 
 ## 3. Current active goal
 
-- **Milestone:** M3 (configuration and real model backends). T3.1 done.
-- **Current task:** none active. **Recommended next: T3.2 `models.py` `build_model` + cache.** It maps a `ModelSpec` to `effgen.models.load_model` kwargs (unit-testable by monkeypatching `load_model`, so no GPU or Ollama is needed). Alternative: T4.1 workspace tools (depends only on T3.1). T3.3 stays blocked until Ollama is installed.
-- **Why:** the config layer now produces validated specs; nothing yet turns them into effGen models.
-- **How success is verified:** `uv run pytest tests/test_models.py -q` (per the T3.2 plan entry).
+- **Milestone:** M3 (configuration and real model backends). T3.1 and T3.2 done; T3.3 blocked (no Ollama), T3.4/T3.5 need GPU runs and `bitsandbytes`.
+- **Current task:** none active. **Recommended next: T4.1 `tools.py` registry + `file_operations`** (workspace-confined, per-agent allowlists, no web tools). It depends only on T3.1 and is fully testable on CPU. Alternative: a small, currently unplanned wiring step (`HarnessConfig` → `ModelCache` → `build_harness`), which fits naturally with T5.1.
+- **Why:** model construction is now specified and tested; agents still have no tools to work with.
+- **How success is verified:** `uv run pytest tests/test_tools.py -q` (per the T4.1 plan entry).
 - **First executable development milestone:** **M1 (T1.1 → T1.3): reached 2026-10-16.** `tests/test_e2e_delegation.py` passes.
 
 ## 4. Completed work
@@ -387,9 +387,64 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 - **Deviations from the plan text:** none in scope; two design choices beyond it: `workers` is a YAML list (not a mapping) and two fields are required (HF `quantization`, Ollama `context_length`), see above. `Limits` fields are finite and non-nullable even though the runtime accepts `None`.
 - **Debt / limitations:** the workspace is not checked for existence (T4.1 does); `base_url` is only checked for an http(s) prefix; model ids are not checked against Ollama/HF (no network); `hf` models with `dtype` omitted use effGen's automatic bf16/fp16 choice; the example's model pairing is unverified for 8 GB VRAM (U7). Nothing wires `HarnessConfig` into `build_harness` yet.
 
+### T3.2 Model factory and cache (2026-10-16)
+
+- **Files:** `src/smol_harness/models.py`, `tests/test_models.py` (87 tests). No other source changes.
+- **effGen APIs used:** `effgen.models.load_model` (the only loader call), `effgen.models.base.BaseModel` / `ModelType`, `effgen.models.openai_compatible_adapter.OpenAICompatibleAdapter` (result check), `BaseModel.unload()`.
+- **Public API:** `build_model(spec)`, `loader_args(spec)`, `ModelCache` (`get`, `close`, `__len__`, `__contains__`, context manager), `ModelLoadError`, `HF_QUANTIZATION_BITS`, `OLLAMA_ID_ALIAS_PREFIXES`.
+- **Quantization argument mapping:** hf `none` → `quantization_bits=None`; `bnb-8bit` → `8`; `bnb-4bit-nf4` → `4` (always passed, even `None`; effGen's `quantization=` shorthand unused). hf `dtype` `bf16` → `torch.bfloat16`, `fp16` → `torch.float16` (key omitted when unset). Always `engine="transformers"` and `require_gpu=True`. ollama: `provider="openai_compatible"`, `base_url`, `context_length`; no quantization argument (fixed by the tag). FP4 is unreachable.
+- **Cache behaviour:** keyed by the whole frozen `ModelSpec`; equal specs share one instance (one load), any differing field (provider, model, quantization, dtype, base_url, context_length) is a separate entry; per-instance, no global state; failed loads leave no entry; `close()` unloads each model once and is idempotent; `get` after `close` raises.
+- **Verification (all run):** `uv run pytest tests/test_models.py -q` → 87 passed. `uv run pytest -q` → 405 passed. `uv lock --check` OK. Ten mutations (quantization_bits omitted for `none`, `require_gpu` dropped, cache keyed by model id only, result check removed, silent retry/downgrade after failure, alias guard removed, error cause dropped, error message concealed, `close` not unloading, 8-bit/4-bit swapped, hf kind check skipped) each fail tests and were restored.
+- **Acceptance:** exact loader kwargs for each provider and quantization; endpoint and context length propagate; same-spec reuse, different-spec separation, cross-provider independence; loading failures carry the spec and original error (`__cause__`) and are not cached or retried; wrong-kind and substituted-quantization results are refused; invalid specs fail before anything loads; four workers over two distinct specs share model instances through real `WorkerRegistry`/`Agent`s (2 loads for 4 agents); importing the module loads no model and no torch/transformers/bitsandbytes/accelerate (checked in a subprocess).
+- **Beyond the listed arguments (flag for review):** `require_gpu=True` for hf; the Ollama alias-prefix guard; the post-load type and quantization check; `ModelLoadError` wrapping (original exception preserved as `__cause__`).
+- **Limitations:** no real model has been loaded: the hf path is verified against effGen's real routing with only `TransformersEngine` stubbed, and the real engine's `model_type`/`quantization_bits` attributes are source-level (T3.4). The Ollama server is first contacted on first use (T3.3). `require_gpu=True` rules out CPU-only hosts for hf. The alias set mirrors effGen's private alias table and can drift (a control test re-checks effGen's behaviour). Nothing wires `ModelCache` into `build_harness` yet.
+
+### T3.2a Explicit Hugging Face device selection (2026-10-16)
+
+- **Why:** T3.2 hard-coded `require_gpu=True`, which rules out CPU-only hosts (the planned fanless edge-device smoke test). Not in the original plan; requested as a focused adjustment before real-model inference.
+- **Files:** `src/smol_harness/config.py` (`ModelSpec.device`, `HF_DEVICES`, `DEFAULT_HF_DEVICE`, dtype `fp32`, `hf_placement_problem`, `device` key), `src/smol_harness/models.py` (CPU/CUDA kwargs, `_cuda_available` preflight, post-load device check), `configs/example.yaml` (comment only), `tests/test_config.py` (+22 collected tests, now 201), `tests/test_models.py` (+23, now 110; fakes now report a device, `loader` fixture is hermetic about CUDA), `tests/test_hf_device.py` (new, 8 tests).
+- **Behaviour:** `device: cuda` (default; omitted == explicit, same cache key): unchanged arguments (`require_gpu=True`, no `device_map`), plus our own CUDA-availability check and a post-load check that the model is on `cuda`. `device: cpu`: `quantization_bits=None`, `require_gpu=False`, `device_map="cpu"`, `use_flash_attention=False`, explicit `torch_dtype`, post-load check that the model is on `cpu`. Rules: cpu allows only `quantization: none` and requires `dtype` in {`fp32`, `bf16`}; cuda rejects `fp32`; unknown devices (`gpu`, `cuda:0`, `mps`, `CPU`) rejected; `device` rejected for ollama (config and dataclass).
+- **Verification (all run):** `uv run pytest tests/test_config.py tests/test_models.py tests/test_hf_device.py -q` → 319 passed. `uv run pytest -q` → 458 passed. `uv lock --check` OK. The 266 pre-existing config/model tests stayed green; only the test fakes were updated for device reporting, no assertion was changed. Seven mutations fail tests and were restored: CPU mode that only sets `require_gpu=False` (the real-engine test shows effGen then places the model on CUDA and the device check refuses it), CUDA preflight removed, device ignored in the cache key, post-load device check removed, CPU dtype optional, bitsandbytes allowed on CPU, `require_gpu=True` kept in CPU mode (real effGen raises `GPUPlacementError`).
+- **Real-engine checks without weights:** a 2-layer random Llama plus a word-level tokenizer is generated into a temp dir; effGen's real `load_model` / `TransformersEngine` run against it (CPU and, on this GPU host, CUDA; the three CUDA tests are marked `gpu` and skip without CUDA).
+- **Correction to T3.2:** its claim that `require_gpu=True` prevents CPU fallback was too broad. It only rejects partial GPU placement; with CUDA absent effGen loads silently on CPU. The CUDA preflight added here covers that case. Audit and architecture are corrected.
+- **Debt / limitations:** CPU mode is verified on a tiny random model, not a real checkpoint (that is the planned Liquid AI smoke test; no weights were downloaded). `device: cuda:N` / multi-GPU selection is not supported. `fp32` on CUDA is deliberately unsupported. CPU inference speed, thread settings and memory on the edge device are untested. `use_flash_attention=False` is passed only in CPU mode.
+
+### T3.2b Liquid AI CPU smoke test (2026-10-16)
+
+- **Scope:** one real checkpoint, CPU only, one load and two tiny inferences. No orchestration changes, GPU inference, quantization work or workspace tools. Not in the original plan; requested by the project's senior as an edge-device feasibility check.
+- **Model decision:** the target `LiquidAI/LFM2.5-350M` was kept. The model card describes it as a "general-purpose instruction-tuned model" (a separate `LFM2.5-350M-Base` exists), ChatML-like template, 16 layers (10 conv + 6 attention), 32,768-token context, recommended sampling temperature 0.1 / top_k 50 / repetition_penalty 1.05, recommended for "data extraction, structured outputs, and tool use" and "not recommended for knowledge-intensive tasks and programming". No alternative was needed.
+- **Pre-download compatibility checks (no weights):** Hub `config.json`: `model_type: lfm2`, `architectures: [Lfm2ForCausalLM]`, saved with transformers 5.0.0rc1; the installed transformers 5.20.0 contains `transformers.models.lfm2`, `AutoConfig` resolved it to `Lfm2Config` and `Lfm2ForCausalLM` exists; no `trust_remote_code` needed.
+- **Files:** `tests/integration/test_liquid_cpu.py` (1 test, marker `real_model`), `tests/test_integration_optin.py` (2 tests), `tests/conftest.py` (`--run-real-models` option / `SMOL_RUN_REAL_MODELS=1`, skip hook), `pyproject.toml` (marker `real_model`). No source module changed.
+- **Opt-in design:** tests marked `real_model` are skipped with a reason unless `--run-real-models` (or the env var) is given; `-m real_model` alone does not opt in (both checked by subprocess tests). The test resolves the pinned revision through `huggingface_hub.snapshot_download(local_files_only=True)` and only downloads if the snapshot is missing; it then loads from the local snapshot path with the network blocked. It writes its measurements to `/tmp/smol-harness-lfm-cpu-smoke.json` (override with `SMOL_SMOKE_REPORT`) and prints them.
+- **Run:** `uv run pytest tests/integration/test_liquid_cpu.py --run-real-models -s` → 1 passed in 6.5 s. Hard assertions: weights load through `build_model`; all parameters fp32 on CPU; no CUDA memory/context; `generate` and a minimal `Agent.run` return real text (`success=True`, `termination="done"`); both answers contain "paris" (a coherence check, since a wrongly loaded model emits junk); the process is not listed by `nvidia-smi`. No scripted output is involved.
+- **Results:**
+
+| Item | Value |
+|---|---|
+| Model / revision | `LiquidAI/LFM2.5-350M` @ `9e6c6ccf47cd318696e137d381a7ded8fe4df09f` (Hub commit, `lastModified` 2026-08-05); 354,483,968 parameters; BF16 safetensors, 714 MB; not gated; license tag `other` (`lfm1.0`) |
+| Versions | Python 3.12.13, effGen 1.3.0, transformers 5.20.0, torch 2.14.1+cu130 |
+| Spec | `ModelSpec("hf", <local snapshot path>, "none", dtype="fp32", device="cpu")` through `build_model` (kwargs: `quantization_bits=None`, `require_gpu=False`, `device_map="cpu"`, `use_flash_attention=False`, `torch_dtype=float32`) |
+| Host | AMD Ryzen 7 7840HS, 16 logical CPUs, torch used 8 threads; actively cooled laptop with a CUDA GPU present (not the fanless edge device) |
+| Load time | 3.3 s (test run), 4.9 s (earlier exploratory run), from the page cache after a one-off 60 s download |
+| Inference | `model.generate`: 0.31 s, 2 tokens, text `Paris`. `Agent.run`: 0.21 s, `success=True`, `termination=done`, 1 iteration, output `Paris`. Prompt: "What is the capital of France? Answer in one short sentence." Sampling from the model card: temperature 0.1, top_k 50, repetition_penalty 1.05; max tokens 32 (generate) / 48 (agent) |
+| Memory | fp32 weights 1352 MiB; process RSS 597 MiB before load, 2171 MiB after, 2194 MiB at the end; process peak (VmHWM) 2549 MiB (the BF16 file is upcast to fp32 while loading) |
+| CPU-only evidence | engine `device == "cpu"`; all parameters `cpu`/`float32`; CUDA bytes allocated delta 0, reserved delta 0, no CUDA context created; `nvidia-smi` does not list the process; network blocked during load and inference |
+| Temperatures | `acpitz` zone: 59 C before, 62 C after load, 63 C after inference. The only sensor exposed on this laptop. A before/after snapshot of an actively cooled host, **not** evidence of thermal safety on a fanless device. No power data (RAPL not read) |
+
+- **Verification:** `uv run pytest -q` → 460 passed, 1 skipped (the opt-in test, 24 s). `uv lock --check` OK. Loads performed in total: one exploratory run and one test run (no repeated or sustained inference).
+- **Limitations / unresolved:**
+  - Only a trivial one-word factual answer was tested; reliability of effGen's final-answer format on longer or tool-using prompts is unknown (the card calls the model unsuited to programming and knowledge tasks, so it is a doubtful coding worker; it targets extraction, structured output and tool calling).
+  - Native tool calling is untested: effGen reports `supports_tool_calling() == True` (the chat template renders tools), so `tool_calling_mode="auto"` would pick native mode, while the card says the model emits Pythonic `<|tool_call_start|>` calls by default; whether effGen parses them is unverified.
+  - effGen reports a 128,000-token context (`max_position_embeddings` in `config.json`) while the card states 32,768; effGen plans its context budget from the former.
+  - `causal_conv1d` is not installed, so transformers uses its reference PyTorch conv implementation (correct, slower); this is a CUDA-only kernel so the CPU path would not use it anyway. CPU speed is therefore not representative of an edge SoC.
+  - `Agent.run` reported `tokens_used=32` while the same prompt through `model.generate` reported 2; what effGen counts there was not investigated.
+  - The load peak (2.5 GiB RSS) is dominated by the fp32 upcast; an edge device with little RAM may need bf16 (not tested on CPU) or a smaller footprint.
+  - Temperatures come from one sensor on an actively cooled laptop; no thermal, power or sustained-load conclusions can be drawn for the fanless device.
+  - The license tag is `other` (LFM1.0); terms were not reviewed.
+
 ## 5. Upcoming work
 
-M2 and T3.1 are complete. Next: T3.2 (then T3.3 when Ollama exists, T3.4 for HF/GPU), or T4.1 after T3.1. Do M3 before M4 only if Ollama is installed by then; otherwise do M4 first (M4 depends only on T3.1).
+M2, T3.1 and T3.2 are complete. Next: T4.1 (workspace tools). T3.3 waits for Ollama; T3.4/T3.5 need GPU runs and `bitsandbytes`. Do M3 before M4 only if Ollama is installed by then; otherwise do M4 first (M4 depends only on T3.1).
 
 ## 6. Changes to scope or architecture
 

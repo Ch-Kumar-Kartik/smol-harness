@@ -34,5 +34,7 @@ workers:
       model: Qwen/Qwen2.5-Coder-1.5B-Instruct
       quantization: bnb-4bit-nf4   # quantized while loading (bitsandbytes NF4)
       dtype: bf16
+      # device: cuda                # default. For a CPU-only host use `device: cpu` with
+      #                              # `quantization: none` and an explicit `dtype: fp32` (or bf16).
     tools: [file_operations, shell]
     max_iterations: 6

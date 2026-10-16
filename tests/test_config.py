@@ -416,3 +416,57 @@ def test_unknown_keys_rejected_at_every_level():
 
 def test_config_error_is_a_value_error():
     assert issubclass(ConfigError, ValueError)
+
+
+# ---- T3.2a: hf device selection -----------------------------------------------------------------------------------------
+def hf_model(**over):
+    return {**HF_NF4, **over}
+
+
+def test_hf_device_defaults_to_cuda_and_explicit_cuda_is_the_same_spec():
+    omitted = parse_config(cfg()).workers[0].model
+    explicit = parse_config(cfg(workers=[worker(model=hf_model(device="cuda"))])).workers[0].model
+    assert omitted.device == "cuda" and omitted == explicit and hash(omitted) == hash(explicit)
+    assert parse_config(cfg()).orchestrator.model.device is None  # ollama never has a device
+
+
+@pytest.mark.parametrize("dtype", ["fp32", "bf16"])
+def test_hf_cpu_accepts_nonquantized_with_explicit_dtype(dtype):
+    m = parse_config(cfg(workers=[worker(model=hf_model(quantization="none", device="cpu", dtype=dtype))])).workers[0].model
+    assert (m.device, m.quantization, m.dtype) == ("cpu", "none", dtype)
+
+
+def test_device_is_part_of_the_spec_identity():
+    cpu = ModelSpec("hf", "m", "none", dtype="bf16", device="cpu")
+    cuda = ModelSpec("hf", "m", "none", dtype="bf16", device="cuda")
+    assert cpu != cuda and len({cpu, cuda}) == 2
+
+
+@pytest.mark.parametrize("override, fragment, where", [
+    ({"quantization": "bnb-8bit", "device": "cpu", "dtype": "fp32"}, "needs a CUDA GPU", "device"),
+    ({"quantization": "bnb-4bit-nf4", "device": "cpu", "dtype": "bf16"}, "needs a CUDA GPU", "device"),
+    ({"quantization": "none", "device": "cpu"}, "requires an explicit dtype", "dtype"),  # host-dependent otherwise
+    ({"quantization": "none", "device": "cpu", "dtype": "fp16"}, "not supported on cpu", "dtype"),
+    ({"quantization": "none", "device": "cuda", "dtype": "fp32"}, "only supported with device: cpu", "dtype"),
+    ({"quantization": "none", "dtype": "fp32"}, "only supported with device: cpu", "dtype"),  # device omitted = cuda
+])
+def test_unsupported_device_combinations_are_rejected(override, fragment, where):
+    msg = bad(cfg(workers=[worker(model=hf_model(**override))]), fragment)
+    assert msg.startswith(f"workers[0].model.{where}")
+
+
+@pytest.mark.parametrize("device", ["gpu", "CPU", "CUDA", "cuda:0", "mps", "", True, 0, None, ["cpu"]])
+def test_invalid_device_values_are_rejected(device):
+    bad(cfg(workers=[worker(model=hf_model(device=device))]), "workers[0].model.device")
+
+
+def test_device_is_rejected_for_ollama_in_config_and_in_the_dataclass():
+    bad(cfg(workers=[worker(model={**OLLAMA, "device": "cpu"})]), "unknown key 'device'")
+    with pytest.raises(ValueError, match="does not apply to provider 'ollama'"):
+        ModelSpec("ollama", "m:1", "server", base_url="http://x/v1", context_length=4096, device="cpu")
+
+
+def test_fp32_is_only_a_valid_dtype_in_cpu_mode_and_other_dtype_values_stay_invalid():
+    parse_config(cfg(workers=[worker(model=hf_model(quantization="none", device="cpu", dtype="fp32"))]))
+    for dtype in ("float32", "FP32", "int8"):
+        bad(cfg(workers=[worker(model=hf_model(quantization="none", device="cpu", dtype=dtype))]), "dtype")

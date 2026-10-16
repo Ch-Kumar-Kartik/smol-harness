@@ -1,6 +1,6 @@
 # New Session Handoff
 
-_Last updated: 2026-10-16 (after T3.1: YAML configuration)._
+_Last updated: 2026-10-16 (after T3.2b: Liquid AI CPU smoke test)._
 
 ## 1. Project overview
 
@@ -35,7 +35,12 @@ Docs plus the T0.1 project skeleton. No harness logic yet.
 | `tests/test_delegation.py` | 22 tests of the delegation layer through `BaseTool.execute()` |
 | `src/smol_harness/config.py` | YAML → frozen dataclasses with validation (T3.1): `load_config`, `loads_config`, `parse_config`, `ConfigError`, `ModelSpec`, `AgentSpec`, `Limits`, `HarnessConfig` |
 | `configs/example.yaml` | Mixed-provider example (Ollama orchestrator, HF NF4 worker) with finite limits |
-| `tests/test_config.py` | 179 configuration tests |
+| `src/smol_harness/models.py` | `build_model(ModelSpec)`, `loader_args`, `ModelCache`, `ModelLoadError` (T3.2) |
+| `tests/test_models.py` | 110 tests: exact loader kwargs, cache, failures, device selection, wiring against effGen's real routing |
+| `tests/integration/test_liquid_cpu.py` | **Opt-in** real-model CPU smoke test (`LiquidAI/LFM2.5-350M`, marker `real_model`) |
+| `tests/test_integration_optin.py` | 2 tests proving real-model tests are skipped without `--run-real-models` |
+| `tests/test_hf_device.py` | 8 tests: CPU/CUDA placement against effGen's real engine with a locally generated tiny model (no download) |
+| `tests/test_config.py` | 201 configuration tests |
 | `tests/conftest.py` | `ScriptedModel` deterministic fake effGen `BaseModel` (+ `scripted_model` fixture) |
 | `tests/test_scripted_model.py` | 15 tests of the fake, driven through the real effGen `Agent` |
 
@@ -45,19 +50,20 @@ The remaining planned layout (`src/smol_harness/{config,models,tools,delegation,
 
 | Area | State |
 |---|---|
-| Implemented and verified | T0.1 bootstrap; T1.1 `ScriptedModel`; T1.2 delegation layer; T1.3 end-to-end orchestrator→worker→orchestrator. **M1 complete**; T2.1 cooperative worker deadline; T2.2 failure propagation; T2.3 delegation limit + report truncation. **M2 complete**; T3.1 YAML configuration (318 tests pass) |
+| Implemented and verified | T0.1 bootstrap; T1.1 `ScriptedModel`; T1.2 delegation layer; T1.3 end-to-end orchestrator→worker→orchestrator. **M1 complete**; T2.1 cooperative worker deadline; T2.2 failure propagation; T2.3 delegation limit + report truncation. **M2 complete**; T3.1 YAML configuration; T3.2 model factory and cache; T3.2a explicit hf device selection; T3.2b Liquid AI CPU smoke test passed with a real checkpoint (460 pass, 1 opt-in test skipped by default) |
 | Partially implemented | Nothing |
-| Not yet implemented | `duration_s`, model building (T3.2), real models (Ollama/HF, T3.3–T3.5), workspace tools (M4), CLI (T5.1); `HarnessConfig` is not yet wired into `build_harness` |
+| Not yet implemented | `duration_s`, real-model smoke tests (T3.3–T3.5), workspace tools (M4), CLI (T5.1); `HarnessConfig` and `ModelCache` are not yet wired into `build_harness` |
 | Known limitations (by design) | Sequential workers only; depth 1; **the worker timeout is cooperative** (checked before model/tool calls; an in-flight generation or tool is never interrupted); no orchestrator deadline; FP4 unsupported (effGen hard-codes NF4) |
 
 ## 4. Most recent session
 
-- **Goal:** T3.1 only: YAML configuration and validation.
-- **Done:** `config.py`, `configs/example.yaml`, 179 tests; PyYAML declared as a runtime dependency (was dev-only though already installed through effGen). Details: `docs/implementation-plan.md` §4.
-- **Files created:** `src/smol_harness/config.py`, `tests/test_config.py`, `configs/example.yaml`. Modified: `pyproject.toml`, `uv.lock`. Docs: plan, this file, audit, `architecture.md` §4 and §8.
-- **Tests:** `uv run pytest tests/test_config.py -q` → 179 passed; `uv run pytest -q` → 318 passed (CPU, ~8 s). Ten mutations fail tests (one survived first, test tightened).
-- **Problems:** one wrong test fragment on first run (message wording), fixed in the test.
-- **Unresolved:** U5–U8, U10; native tool calling, streaming and `run_async` untested.
+- **Goal:** T3.2b only: one real-model, CPU-only smoke test with `LiquidAI/LFM2.5-350M` through `build_model` and effGen.
+- **Result: loaded and ran.** All 354M parameters fp32 on CPU, no CUDA memory or context, `model.generate` and a minimal `Agent.run` both answered `Paris` (0.31 s and 0.21 s). Full results table: `docs/implementation-plan.md` §4 (T3.2b).
+- **Files:** created `tests/integration/test_liquid_cpu.py`, `tests/test_integration_optin.py`; modified `tests/conftest.py` (opt-in option and skip hook), `pyproject.toml` (marker). No source module changed. Docs: plan, this file, audit.
+- **Tests:** default `uv run pytest -q` → 460 passed, 1 skipped; opt-in run → 1 passed; `uv lock --check` OK. 714 MB of weights are now in `~/.cache/huggingface` (`/home` has 7.8 GB free).
+- **Key facts:** architecture `lfm2` is native in transformers 5.20.0 (no remote code); effGen reports `supports_tool_calling() == True` and a 128,000-token context (card says 32,768); peak RSS 2.5 GiB because of the fp32 upcast.
+- **Problems:** none; my first metadata fetch failed only because `curl` did not follow a redirect.
+- **Unresolved:** U5–U8, U10; native tool calling with this model, reliability on longer prompts, edge-device timing/thermals/RAM, bf16 on CPU.
 
 ### Configuration schema (as built)
 
@@ -87,16 +93,18 @@ Model, by provider (unknown or other-provider keys are rejected):
 | provider | keys | quantization |
 |---|---|---|
 | `ollama` | `model` (tag), `context_length` (**required**, 256..10M), `base_url` (default `http://127.0.0.1:11434/v1`), `quantization` | `server` only (default) |
-| `hf` | `model` (repo id/path), `quantization` (**required**), `dtype` (`bf16`/`fp16`, optional) | `none`, `bnb-8bit`, `bnb-4bit-nf4` |
+| `hf` | `model` (repo id/path), `quantization` (**required**), `device` (`cuda` default \| `cpu`), `dtype` (see below) | `none`, `bnb-8bit`, `bnb-4bit-nf4` |
+
+hf placement rules: `device: cuda` → any quantization; `dtype` `bf16` / `fp16` / omitted. `device: cpu` → `quantization: none` only and `dtype` **required** (`fp32` or `bf16`). Everything else is rejected.
 
 ## 5. Current task and next steps
 
-- **Current milestone:** M3. T3.1 done. **Waiting for user approval.**
-- **Recommended next task:** T3.2 `models.py`: `build_model(spec: ModelSpec) -> BaseModel` mapping to `effgen.models.load_model` (Ollama: `provider="openai_compatible"`, `base_url`, `context_length`; HF: `engine="transformers"`, `quantization_bits` **always passed** (None/8/4), `torch_dtype`, `device_map="auto"`) plus a cache keyed by the frozen/hashable `ModelSpec` so identical specs share one instance. Test by monkeypatching `load_model` (no GPU/Ollama).
-- **Alternative:** T4.1 workspace tools (depends only on T3.1).
-- **Still blocked:** T3.3 (Ollama not installed). T3.4 needs `bitsandbytes` (not installed).
-- **Relevant files:** `docs/implementation-plan.md` T3.2; `docs/architecture.md` §8; audit §1.5–§1.7; `src/smol_harness/config.py`.
-- **Cautions:** HF `dtype: None` means effGen's automatic choice, so pass `torch_dtype=None` rather than inventing one; the Ollama `context_length` goes to the adapter as `context_length=`; do not pass `quantization` strings through to effGen (use `quantization_bits`).
+- **Current milestone:** M3 partly done (T3.1, T3.2, T3.2a, T3.2b). **Waiting for user approval.**
+- **Done since the last handoff:** the CPU smoke test with a real checkpoint (T3.2b). A natural follow-up, if directed: run the same test on the actual fanless edge device (record RAM, timing and temperatures there), or a short effGen tool-calling check with this model (native-vs-ReAct, see audit). Neither is started.
+- **Other candidates:** T4.1 workspace tools (depends only on T3.1); the unplanned wiring step `HarnessConfig` → `ModelCache` → `build_harness` (fits with T5.1).
+- **Blocked:** T3.3 (Ollama not installed); real GPU load of a bnb-quantized model needs `bitsandbytes` (not installed).
+- **Relevant files:** `src/smol_harness/models.py`, `src/smol_harness/config.py` (`hf_placement_problem`), `tests/test_hf_device.py` (a pattern for offline real-engine tests).
+- **Cautions:** CPU mode has only been exercised on a tiny random model; expect slow generation and measure memory on the edge device. `device: cuda` fails fast without CUDA by design.
 
 ## 6. Known issues and warnings
 
@@ -135,7 +143,8 @@ Verified on 2026-10-16 (Linux, uv 0.11.29):
 cd /home/ch_kartik/Projects/Active/smol-harness
 uv sync --locked                 # creates .venv with Python 3.12 + effgen 1.3.0 (~2 min cold: torch/CUDA wheels)
 uv run python -c "import effgen; print(effgen.__version__)"   # -> 1.3.0
-uv run pytest -q                 # -> 318 passed
+uv run pytest -q                 # -> 460 passed, 1 skipped (real-model test)
+uv run pytest tests/integration/test_liquid_cpu.py --run-real-models -s   # opt-in; first run downloads ~714 MB, writes /tmp/smol-harness-lfm-cpu-smoke.json
 ```
 
 Not yet available: running the harness, integration tests, smoke tests. They'll be added after T1.3 and T5.1.

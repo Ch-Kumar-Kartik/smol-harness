@@ -23,8 +23,10 @@ MAX_SPAWN_DEPTH = 1  # fixed for the MVP: only the orchestrator delegates
 
 PROVIDERS = ("ollama", "hf")
 HF_QUANTIZATIONS = ("none", "bnb-8bit", "bnb-4bit-nf4")
+HF_DEVICES = ("cuda", "cpu")
+DEFAULT_HF_DEVICE = "cuda"  # the T3.2 behaviour: fail fast rather than fall back to CPU
 OLLAMA_QUANTIZATIONS = ("server",)
-HF_DTYPES = ("bf16", "fp16")
+HF_DTYPES = ("bf16", "fp16", "fp32")
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434/v1"  # Ollama's OpenAI-compatible endpoint (audit §1.5)
 
 # Tools the harness can build (T4.x). Anything else is rejected, whatever the YAML says.
@@ -53,7 +55,15 @@ class ModelSpec:
     quantization: str  # ollama: "server" (chosen by the tag) | hf: "none" | "bnb-8bit" | "bnb-4bit-nf4"
     base_url: str | None = None  # ollama only
     context_length: int | None = None  # ollama only (effGen cannot ask the server)
-    dtype: str | None = None  # hf only: "bf16" | "fp16"; None = effGen's automatic choice
+    dtype: str | None = None  # hf only: "bf16" | "fp16" | "fp32"; None = effGen's automatic choice (cuda only)
+    device: str | None = None  # hf only: "cuda" (default) | "cpu"; always None for ollama
+
+    def __post_init__(self) -> None:
+        if self.provider == "hf" and self.device is None:
+            # Normalised so that an omitted device and an explicit "cuda" are the same spec (cache key).
+            object.__setattr__(self, "device", DEFAULT_HF_DEVICE)
+        elif self.provider != "hf" and self.device is not None:
+            raise ValueError(f"device does not apply to provider {self.provider!r}")
 
 
 @dataclass(frozen=True)
@@ -139,6 +149,33 @@ def _seconds(value: Any, path: str) -> float:
     return float(value)
 
 
+def hf_placement_problem(device: Any, quantization: str, dtype: Any) -> str | None:
+    """Why this hf device/quantization/dtype combination is unsupported, or None if it is fine.
+
+    One rule set shared by config validation and `models.loader_args`. Rules (audit §1.6, T3.2a):
+    * cuda: any quantization; dtype bf16, fp16 or omitted (effGen then picks bf16/fp16 by GPU).
+    * cpu: quantization `none` only (bitsandbytes needs CUDA); dtype REQUIRED and fp32 or bf16.
+      effGen otherwise chooses a CPU dtype from whether CUDA happens to be present (bf16 on a
+      CUDA host, fp32 without), i.e. from the host rather than the config.
+    """
+    if device not in HF_DEVICES:
+        return f"must be one of {', '.join(HF_DEVICES)}, got {device!r}"
+    if dtype is not None and dtype not in HF_DTYPES:
+        return f"dtype must be one of {', '.join(HF_DTYPES)}, got {dtype!r}"
+    if device == "cpu":
+        if quantization != "none":
+            return (f"quantization {quantization!r} needs a CUDA GPU (bitsandbytes). With device: cpu use "
+                    "quantization: none and an explicit dtype")
+        if dtype is None:
+            return ("device: cpu requires an explicit dtype (fp32 or bf16); effGen would otherwise pick one "
+                    "depending on whether CUDA is present on the host")
+        if dtype not in ("fp32", "bf16"):
+            return f"dtype {dtype!r} is not supported on cpu; use fp32 or bf16"
+    elif dtype == "fp32":
+        return "dtype fp32 is only supported with device: cpu (cuda supports bf16, fp16, or omit it)"
+    return None
+
+
 # ---- sections ------------------------------------------------------------------------------------------
 def _quantization(value: Any, provider: str, path: str) -> str:
     if not isinstance(value, str):
@@ -193,14 +230,19 @@ def _model(value: Any, path: str) -> ModelSpec:
 
     # hf: quantization is required. If it were omitted effGen would pick 4/8-bit from free VRAM
     # on its own (audit §1.7), i.e. a silent substitution.
-    _keys(m, path, ("provider", "model", "quantization"), ("dtype",))
+    _keys(m, path, ("provider", "model", "quantization"), ("dtype", "device"))
     quant = _quantization(m["quantization"], provider, _join(path, "quantization"))
-    dtype = None
-    if "dtype" in m:
-        dtype = m["dtype"]
-        if dtype not in HF_DTYPES or not isinstance(dtype, str):
-            _fail(_join(path, "dtype"), f"must be one of {', '.join(HF_DTYPES)}, got {dtype!r}")
-    return ModelSpec(provider, _text(m["model"], _join(path, "model"), "model id", no_space=True), quant, dtype=dtype)
+    device = m.get("device", DEFAULT_HF_DEVICE)
+    dtype = m.get("dtype")
+    if "dtype" in m and (not isinstance(dtype, str) or dtype not in HF_DTYPES):
+        _fail(_join(path, "dtype"), f"must be one of {', '.join(HF_DTYPES)}, got {dtype!r}")
+    if not isinstance(device, str):
+        _fail(_join(path, "device"), f"must be one of {', '.join(HF_DEVICES)}, got {device!r}")
+    problem = hf_placement_problem(device, quant, dtype)
+    if problem:
+        _fail(_join(path, "dtype" if problem.startswith(("dtype", "device: cpu requires")) else "device"), problem)
+    return ModelSpec(provider, _text(m["model"], _join(path, "model"), "model id", no_space=True), quant,
+                     dtype=dtype, device=device)
 
 
 def _tools(value: Any, path: str, *, orchestrator: bool) -> tuple[str, ...]:

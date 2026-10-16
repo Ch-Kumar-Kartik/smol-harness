@@ -8,6 +8,7 @@ model and no network. Modelled on effGen's own `_Scripted` fake
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -110,3 +111,21 @@ class ScriptedModel(BaseModel):
 def scripted_model():
     """Factory: ``scripted_model(["turn 1", "turn 2"], name="orch")``."""
     return ScriptedModel
+
+
+# ---- real-model opt-in -------------------------------------------------------------------------------
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--run-real-models", action="store_true", default=False,
+        help="run tests marked `real_model`: they load real checkpoints and may download weights",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Tests marked `real_model` never run by accident: they need --run-real-models (or SMOL_RUN_REAL_MODELS=1)."""
+    if config.getoption("--run-real-models") or os.environ.get("SMOL_RUN_REAL_MODELS") == "1":
+        return
+    skip = pytest.mark.skip(reason="real-model test (may download weights): opt in with --run-real-models")
+    for item in items:
+        if "real_model" in item.keywords:
+            item.add_marker(skip)

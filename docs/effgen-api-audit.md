@@ -211,10 +211,10 @@ The user-namespace prerequisite was checked on this host on 2026-10-16: `unshare
 | Agent execution | Verified (source + runtime) | Implemented (orchestrator + worker `Agent`s via `Harness`) | Tested with scripted models (T1.1–T1.3) | `Agent` + `AgentConfig`; see 1.1 |
 | Subagent spawning | Partial: agent-as-tool supported; built-in managers unsuitable | Implemented (T1.2–T1.3) | Tested end-to-end with scripted models (T1.3); real models pending | Custom `delegate` tool (see architecture.md) |
 | Context isolation | Verified (source + runtime control test) | Implemented for workers (fresh `Agent` per delegation) | Tested at unit level (T1.2) | Fresh worker `Agent` per delegation around a shared model |
-| Ollama loading | Verified (source), via `openai_compatible` | Not started | Not tested | Ollama not installed on this host |
-| Hugging Face loading | Verified (source) | Not started | Not tested | Must pass `quantization_bits` explicitly |
-| Mixed providers | Plausible (independent `BaseModel` instances per agent) | Not started | Not tested | Unverified on a real run |
-| Quantization | Verified (source): bf16/fp16, bnb 8-bit, bnb NF4, Ollama GGUF tags | Not started | Not tested | FP4 not supported by effGen API |
+| Ollama loading | Verified (source + offline construction), via `openai_compatible` | `build_model` implemented (T3.2) | Adapter construction tested offline; server contact pending T3.3 | Ollama not installed on this host |
+| Hugging Face loading | Verified (source + routing; real engine on a tiny local model for CPU and CUDA) | `build_model` with explicit `device` implemented (T3.2, T3.2a) | Argument flow and real placement tested on a tiny model; a real checkpoint (LFM2.5-350M) loaded and ran on CPU (T3.2b); real GPU/quantized checkpoint pending T3.4 | Must pass `quantization_bits` explicitly |
+| Mixed providers | Plausible (independent `BaseModel` instances per agent) | Config + `ModelCache` support it (T3.1, T3.2) | Cache/identity tested with fakes; real mixed run pending T3.5 | Unverified on a real run |
+| Quantization | Verified (source): bf16/fp16, bnb 8-bit, bnb NF4, Ollama GGUF tags | Config validation (T3.1) and `quantization_bits` mapping (T3.2) implemented | Mapping tested; real quantized load pending T3.4 | FP4 not supported by effGen API |
 | Tool execution | Verified (source) | Not started | Not tested | `FileOperations` + sandboxed shell |
 | Execution limits | Partial: steps yes, wall clock no (hooks verified) | Worker deadline (cooperative, T2.1), failure propagation (T2.2), `max_delegations` and report truncation (T2.3) implemented; iteration caps are effGen's | Tested with scripted models (T2.1–T2.3) | Deadline middleware needed |
 
@@ -345,6 +345,51 @@ Status values: Not started, In progress, Implemented (unverified), Tested, Block
 - Tests: `uv run pytest -q` → 318 passed.
 - **Newly verified:** importing `smol_harness.config` and loading the example config does not import `torch` or `transformers` (checked via `sys.modules`); `effgen` itself is imported lazily and only `Agent`-level modules (including `effgen.models.base`) are loaded.
 - Limitations: the rules reflect effGen 1.3.0 source-level findings (§1.5–§1.7). Whether each accepted combination actually loads is verified only in T3.3–T3.5.
+
+### 2026-10-16 – T3.2 Model factory and cache
+- Added: `src/smol_harness/models.py` (`build_model`, `ModelCache`).
+- effGen APIs used: `effgen.models.load_model(model_id, provider=, base_url=, context_length=, engine=, quantization_bits=, require_gpu=, torch_dtype=)`, `OpenAICompatibleAdapter`, `BaseModel.model_type` / `.unload()`.
+- Files: `src/smol_harness/models.py`, `tests/test_models.py`.
+- Tests: `uv run pytest -q` → 405 passed.
+- **Verified at runtime (effGen 1.3.0, no model downloaded, no network; sockets blocked in the test):**
+  - `load_model("qwen2.5-coder:7b-instruct-q4_K_M", provider="openai_compatible", base_url="http://127.0.0.1:11434/v1", context_length=8192)` returns an exact `OpenAICompatibleAdapter` with `model_name` = the full tag (colon kept), `base_url` and `get_context_length() == 8192` as given, `is_loaded() == True`, `_provider == "openai_compatible"`, `model_type == ModelType.OPENAI`. Constructing it makes no network call (`openai` client creation only), so the Ollama server is first contacted on first use.
+  - **Silent id rewriting (new hazard):** with `provider="openai_compatible"`, effGen strips a leading `<alias>:` from the model id when the alias names that adapter. Confirmed for all of `openai`, `openai_compatible`, `openai-compatible`, `openai_compat`, `oai_compatible`, `compatible`, `server`, `vllm_server`, `local_server`: e.g. `server:latest` → the endpoint is asked for `latest`. Ordinary tags (`llama3:8b`, `qwen2.5-coder:7b-instruct-q4_K_M`, `mistral`) are untouched. The factory rejects such ids.
+  - **Quantization auto-selection (new evidence for §1.7):** called without `quantization_bits`, effGen's loader decided on its own. On this 8 GB machine the engine received `quantization_bits=4`; an explicit `quantization_bits=None` reaches the engine as `None` (checked against effGen's real routing with only `TransformersEngine` replaced by a recording stub, and with the VRAM heuristic pinned to 4 so the test is hardware-independent).
+  - hf routing delivers to `TransformersEngine(model_name, **params)`: `quantization_bits`, `torch_dtype` and `require_gpu` exactly as passed, plus `apply_chat_template=True` and `device_map="auto"` added by effGen itself (CUDA present). `model.load()` is called inside `load_model`, so a real hf load happens at that call. The convenience `load_model` builds a fresh `ModelLoader` per call, so there is no hidden cross-call cache.
+- **Source-level only (not run):** `TransformersEngine.model_type == ModelType.TRANSFORMERS` and its `quantization_bits` attribute (used by the factory's post-load check); `require_gpu=True` raising instead of CPU/offload fallback (TransformersEngine docstring; **partly wrong, see the T3.2a entry: it does not fail when CUDA is absent**); a bare hf id that equals a cloud-catalog slug could be routed to that provider when credentials exist (`model_loader_routing.py`, catalog routing), which the factory's result-type check would catch. Real-load verification is T3.4.
+- Limitations: no real model loaded; alias list mirrors effGen's private table (a control test re-checks effGen's behaviour each run).
+- Decisions: always pass `quantization_bits` and `require_gpu=True` for hf; refuse Ollama ids effGen would rewrite; one load attempt, no retry or fallback; wrap failures in `ModelLoadError` with the original as `__cause__`.
+
+### 2026-10-16 – T3.2a Explicit Hugging Face device selection
+- Added: `ModelSpec.device` (`cuda` default | `cpu`), shared placement rules (`config.hf_placement_problem`), CPU pinning and CUDA preflight in `models.py`.
+- effGen APIs used: `effgen.models.load_model(..., engine="transformers", quantization_bits=, require_gpu=, device_map=, torch_dtype=, use_flash_attention=)` and the resulting engine's `.device`, `.model`, `.unload()`.
+- Files: `src/smol_harness/config.py`, `src/smol_harness/models.py`, `tests/test_hf_device.py`, `tests/test_models.py`, `tests/test_config.py`.
+- Tests: `uv run pytest -q` → 458 passed.
+- **Verified at runtime (effGen 1.3.0, torch 2.14.1+cu130, GPU present; real engine on a locally generated 2-layer random Llama, no download):**
+  - `TransformersEngine` has **no device parameter**. `load()` sets `self.device="cuda"` whenever `torch.cuda.is_available()` (`transformers_engine_loading.py:load`), and a `device` kwarg is filtered out (`transformers_engine.py`, `additional_kwargs` skip list). `device_map` is only applied when the engine decided on CUDA (`_assemble_model_kwargs`), and when it is present the later `.to(cuda)` step is skipped.
+  - **CPU pinning works:** on a CUDA host, `device_map="cpu"` + `require_gpu=False` + `use_flash_attention=False` + explicit `torch_dtype` → every parameter on CPU, `hf_device_map` all CPU, engine `.device == "cpu"`, `torch.cuda.memory_allocated()` unchanged before, after load and after `generate`, generation works. effGen then logs a "did not fit in GPU memory" warning that is misleading in this case; harmless.
+  - **`require_gpu=False` alone does not prevent CUDA placement:** without `device_map="cpu"` the same load lands on `cuda:0` (8.6 MB allocated for the tiny model). `require_gpu=True` together with `device_map="cpu"` raises `GPUPlacementError` ("could not be placed entirely on the GPU"), so CPU mode must set `require_gpu=False`.
+  - **`require_gpu=True` does not fail when CUDA is unavailable** (simulated with `torch.cuda.is_available` patched to `False`): the model loads on CPU with no error, because it only compares the intended device with the final placement. This corrects the T3.2 note. `build_model` therefore checks CUDA availability itself for `device: cuda`.
+  - **Dtype is host-dependent:** CPU-pinned with `torch_dtype` omitted loads as `bfloat16` on a CUDA host and `float32` when CUDA is unavailable, so the config requires an explicit dtype for `device: cpu`.
+  - Default CUDA placement (no `device_map`, `require_gpu=True`): `device == "cuda"`, parameters on `cuda:0`; effGen itself adds `device_map="auto"`.
+  - effGen skips its `device_map="auto"` sampling probe when `device_map != "auto"`, so pinned placements run no CUDA forward pass.
+- **Source-level only:** bitsandbytes quantization on CPU is rejected by config because bnb needs CUDA (effGen's `BitsAndBytesConfig` is built regardless of device); it was not run. `fp16` on CPU is rejected as poorly supported, not measured.
+- Limitations: tiny random model only; no real checkpoint, no CPU performance or memory numbers; `cuda:N` selection unsupported.
+- Decisions: default `cuda` (existing configs and fail-fast unchanged); explicit dtype required on CPU; shared rule function; verify the engine's reported device after loading.
+
+### 2026-10-16 – T3.2b Liquid AI CPU smoke test (first real checkpoint)
+- Added: opt-in integration test `tests/integration/test_liquid_cpu.py` (no source change).
+- effGen APIs used: `build_model` → `effgen.models.load_model(path, engine="transformers", quantization_bits=None, require_gpu=False, device_map="cpu", use_flash_attention=False, torch_dtype=torch.float32)`; `model.generate(prompt, GenerationConfig(max_tokens=, temperature=, top_k=, repetition_penalty=))`; `Agent(AgentConfig(..., tools=[], tool_calling_mode="react", capability_probe=False)).run`.
+- Tests: default `uv run pytest -q` → 460 passed, 1 skipped; opt-in run → 1 passed.
+- **Verified at runtime (effGen 1.3.0, transformers 5.20.0, torch 2.14.1+cu130, real weights `LiquidAI/LFM2.5-350M@9e6c6ccf`, CPU, fp32):**
+  - effGen's `TransformersEngine` loads an `lfm2` checkpoint (`Lfm2ForCausalLM`, hybrid conv/attention) with no `trust_remote_code` and no code changes. A local snapshot path routes as a local model (no catalog or provider lookup) and works with the network blocked.
+  - The T3.2a CPU kwargs work on a real checkpoint: all 354,483,968 parameters `cpu`/`float32`, engine `device == "cpu"`, CUDA allocation/reservation delta 0, no CUDA context created even though torch sees a CUDA GPU, process not listed by `nvidia-smi`. A BF16 checkpoint loaded with `torch_dtype=float32` is upcast (weights 1352 MiB; peak process RSS 2549 MiB).
+  - `model.generate` returns `GenerationResult(text='Paris', tokens_used=2, finish_reason='stop')` in 0.31 s; a no-tool `Agent.run` returns `success=True`, `termination='done'`, `iterations=1`, output `Paris` in 0.21 s. The agent reported `tokens_used=32` for the same prompt (what is counted was not investigated).
+  - `model.supports_tool_calling()` is `True` (the chat template renders tools), and `get_context_length()` is `128000`, read from `max_position_embeddings`; the model card states a 32,768-token context.
+  - transformers logs that `causal_conv1d_fn` / `causal_conv1d_update` fall back to the reference PyTorch implementation because the optional CUDA package `causal_conv1d` is not installed (correct output, slower).
+- **Source-level / not verified:** whether effGen's native tool-calling path parses LFM2.5's default Pythonic `<|tool_call_start|>…<|tool_call_end|>` calls (the card says JSON calls need a system-prompt request); reliability of effGen's ReAct final-answer format on longer prompts; bf16 on CPU; behaviour and timing on the actual edge device.
+- Limitations: one trivial prompt; development laptop (actively cooled, 8 torch threads on a 16-thread Ryzen 7 7840HS) is not representative of an edge SoC; the model card says the model is not recommended for programming or knowledge-intensive tasks, so its suitability as a coding worker is doubtful; license tag `other` (LFM1.0) not reviewed.
+- Decisions: keep the model (it is instruction-tuned); pin the Hub revision and load from the local snapshot path with the network blocked; run real-model tests only with explicit opt-in; coherence check on the answer; record measurements, assert only placement and success.
 
 (Further entries follow this format.)
 
