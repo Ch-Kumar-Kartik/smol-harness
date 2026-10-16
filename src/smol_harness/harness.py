@@ -17,6 +17,7 @@ from smol_harness.delegation import (
     DelegateTool,
     WorkerRecord,
     WorkerRegistry,
+    validate_limits,
 )
 
 
@@ -37,7 +38,12 @@ class Harness:
         orchestrator: AgentConfig,
         registry: WorkerRegistry,
         worker_timeout_s: float | None = None,
+        max_delegations: int | None = None,
+        max_report_chars: int | None = None,
     ) -> None:
+        validate_limits(max_delegations, max_report_chars)  # fail at build time, not mid-run
+        self.max_delegations = max_delegations
+        self.max_report_chars = max_report_chars
         if any(t.name == DELEGATE_TOOL_NAME for t in orchestrator.tools):
             raise ValueError(f"orchestrator config must not already hold {DELEGATE_TOOL_NAME!r}")
         self._orchestrator = orchestrator
@@ -51,7 +57,10 @@ class Harness:
         (audit §1.4), so independent runs must not share one.
         """
         records: list[WorkerRecord] = []
-        delegate = DelegateTool(self.registry, records, self.worker_timeout_s)
+        delegate = DelegateTool(
+            self.registry, records, self.worker_timeout_s,
+            max_delegations=self.max_delegations, max_report_chars=self.max_report_chars,
+        )
         config = replace(self._orchestrator, tools=[*self._orchestrator.tools, delegate], enable_sub_agents=False)
         with Agent(config) as agent:
             response = agent.run(task)
@@ -69,12 +78,16 @@ def build_harness(
     workers: Mapping[str, AgentConfig],
     descriptions: Mapping[str, str] | None = None,
     worker_timeout_s: float | None = None,
+    max_delegations: int | None = None,
+    max_report_chars: int | None = None,
 ) -> Harness:
     """Register `workers` (name -> config) and return a `Harness` for `orchestrator`.
 
-    `worker_timeout_s` is a cooperative per-delegation deadline (None = none).
+    `worker_timeout_s` is a cooperative per-delegation deadline; `max_delegations` caps
+    delegation attempts per `run`; `max_report_chars` caps each report's serialized size.
+    None = no limit for all three.
     """
     registry = WorkerRegistry()
     for name, config in workers.items():
         registry.register(name, config, (descriptions or {}).get(name, ""))
-    return Harness(orchestrator, registry, worker_timeout_s)
+    return Harness(orchestrator, registry, worker_timeout_s, max_delegations, max_report_chars)

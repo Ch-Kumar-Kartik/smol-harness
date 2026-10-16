@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import time
 from dataclasses import fields
 
@@ -17,11 +18,14 @@ from effgen import Agent, AgentConfig, RunStoppedError, tool
 from effgen.models.errors import BackendUnreachableError
 
 from smol_harness.delegation import (
+    MIN_REPORT_CHARS,
+    TRUNCATION_MARK,
     DeadlineMiddleware,
     DelegateTool,
     WorkerRegistry,
     WorkerResult,
     WorkerTimeout,
+    bounded,
 )
 from smol_harness.harness import build_harness
 
@@ -470,3 +474,245 @@ def test_retrying_the_identical_failing_delegation_forever_ends_stuck_not_tool_f
     assert result.response.stop_reason == "loop_detected"
     assert len(result.workers) == 1  # effGen does not re-dispatch the repeated identical call
     assert len(om.calls) == 4
+
+
+# =====================================================================================
+# T2.3: max_delegations, max_report_chars, iteration limits
+# =====================================================================================
+def long_answer(n: int) -> str:
+    return "Thought: d.\nFinal Answer: " + "x" * n
+
+
+def counting_registry(answer: str = ANSWER, name: str = "w", **over):
+    """One-worker registry; `created` lists every Agent build (to prove refusals build nothing)."""
+    model = ScriptedModel([answer])
+    reg = WorkerRegistry()
+    reg.register(name, cfg(model, name=name, **over))
+    created: list[str] = []
+    real_create = reg.create
+    reg.create = lambda n: created.append(n) or real_create(n)  # type: ignore[method-assign]
+    return reg, model, created
+
+
+# ---- max_delegations -----------------------------------------------------------------------------
+def test_n_delegations_allowed_and_n_plus_one_refused():
+    reg, model, created = counting_registry()
+    records: list = []
+    dt = DelegateTool(reg, records, max_delegations=2)
+    reports = [delegate(dt, worker="w", task=f"job {i}") for i in range(3)]
+    assert [r["status"] for r in reports] == ["completed", "completed", "failed"]
+    refused = reports[2]
+    assert refused["error_type"] == "delegation_limit_reached"
+    assert "at most 2 delegations" in refused["error"] and "Do not delegate again" in refused["error"]
+    assert refused["output"] == "" and refused["termination"] is None
+    assert [r.status for r in records] == ["completed", "completed", "failed"]  # the refusal is recorded too
+
+
+def test_refused_delegations_do_not_build_or_run_a_worker():
+    reg, model, created = counting_registry()
+    dt = DelegateTool(reg, max_delegations=1)
+    delegate(dt, worker="w", task="first")
+    assert created == ["w"] and len(model.calls) == 1
+    for i in range(4):  # known worker, unknown worker, blank task: all refused before any lookup
+        r = delegate(dt, worker=["w", "nobody", "w", "w"][i], task=["x", "x", "   ", "again"][i])
+        assert r["error_type"] == "delegation_limit_reached"
+    assert created == ["w"] and len(model.calls) == 1
+
+
+def test_every_attempt_gets_a_unique_delegation_id_including_refusals():
+    reg, _, _ = counting_registry()
+    dt = DelegateTool(reg, max_delegations=2)
+    ids = [delegate(dt, worker="w", task=f"t{i}")["delegation_id"] for i in range(5)]
+    assert ids == ["d1", "d2", "d3", "d4", "d5"]
+
+
+def test_delegation_counter_resets_for_every_harness_run():
+    reg_models = ScriptedModel([ANSWER])
+    om = ScriptedModel([delegate_turn("a"), delegate_turn("b"), "Final Answer: r1",
+                        delegate_turn("c"), delegate_turn("d"), "Final Answer: r2"], name="orch", on_exhausted="raise")
+    h = build_harness(cfg(om, "orch"), {"w": cfg(reg_models, "w")}, max_delegations=1)
+    for _ in range(2):
+        r = h.run("USER TASK")
+        assert [(w.result.delegation_id, w.status) for w in r.workers] == [("d1", "completed"), ("d2", "failed")]
+        assert r.workers[1].result.error_type == "delegation_limit_reached" and r.success
+    assert len(reg_models.calls) == 2  # one real worker run per harness run
+
+
+def test_orchestrator_continues_after_a_delegation_limit_refusal():
+    om = ScriptedModel([delegate_turn("a"), delegate_turn("b"), "Thought: ok.\nFinal Answer: finished with one result"],
+                       name="orch", on_exhausted="raise")
+    h = build_harness(cfg(om, "orch"), {"w": cfg(ScriptedModel([ANSWER]), "w")}, max_delegations=1)
+    result = h.run("USER TASK")
+    assert result.success is True and result.termination == "done"
+    assert result.output == "finished with one result" and len(om.calls) == 3
+    refusal = json.loads(om.calls[2].prompt.split("Observation:")[-1])
+    assert refusal["error_type"] == "delegation_limit_reached" and refusal["delegation_id"] == "d2"
+
+
+def test_a_parent_that_keeps_delegating_past_the_limit_is_stopped_by_its_own_iteration_cap():
+    # Refusals are unique (delegation_id), so effGen's repeated-result guard does not fire first.
+    turns = [delegate_turn(f"job {i}") for i in range(10)]
+    om = ScriptedModel(turns, name="orch", on_exhausted="raise")
+    h = build_harness(cfg(om, "orch", max_iterations=6), {"w": cfg(ScriptedModel([ANSWER]), "w")}, max_delegations=1)
+    result = h.run("USER TASK")
+    assert result.success is False and result.termination == "stuck"
+    # `_partial`: the run had a real tool result; `_exhausted` is what a run with none gets (U11)
+    assert result.response.stop_reason == "max_iterations_partial"
+    # the 6th model call's delegation is never dispatched: effGen stops at the cap first
+    assert len(om.calls) == 6 and [w.status for w in result.workers] == ["completed"] + ["failed"] * 4
+
+
+def test_tool_description_tells_the_parent_its_budget():
+    reg, _, _ = counting_registry()
+    assert "at most 3 times" in DelegateTool(reg, max_delegations=3).metadata.description
+    assert "at most" not in DelegateTool(reg).metadata.description
+
+
+# ---- repeated-result guard compatibility -------------------------------------------------------------
+def test_identical_worker_outputs_stay_distinguishable():
+    reg, _, _ = counting_registry(answer=long_answer(50))
+    dt = DelegateTool(reg)
+    a, b = (asyncio.run(dt.execute(worker="w", task=t)).output for t in ("one", "two"))
+    assert a != b and json.loads(a)["output"] == json.loads(b)["output"]
+    assert json.loads(a)["delegation_id"] != json.loads(b)["delegation_id"]
+
+
+def test_parent_is_not_stopped_by_identical_worker_outputs_even_when_truncated():
+    om = ScriptedModel([delegate_turn("a"), delegate_turn("b"), delegate_turn("c"), "Final Answer: all three agreed"],
+                       name="orch", on_exhausted="raise")
+    h = build_harness(cfg(om, "orch"), {"w": cfg(ScriptedModel([long_answer(3000)]), "w")}, max_report_chars=500)
+    result = h.run("USER TASK")
+    assert result.success is True and result.termination == "done"
+    assert [w.status for w in result.workers] == ["completed"] * 3
+
+
+# ---- max_report_chars --------------------------------------------------------------------------------------
+def test_large_output_is_truncated_to_the_limit_and_stays_valid_json():
+    reg, _, _ = counting_registry(answer=long_answer(5000))
+    records: list = []
+    raw = asyncio.run(DelegateTool(reg, records, max_report_chars=600).execute(worker="w", task="t")).output
+    assert isinstance(raw, str) and len(raw) <= 600
+    data = json.loads(raw)
+    assert data["truncated"] is True and data["output"].endswith(TRUNCATION_MARK)
+    assert data["status"] == "completed" and data["worker"] == "w" and data["delegation_id"] == "d1"
+    assert data["termination"] == "done" and data["iterations"] >= 1 and data["tokens_used"] > 0
+    assert len(data["output"]) > 100  # most of the budget goes to the output, not to a token stub
+    assert records[0].result.output == "x" * 5000 and records[0].result.truncated is True  # harness keeps it whole
+
+
+def test_a_report_that_fits_is_left_alone():
+    reg, _, _ = counting_registry()
+    data = delegate(DelegateTool(reg, max_report_chars=2000), worker="w", task="t")
+    assert data["truncated"] is False and data["output"] == "all done" and TRUNCATION_MARK not in json.dumps(data)
+
+
+def test_failure_metadata_survives_truncation():
+    # effGen already shortens long exception text itself (~270 chars: "... (25000 characters)"), so
+    # the long error here is ours: an unknown worker name is echoed in the message.
+    reg, _, _ = counting_registry()
+    raw = asyncio.run(DelegateTool(reg, max_report_chars=600).execute(worker="n" * 3000, task="t")).output
+    data = json.loads(raw)
+    assert len(raw) <= 600 and data["truncated"] is True and data["error"].endswith(TRUNCATION_MARK)
+    assert data["error"].startswith("Unknown worker 'nnnn")  # the useful head survives
+    assert (data["status"], data["error_type"], data["delegation_id"]) == ("failed", "unknown_worker", "d1")
+
+
+def test_bounded_preserves_every_essential_field():
+    r = WorkerResult(worker="coder", status="timeout", delegation_id="d12", output="o" * 9000, error="e" * 9000,
+                     error_type="WorkerTimeout", termination="stuck", iterations=7, tool_calls=5, tokens_used=1234)
+    out = bounded(r, MIN_REPORT_CHARS + 50)
+    data = json.loads(out.to_json())
+    assert len(out.to_json()) <= MIN_REPORT_CHARS + 50 and data["truncated"] is True
+    assert (data["worker"], data["status"], data["delegation_id"], data["error_type"], data["termination"]) == (
+        "coder", "timeout", "d12", "WorkerTimeout", "stuck")
+    assert (data["iterations"], data["tool_calls"], data["tokens_used"]) == (7, 5, 1234)
+
+
+def test_bounded_always_fits_and_stays_valid_json_for_hostile_content():
+    rng = random.Random(0)
+    alphabet = ['a', 'b', ' ', '\n', '"', '\\', '\t', '\u00e9', '\u4e2d', '\U0001F600', '\x01', '{', '}']
+
+    def text(n):
+        return "".join(rng.choice(alphabet) for _ in range(n))
+
+    for _ in range(400):
+        limit = rng.choice([MIN_REPORT_CHARS, MIN_REPORT_CHARS + 1, 400, 777, 1500, 4000])
+        r = WorkerResult(
+            worker=rng.choice(["w", text(rng.randint(0, 3000))]),
+            status=rng.choice(["completed", "failed", "timeout"]),
+            delegation_id=f"d{rng.randint(1, 10**9)}",
+            output=text(rng.randint(0, 6000)),
+            error=rng.choice([None, text(rng.randint(0, 6000))]),
+            error_type=rng.choice([None, "BackendUnreachableError", text(rng.randint(0, 800))]),
+            termination=rng.choice([None, "stuck", "tool_failed", "not_possible"]),
+            iterations=rng.randint(0, 10**9), tool_calls=rng.randint(0, 10**9), tokens_used=rng.randint(0, 10**9),
+        )
+        out = bounded(r, limit)
+        raw = out.to_json()
+        assert len(raw) <= limit, (limit, len(raw))
+        data = json.loads(raw)
+        assert data["status"] == r.status and data["delegation_id"] == r.delegation_id
+        assert data["termination"] == r.termination and data["iterations"] == r.iterations
+        if len(r.to_json()) > limit:
+            assert data["truncated"] is True
+        else:
+            assert out is r  # untouched when it already fits
+
+
+def test_oversized_model_supplied_worker_name_cannot_break_the_limit():
+    reg, _, _ = counting_registry()
+    raw = asyncio.run(DelegateTool(reg, max_report_chars=500).execute(worker="n" * 20000, task="t")).output
+    data = json.loads(raw)
+    assert len(raw) <= 500 and data["status"] == "failed" and data["error_type"] == "unknown_worker"
+    assert data["delegation_id"] == "d1"
+
+
+def test_harness_report_limit_reaches_the_parent_prompt():
+    om = ScriptedModel([delegate_turn("a"), "Final Answer: noted"], name="orch", on_exhausted="raise")
+    h = build_harness(cfg(om, "orch"), {"w": cfg(ScriptedModel([long_answer(4000)]), "w")}, max_report_chars=450)
+    result = h.run("USER TASK")
+    obs = om.calls[1].prompt.split("Observation:")[-1].strip()
+    obs = obs.split("\n\n")[0]  # drop anything effGen appends after the observation
+    assert len(obs) <= 450 and json.loads(obs)["truncated"] is True
+    assert result.success is True and result.termination == "done"
+
+
+# ---- invalid configuration ----------------------------------------------------------------------------------
+@pytest.mark.parametrize("bad", [0, -1, True, 1.5, "3"])
+def test_invalid_max_delegations_rejected(bad):
+    with pytest.raises(ValueError, match="max_delegations"):
+        DelegateTool(WorkerRegistry(), max_delegations=bad)
+    with pytest.raises(ValueError, match="max_delegations"):
+        build_harness(cfg(ScriptedModel(["x"]), "o"), {}, max_delegations=bad)
+
+
+@pytest.mark.parametrize("bad", [0, -1, MIN_REPORT_CHARS - 1, True, 2.5, "500"])
+def test_invalid_or_impossibly_small_max_report_chars_rejected(bad):
+    with pytest.raises(ValueError, match="max_report_chars"):
+        DelegateTool(WorkerRegistry(), max_report_chars=bad)
+    with pytest.raises(ValueError, match="max_report_chars"):
+        build_harness(cfg(ScriptedModel(["x"]), "o"), {}, max_report_chars=bad)
+
+
+def test_boundary_and_none_limits_accepted():
+    DelegateTool(WorkerRegistry(), max_delegations=1, max_report_chars=MIN_REPORT_CHARS)
+    DelegateTool(WorkerRegistry(), max_delegations=None, max_report_chars=None)
+    build_harness(cfg(ScriptedModel(["x"]), "o"), {}, max_delegations=5, max_report_chars=MIN_REPORT_CHARS)
+
+
+# ---- iteration limits are effGen's, and stay structured --------------------------------------------------------------
+def test_worker_iteration_cap_is_effgens_and_stays_structured():
+    model = ScriptedModel(STEP_TURNS)
+    reg = WorkerRegistry()
+    reg.register("w", cfg(model, tools=[step], max_iterations=2, raise_on_error=True))
+    data = delegate(DelegateTool(reg), worker="w", task="t")
+    assert data["status"] == "failed" and data["error_type"] == "worker_run_failed" and data["termination"] == "stuck"
+    assert data["iterations"] == 2 and len(model.calls) == 2  # stopped at its own cap, no second mechanism
+
+
+def test_parent_iteration_cap_is_effgens_too():
+    om = ScriptedModel([delegate_turn(f"job {i}") for i in range(8)], name="orch", on_exhausted="raise")
+    h = build_harness(cfg(om, "orch", max_iterations=3), {"w": cfg(ScriptedModel([ANSWER]), "w")})
+    result = h.run("USER TASK")
+    assert result.success is False and result.response.stop_reason == "max_iterations_partial"
+    assert len(om.calls) == 3 and len(result.workers) == 2  # the last call's delegation is not dispatched

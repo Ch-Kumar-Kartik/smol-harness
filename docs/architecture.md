@@ -107,7 +107,7 @@ tests/           # unit tests use scripted effGen BaseModel fakes (no GPU / netw
 
 | Module | Responsibility | Must NOT |
 |---|---|---|
-| `config.py` | Parse and validate one YAML file into frozen dataclasses: `ModelSpec(provider, model, base_url, quantization, dtype, context_length, request_timeout)`, `AgentSpec(name, description, model, tools, system_prompt, max_iterations)`, `Limits(worker_timeout_s, max_report_chars, max_delegations)`, `HarnessConfig(workspace, orchestrator, workers)`. Reject unknown tools, unknown quantization values for a provider, and duplicate names. | Load models or construct agents |
+| `config.py` | Parse and validate one YAML file into frozen dataclasses (T3.1, built): `ModelSpec(provider, model, quantization, base_url, context_length, dtype)`, `AgentSpec(name, model, tools, max_iterations, description, system_prompt)`, `Limits(max_delegations, max_report_chars, worker_timeout_s, max_depth)`, `HarnessConfig(workspace, orchestrator, workers, limits)`. Errors are `ConfigError` with a dotted path. Rejects unknown tools / web-browser tools / `delegate` on workers, unsupported or cross-provider quantization, duplicate names (also duplicate YAML keys), non-finite or out-of-range limits. See §8 for the schema decisions. | Load models, construct agents or tools, touch the filesystem or network |
 | `models.py` | `build_model(spec) -> effgen BaseModel` via `effgen.models.load_model`. Map our quantization enum to effGen kwargs. Cache instances by spec so identical specs share weights. | Implement inference, a provider base class, or quantization |
 | `tools.py` | `build_tools(names, workspace) -> list[BaseTool]` from a fixed registry: `file_operations`, `shell` (later maybe `edit_file`). | Register web or network tools; implement path checks effGen already does |
 | `delegation.py` | `DelegateTool` (an effGen `BaseTool`), `WorkerResult` / `WorkerRecord`, `WorkerRegistry` (in-memory lifecycle: `pending → running → completed / failed / timeout`), `DeadlineMiddleware`. | Run its own reasoning loop; merge histories |
@@ -141,7 +141,7 @@ sequenceDiagram
     H-->>User: final output + worker records
 ```
 
-### Delegate tool contract (implemented except `duration_s` and truncation; `delegation_id` and the `timeout` status were added in T2.2 / T2.1)
+### Delegate tool contract (implemented except `duration_s`; `timeout` status T2.1, `delegation_id` T2.2, `truncated` and limits T2.3)
 
 - **Input:**
   - `worker`: enum of configured worker names.
@@ -188,6 +188,7 @@ The harness's provider vocabulary is deliberately tiny. It maps 1:1 to effGen ca
 
 - **Always pass `quantization_bits` explicitly**, including `None`, to defeat effGen's VRAM-based auto-quantization.
 - `bnb-4bit-fp4` is rejected at config validation, because effGen hard-codes NF4.
+- **Config schema as built (T3.1), `configs/example.yaml`:** top level `workspace`, `orchestrator`, `workers` (a **list** with `name:`, so duplicate names are detectable), optional `limits`. Per model: `ollama` takes `model`, `context_length` (**required**: effGen cannot ask the server and would silently assume 32768), optional `quantization` (only `server`, default) and `base_url`; `hf` takes `model`, `quantization` (**required**: omitted, effGen would auto-pick 4/8-bit from free VRAM) and optional `dtype` (`bf16`/`fp16`). Fields of the other provider are rejected. There is no `request_timeout` (not an MVP control). Every agent lists its `tools` explicitly (`[]` allowed); the orchestrator may list `delegate` (implicit, not stored), workers may not. Limits are finite integers/numbers in fixed ranges; `max_depth` must be 1.
 - The model cache key is the full `ModelSpec`. Orchestrator and worker may share one instance when their specs are identical.
 - **Hardware note:** RTX 4060 Laptop, 8 GB VRAM, 14 GB RAM. A realistic first pairing is an Ollama ~7B Q4 orchestrator with an HF ~1.5B NF4 worker. **Unverified**; VRAM co-residency must be measured in T3.4.
 
@@ -211,8 +212,8 @@ The harness's provider vocabulary is deliberately tiny. It maps 1:1 to effGen ca
 | Max steps per agent | `AgentSpec.max_iterations` | `AgentConfig.max_iterations` (effGen) |
 | Per-worker timeout | `Limits.worker_timeout_s` | `DeadlineMiddleware`: `before_model_call` / `before_tool_call` raise `WorkerTimeout` once the deadline has passed, which stops the worker run (middleware exceptions propagate, audit §1.8). Plus the HTTP `timeout` on Ollama and shell timeouts. **Cooperative:** it cannot pre-empt an in-flight Transformers `generate()` or a running tool, so worst-case overrun is one call. As built (T2.1): a fresh instance per delegation passed via `agent.run(middleware=[...])`; a timeout is recognised by the instance's `expired` flag, giving `WorkerResult.status="timeout"`. |
 | Max depth | structural (= 1) | see §6 |
-| Max delegations per run | `Limits.max_delegations` | Counter in `DelegateTool` |
-| Report size | `Limits.max_report_chars` | Truncation in `DelegateTool` |
+| Max delegations per run | `max_delegations` (`build_harness`/`DelegateTool`) | Per-run counter in `DelegateTool`; attempt N+1 onward is refused *before any lookup* with `status="failed"`, `error_type="delegation_limit_reached"`, still a successful tool call, still a unique `delegation_id`, no worker built (T2.3) |
+| Report size | `max_report_chars` | `bounded()` shrinks the report until its *serialized JSON* fits: caps `worker`/`error_type` at 64 chars, cuts `output` then `error` (marker `...[truncated]`), sets `truncated: true`. Never touches `delegation_id`/`status`/`termination`/counters. Limits below `MIN_REPORT_CHARS` (346) are rejected (T2.3) |
 | Orchestrator wall clock | optional; same middleware | post-MVP unless needed |
 | Failure propagation | `WorkerResult.status` / `error` | Exceptions (`RunStoppedError`, `BackendUnreachableError`, `WorkerTimeout`, others) are caught in `DelegateTool` and reported. Orchestrator errors propagate to the CLI (exit code ≠ 0). |
 

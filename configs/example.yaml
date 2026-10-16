@@ -1,0 +1,38 @@
+# Example smol-harness configuration (validated by smol_harness.config; nothing here is loaded
+# until the model tasks in docs/implementation-plan.md).
+# Model ids below are examples. The orchestrator/worker pairing is NOT yet verified to fit in the
+# 8 GB VRAM of the development machine (see docs/new-session.md, U7).
+
+# Directory the agents work in. Relative paths are relative to this file. It need not exist yet.
+workspace: ../workspace
+
+# Every limit is finite. Omitted keys fall back to these same defaults.
+limits:
+  max_delegations: 4        # delegation attempts per run; the next one is refused
+  max_report_chars: 4000    # serialized size of each worker report seen by the orchestrator
+  worker_timeout_s: 300     # cooperative: checked before each model/tool call, never interrupts one
+  max_depth: 1              # fixed in the MVP; only the orchestrator delegates
+
+orchestrator:
+  model:
+    provider: ollama
+    model: qwen2.5-coder:7b-instruct-q4_K_M   # quantization is chosen by this tag
+    quantization: server
+    context_length: 8192    # must not exceed the window Ollama actually serves (num_ctx)
+    base_url: http://127.0.0.1:11434/v1
+  tools: [file_operations]  # `delegate` is always available to the orchestrator
+  max_iterations: 8
+  system_prompt: >-
+    You coordinate worker agents. Split the user's task into self-contained pieces, delegate them
+    with the delegate tool, and answer from the workers' reports.
+
+workers:
+  - name: coder
+    description: Reads, searches and edits files in the workspace and runs shell commands.
+    model:
+      provider: hf
+      model: Qwen/Qwen2.5-Coder-1.5B-Instruct
+      quantization: bnb-4bit-nf4   # quantized while loading (bitsandbytes NF4)
+      dtype: bf16
+    tools: [file_operations, shell]
+    max_iterations: 6

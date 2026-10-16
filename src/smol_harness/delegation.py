@@ -100,6 +100,8 @@ class WorkerResult:
     # (stop_reason `repeated_tool_result`), which two identical failure (or
     # success) reports from different delegations would otherwise trigger.
     delegation_id: str = ""
+    # True when output/error/etc. were cut to fit max_report_chars (see bounded()).
+    truncated: bool = False
     output: str = ""
     error: str | None = None
     error_type: str | None = None
@@ -109,11 +111,84 @@ class WorkerResult:
     tokens_used: int = 0
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self))
+        # ensure_ascii=False: max_report_chars counts characters, and the parent model reads text.
+        return json.dumps(asdict(self), ensure_ascii=False)
 
 
 def _failed(worker: str, error_type: str, error: str) -> WorkerResult:
     return WorkerResult(worker=worker, status="failed", error=error, error_type=error_type)
+
+
+TRUNCATION_MARK = "...[truncated]"
+ID_FIELD_CAP = 64  # chars kept of `worker` / `error_type` when a report has to be shrunk
+
+# Smallest max_report_chars we accept: the report's fixed part with every
+# variable-length field (worker, error_type, output, error text) emptied, at
+# worst-case id/counter widths, plus room for a short message. bounded() can
+# always shrink a report to its fixed part, so any limit >= this is honoured.
+MIN_REPORT_CHARS = len(WorkerResult(
+    worker="", status="completed", delegation_id="d" + "9" * 9, truncated=True,
+    termination="not_possible", iterations=10**9, tool_calls=10**9, tokens_used=10**9,
+).to_json()) + 100
+
+
+def validate_limits(max_delegations: int | None, max_report_chars: int | None) -> None:
+    """Reject nonsensical limits up front (None means unlimited)."""
+    for name, value, minimum in (
+        ("max_delegations", max_delegations, 1),
+        ("max_report_chars", max_report_chars, MIN_REPORT_CHARS),
+    ):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"{name} must be an integer >= {minimum} or None, got {value!r}")
+
+
+def _shrink_field(r: WorkerResult, name: str, limit: int, mark: str) -> WorkerResult:
+    """Keep the longest prefix of field `name` (+ `mark`) whose whole report fits `limit`."""
+    text = getattr(r, name)
+    if not text:
+        return r
+
+    def with_n(n: int) -> WorkerResult:
+        return replace(r, **{name: text[:n] + mark})
+
+    if len(with_n(0).to_json()) > limit:
+        return replace(r, **{name: ""})
+    lo, hi = 0, len(text) - 1
+    while lo < hi:  # serialized length only grows with n, so binary search is sound
+        mid = (lo + hi + 1) // 2
+        if len(with_n(mid).to_json()) <= limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    return with_n(lo)
+
+
+def bounded(result: WorkerResult, limit: int | None) -> WorkerResult:
+    """`result`, shrunk if needed so that `result.to_json()` is at most `limit` characters.
+
+    Measured on the serialized JSON (escaping included). Caps `worker`/`error_type` at
+    ID_FIELD_CAP, cuts `output` then `error` (each ends with TRUNCATION_MARK), and only as a
+    last resort shrinks `worker` and `error_type` further.
+    `delegation_id`, `status`, `termination`, the counters and `truncated=True` are
+    never touched, so the parent still gets a unique, valid, self-describing report.
+    """
+    if limit is None or len(result.to_json()) <= limit:
+        return result
+    r = replace(result, truncated=True)
+    # A model-supplied (unknown) worker name can be arbitrarily long and would starve the useful
+    # fields, so cap the two identifier-like fields first. Real names / error types are shorter.
+    r = replace(r, worker=r.worker[:ID_FIELD_CAP])
+    if r.error_type:
+        r = replace(r, error_type=r.error_type[:ID_FIELD_CAP])
+    # Then the free text, then (last resort) the identifiers themselves; `worker` before
+    # `error_type`, which is what tells the parent what went wrong.
+    for name, mark in (("output", TRUNCATION_MARK), ("error", TRUNCATION_MARK), ("worker", ""), ("error_type", "")):
+        if len(r.to_json()) <= limit:
+            break
+        r = _shrink_field(r, name, limit, mark)
+    return r
 
 
 def _timed_out(worker: str, deadline: DeadlineMiddleware) -> WorkerResult:
@@ -212,9 +287,14 @@ class DelegateTool(BaseTool):
         records: list[WorkerRecord] | None = None,
         worker_timeout_s: float | None = None,
         clock: Callable[[], float] = time.monotonic,
+        max_delegations: int | None = None,
+        max_report_chars: int | None = None,
     ) -> None:
         if worker_timeout_s is not None and worker_timeout_s <= 0:
             raise ValueError(f"worker_timeout_s must be > 0 or None, got {worker_timeout_s!r}")
+        validate_limits(max_delegations, max_report_chars)
+        self._max_delegations = max_delegations  # None = unlimited
+        self._max_report_chars = max_report_chars  # None = unbounded
         self._registry = registry
         # None = no deadline. Otherwise a fresh DeadlineMiddleware per delegation.
         self._timeout_s = worker_timeout_s
@@ -233,6 +313,7 @@ class DelegateTool(BaseTool):
                 "Delegate a self-contained task to a worker agent and get back its JSON report "
                 f"(status, output, error). Available workers - {workers or 'none'}. "
                 "The worker cannot see your conversation, so put everything it needs in task/context."
+                + (f" You may delegate at most {max_delegations} times in total." if max_delegations else "")
             ),
             category=ToolCategory.COMMUNICATION,
             parameters=[
@@ -246,12 +327,24 @@ class DelegateTool(BaseTool):
         ))
 
     async def _execute(self, worker: str, task: str, context: str | None = None, **kwargs: Any) -> str:
+        # Every attempt that reaches the tool (refused ones included) gets a unique id. Calls effGen
+        # rejects for bad arguments never get here, so they are not counted.
         self._seq += 1
         delegation_id = f"d{self._seq}"
-        result = await self._delegate(worker, task, context)
+        if self._max_delegations is not None and self._seq > self._max_delegations:
+            # Checked before anything else: no worker is looked up, built or run.
+            result = _failed(
+                worker, "delegation_limit_reached",
+                f"Delegation limit reached: at most {self._max_delegations} delegations are allowed in this "
+                "run and they have all been used. Do not delegate again; finish with what you have.",
+            )
+        else:
+            result = await self._delegate(worker, task, context)
         result.delegation_id = delegation_id
+        report = bounded(result, self._max_report_chars)  # what the parent sees
+        result.truncated = report.truncated
         self.records.append(WorkerRecord(worker=worker, task=task, context=context, result=result))
-        return result.to_json()
+        return report.to_json()
 
     async def _delegate(self, worker: str, task: str, context: str | None) -> WorkerResult:
         # Unknown worker / blank task are recoverable model mistakes: structured

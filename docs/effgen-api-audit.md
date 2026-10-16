@@ -216,7 +216,7 @@ The user-namespace prerequisite was checked on this host on 2026-10-16: `unshare
 | Mixed providers | Plausible (independent `BaseModel` instances per agent) | Not started | Not tested | Unverified on a real run |
 | Quantization | Verified (source): bf16/fp16, bnb 8-bit, bnb NF4, Ollama GGUF tags | Not started | Not tested | FP4 not supported by effGen API |
 | Tool execution | Verified (source) | Not started | Not tested | `FileOperations` + sandboxed shell |
-| Execution limits | Partial: steps yes, wall clock no (hooks verified) | Worker deadline (cooperative, T2.1) and failure propagation (T2.2) implemented; iteration caps are effGen's; `max_delegations`/truncation pending (T2.3) | Tested with scripted models (T2.1, T2.2) | Deadline middleware needed |
+| Execution limits | Partial: steps yes, wall clock no (hooks verified) | Worker deadline (cooperative, T2.1), failure propagation (T2.2), `max_delegations` and report truncation (T2.3) implemented; iteration caps are effGen's | Tested with scripted models (T2.1–T2.3) | Deadline middleware needed |
 
 Status values: Not started, In progress, Implemented (unverified), Tested, Blocked.
 
@@ -323,6 +323,28 @@ Status values: Not started, In progress, Implemented (unverified), Tested, Block
 - **`tool_failed` for the parent:** never observed from worker failures of any kind (8 combinations) nor from repeated worker failures. It was only produced for a *worker's own* failing tool.
 - Limitations: unexpected-exception reports differ by path (`worker_run_failed` vs `RuntimeError`) because effGen drops the response when wrapping; `iterations` is 0 when no response exists.
 - Decisions: unwrap `RunStoppedError.response` instead of forcing `raise_on_error=False` on workers (keeps the user's config; the registry does not override it).
+
+### 2026-10-16 – T2.3 Delegation limits and report truncation
+- Added: `max_delegations`, `max_report_chars`, `bounded()`, `WorkerResult.truncated`, `validate_limits`.
+- effGen APIs used: unchanged (`BaseTool.execute`, `AgentConfig.max_iterations`, `AgentResponse.stop_reason`).
+- Files: `src/smol_harness/delegation.py`, `src/smol_harness/harness.py`, `tests/test_limits.py`.
+- Tests: `uv run pytest -q` → 139 passed.
+- **Verified at runtime (effGen 1.3.0):**
+  - `max_iterations=N` allows **N model calls** but, when the model never answers, only **N−1 tool dispatches**: the action in the last allowed call is not executed. Parent with `max_iterations=3` that emits a `delegate` call every turn → 3 model calls, 2 worker runs. A worker with `max_iterations=2` → 2 model calls, 1 tool run, `iterations == 2`, structured failure.
+  - Parent `stop_reason` on hitting the cap: `max_iterations_partial` when at least one tool result was obtained (including delegation refusals), `max_iterations_exhausted` when none was (e.g. only invalid-argument calls, T1.3/U11). Both give `termination="stuck"`, `success=False`.
+  - effGen shortens long exception text itself: under `raise_on_error=True` a 25 000-char `ValueError` message becomes a `RuntimeError` of ~270 chars ending `… (25000 characters)`; under `False` the failed response's output is ~380 chars. `BackendUnreachableError` text is shortened as well. So worker `error` text is rarely large; `output` (a worker's final answer) is the main report-size risk.
+  - Refusals (`delegation_limit_reached`) are successful tool calls with unique ids: a parent that keeps delegating past the limit is *not* stopped by `repeated_tool_result`; it is stopped by its own `max_iterations`.
+  - Identical successful worker outputs from different delegations do not trip `repeated_tool_result` (ids differ), even after truncation.
+  - Valid-JSON/size guarantees were checked with a 400-case deterministic fuzz (hostile characters, huge fields, limits from `MIN_REPORT_CHARS` up).
+- Limitations: truncation is by characters, not tokens; the 64-char identifier cap loses a long registered worker name when a report must be shrunk.
+- Decisions: serialize with `ensure_ascii=False` (limits count characters; the parent reads text); keep `WorkerRecord.result` untruncated for debugging; limits default to `None`.
+
+### 2026-10-16 – T3.1 Configuration layer (no effGen integration)
+- Added: `src/smol_harness/config.py`; PyYAML declared as a runtime dependency.
+- effGen APIs used: none. The validation rules encode earlier findings: HF quantization via `quantization_bits` in {None, 8, 4} with NF4 only (§1.7), VRAM-based auto-quantization when unspecified (§1.7), Ollama via the OpenAI-compatible adapter with an assumed 32768 context window when `context_length` is not given (§1.5), and tools limited to those the harness will build.
+- Tests: `uv run pytest -q` → 318 passed.
+- **Newly verified:** importing `smol_harness.config` and loading the example config does not import `torch` or `transformers` (checked via `sys.modules`); `effgen` itself is imported lazily and only `Agent`-level modules (including `effgen.models.base`) are loaded.
+- Limitations: the rules reflect effGen 1.3.0 source-level findings (§1.5–§1.7). Whether each accepted combination actually loads is verified only in T3.3–T3.5.
 
 (Further entries follow this format.)
 

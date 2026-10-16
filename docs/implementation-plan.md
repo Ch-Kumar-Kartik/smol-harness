@@ -126,7 +126,7 @@ Milestone order follows the brief: the **delegation path first**, using scripted
   7. `HarnessResult.workers[0].status == "completed"`.
 - **Tests:** `uv run pytest tests/test_e2e_delegation.py -q`.
 
-### M2: Execution controls and failure propagation (scripted)
+### M2: Execution controls and failure propagation (scripted). **Status: COMPLETE (T2.1–T2.3 verified)**
 
 **T2.1 `DeadlineMiddleware` per-worker timeout**
 
@@ -150,7 +150,7 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 
 **T2.3 `max_iterations` per agent, `max_delegations`, report truncation**
 
-- **Status:** Not started
+- **Status:** Completed (2026-10-16). Verification: see §4. **M2 complete.**
 - **Dependencies:** T2.2.
 - **Acceptance:**
   - The worker stops at its own cap.
@@ -162,7 +162,7 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 
 **T3.1 `config.py` (YAML → dataclasses + validation)**
 
-- **Status:** Not started
+- **Status:** Completed (2026-10-16). Verification: see §4.
 - **Dependencies:** T1.3.
 - **Acceptance:**
   - The example config loads.
@@ -266,11 +266,10 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 
 ## 3. Current active goal
 
-- **Milestone:** M2 (execution controls and failure propagation, scripted). T2.1 and T2.2 done.
-- **Current task:** **T2.3 `max_iterations` per agent, `max_delegations`, report truncation** (Not started; awaiting approval).
-- **Why:** last M2 task: bounds the parent's delegation count and the report size.
-- **What must be achieved:** see T2.3 acceptance criteria. Per-agent `max_iterations` is already enforced by effGen and tested (T2.2 iteration-cap cases); re-check what is left of that bullet.
-- **How success is verified:** `uv run pytest tests/test_limits.py -q`.
+- **Milestone:** M3 (configuration and real model backends). T3.1 done.
+- **Current task:** none active. **Recommended next: T3.2 `models.py` `build_model` + cache.** It maps a `ModelSpec` to `effgen.models.load_model` kwargs (unit-testable by monkeypatching `load_model`, so no GPU or Ollama is needed). Alternative: T4.1 workspace tools (depends only on T3.1). T3.3 stays blocked until Ollama is installed.
+- **Why:** the config layer now produces validated specs; nothing yet turns them into effGen models.
+- **How success is verified:** `uv run pytest tests/test_models.py -q` (per the T3.2 plan entry).
 - **First executable development milestone:** **M1 (T1.1 → T1.3): reached 2026-10-16.** `tests/test_e2e_delegation.py` passes.
 
 ## 4. Completed work
@@ -363,9 +362,34 @@ Milestone order follows the brief: the **delegation path first**, using scripted
   - A parent that retries the *identical* failing delegation is stopped by effGen (`loop_detected`) without the call being re-run.
   - `iterations` is 0 when no response exists (unreachable / wrapped exceptions).
 
+### T2.3 Delegation limits and report truncation (2026-10-16)
+
+- **Files:** `src/smol_harness/delegation.py` (`max_delegations`, `max_report_chars` on `DelegateTool`; `bounded`, `validate_limits`, `MIN_REPORT_CHARS`, `TRUNCATION_MARK`, `ID_FIELD_CAP`; `WorkerResult.truncated`), `src/smol_harness/harness.py` (both limits on `Harness` / `build_harness`, validated at build time), `tests/test_limits.py` (+30 tests, now 77).
+- **Configuration behaviour:**
+  - `max_delegations`: `None` (default, unlimited) or an int ≥ 1 (bool, float, str rejected). Counts every attempt that reaches the tool, per run (a new `DelegateTool` per `Harness.run`). Attempts above the limit return a structured failure and run nothing. The tool description tells the parent its budget.
+  - `max_report_chars`: `None` (default, unbounded) or an int ≥ `MIN_REPORT_CHARS` (= 346: the fixed part of a report at worst-case id/counter widths + 100). Bool, float, str and anything smaller are rejected at construction / `build_harness`.
+  - Both are `None` by default, so M1/M2 behaviour is unchanged unless set.
+- **Truncation semantics:** measured on the final serialized JSON (`ensure_ascii=False`, so characters). Order of cuts: cap `worker`/`error_type` to 64 chars → cut `output` (longest prefix that fits + `...[truncated]`) → cut `error` the same way → last resort shrink `worker`, then `error_type`. `truncated: true` is set. Never changed: `delegation_id`, `status`, `termination`, `iterations`, `tool_calls`, `tokens_used`. A report that already fits is returned untouched (`truncated: false`). `WorkerRecord.result` keeps the full text (with `truncated` set accurately); only the parent-visible JSON is cut.
+- **Verification (all run):** `uv run pytest tests/test_limits.py -q` → 77 passed. `uv run pytest -q` → 139 passed. Five mutations each fail tests and were restored: `>=` instead of `>` (off-by-one), refusal after running a worker, `bounded()` disabled, `DelegateTool`/counters reused across harness runs, size measured on `len(output)` instead of the serialized JSON.
+- **Acceptance:** N delegations allowed and N+1 refused, with no worker built or run (also for unknown worker / blank task); unique ids for every attempt including refusals; identical worker outputs remain distinguishable and do not trip effGen's repeated-result guard (also when truncated); large output truncated to the limit, valid JSON, within size (400-case deterministic fuzz over quotes, newlines, control chars, BMP and astral Unicode, oversized worker names, and limits from the minimum up); failure metadata preserved; invalid configs rejected; counters reset per run; the orchestrator continues after a refusal; worker and parent iteration caps are effGen's own and a worker cap stays a structured failure.
+- **Deviations / notes:** limits default to unset rather than to a "sensible" number (defaults belong to the config layer, T3.1). A refused attempt is recorded as a failed `WorkerRecord` like other failed attempts, so `HarnessResult.workers` can be longer than `max_delegations`. Calls rejected by effGen's argument validation never reach the tool and are not counted.
+- **effGen findings** (audit Part 3): `max_iterations=N` allows N model calls but only N−1 tool dispatches when the model never answers (the last call's action is not dispatched); parent `stop_reason` is `max_iterations_partial` if any tool result was obtained and `max_iterations_exhausted` otherwise; effGen shortens long exception text itself.
+- **Debt / limitations:** the 64-char cap applies whenever a report is over its limit, even if only `output` was too long. `duration_s` is still not reported. Truncation is character-based, not token-based.
+
+### T3.1 YAML configuration and validation (2026-10-16)
+
+- **Files:** `src/smol_harness/config.py`, `tests/test_config.py` (179 tests), `configs/example.yaml`; `pyproject.toml` + `uv.lock` (PyYAML moved from the dev group to a runtime dependency, because `config.py` imports it; it was already installed and locked via effGen).
+- **Public API:** `load_config(path)`, `loads_config(text, base_dir=None)`, `parse_config(mapping, base_dir=None)` → `HarnessConfig`; `ConfigError(ValueError)`; frozen dataclasses `ModelSpec`, `AgentSpec`, `Limits`, `HarnessConfig`; constants `PROVIDERS`, `HF_QUANTIZATIONS`, `OLLAMA_QUANTIZATIONS`, `KNOWN_TOOLS`, `MAX_SPAWN_DEPTH`.
+- **Schema:** see `docs/architecture.md` §8 and `configs/example.yaml`.
+- **Validation decisions:** quantization is exact-match only, never normalised or substituted (`None`, `BNB-8BIT`, `awq`, `gptq`, `int8`, `4bit`, `q4_K_M` all rejected; `bnb-4bit-fp4` rejected with the NF4 reason; bitsandbytes values on ollama rejected with "fixed by the model tag; write `server`"; non-string values such as YAML `off`/`null` rejected with a quoting hint). HF `quantization` and Ollama `context_length` are required. Booleans are rejected wherever integers/numbers are expected; limits must be finite (no `null`/unlimited, `inf`, `nan`); `max_depth` must be 1; no unknown keys anywhere (so no invented controls such as `request_timeout`). Duplicate YAML keys are an error (PyYAML would silently keep the last). Tool names: only `file_operations`/`shell`; web/search/browser/fetch-like names get a specific "not available in the MVP" error; `delegate` is rejected for workers and accepted-but-implicit for the orchestrator. Names and model ids: non-empty, no surrounding or embedded whitespace. At least one worker is required.
+- **Verification (all run):** `uv run pytest tests/test_config.py -q` → 179 passed. `uv run pytest -q` → 318 passed. `uv lock --check` OK. Ten mutations (bool accepted as int, FP4 allowed, hf quantization defaulted, `delegate` on workers, unknown tools accepted, duplicate names, duplicate YAML keys, bitsandbytes on ollama, depth ≠ 1, optional context_length) each fail tests and were restored; one (`bnb` branch removed) initially survived because the test accepted either message, so the test was tightened and the mutant now fails.
+- **Acceptance:** the example loads; unknown provider, `bnb-4bit-fp4`, quantization fields on ollama other than `server`, a worker with `delegate`, unknown tools and duplicate names are all rejected with path-prefixed messages. Also covered: Ollama-only, HF-only, both mixed directions, multiple workers, defaults, malformed YAML, missing required fields, wrong types and ranges. Importing/using the config layer loads neither `torch` nor `transformers`.
+- **Deviations from the plan text:** none in scope; two design choices beyond it: `workers` is a YAML list (not a mapping) and two fields are required (HF `quantization`, Ollama `context_length`), see above. `Limits` fields are finite and non-nullable even though the runtime accepts `None`.
+- **Debt / limitations:** the workspace is not checked for existence (T4.1 does); `base_url` is only checked for an http(s) prefix; model ids are not checked against Ollama/HF (no network); `hf` models with `dtype` omitted use effGen's automatic bf16/fp16 choice; the example's model pairing is unverified for 8 GB VRAM (U7). Nothing wires `HarnessConfig` into `build_harness` yet.
+
 ## 5. Upcoming work
 
-After T2.2: T2.3. Do M3 before M4 only if Ollama is installed by then; otherwise do M4 first (M4 depends only on T3.1).
+M2 and T3.1 are complete. Next: T3.2 (then T3.3 when Ollama exists, T3.4 for HF/GPU), or T4.1 after T3.1. Do M3 before M4 only if Ollama is installed by then; otherwise do M4 first (M4 depends only on T3.1).
 
 ## 6. Changes to scope or architecture
 
