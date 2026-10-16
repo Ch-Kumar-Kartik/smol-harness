@@ -1,0 +1,25 @@
+[project]
+name = "smol-harness"
+version = "0.0.0"
+description = "Minimal multi-agent coding harness on effGen (orchestrator + workers)"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "effgen==1.3.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pyyaml>=6",
+]
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "ollama: needs a reachable Ollama server",
+    "gpu: needs a CUDA GPU",
+]
