@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass, replace
 from functools import partial
 from typing import Any
 
-from effgen import Agent, AgentConfig, AgentMiddleware
+from effgen import Agent, AgentConfig, AgentMiddleware, RunStoppedError
 from effgen.models.base import BaseModel
 from effgen.tools.base_tool import (
     BaseTool,
@@ -95,6 +95,11 @@ class WorkerResult:
 
     worker: str
     status: str
+    # "d1", "d2", ... per DelegateTool (= per run). Makes every report textually
+    # unique: effGen stops a run whose tool "returned the same result twice"
+    # (stop_reason `repeated_tool_result`), which two identical failure (or
+    # success) reports from different delegations would otherwise trigger.
+    delegation_id: str = ""
     output: str = ""
     error: str | None = None
     error_type: str | None = None
@@ -214,6 +219,7 @@ class DelegateTool(BaseTool):
         # None = no deadline. Otherwise a fresh DeadlineMiddleware per delegation.
         self._timeout_s = worker_timeout_s
         self._clock = clock
+        self._seq = 0
         # Per-run sink owned by the caller (Harness.run passes a fresh list), so
         # records never outlive or cross runs. Not global state.
         self.records: list[WorkerRecord] = records if records is not None else []
@@ -240,7 +246,10 @@ class DelegateTool(BaseTool):
         ))
 
     async def _execute(self, worker: str, task: str, context: str | None = None, **kwargs: Any) -> str:
+        self._seq += 1
+        delegation_id = f"d{self._seq}"
         result = await self._delegate(worker, task, context)
+        result.delegation_id = delegation_id
         self.records.append(WorkerRecord(worker=worker, task=task, context=context, result=result))
         return result.to_json()
 
@@ -270,15 +279,24 @@ class DelegateTool(BaseTool):
         ctx = contextvars.copy_context()
         try:
             response = await loop.run_in_executor(None, partial(ctx.run, self._run_worker, agent, prompt, deadline))
-        except Exception as exc:  # RunStoppedError, backend errors, ... all become a report
+        except Exception as exc:
             if deadline is not None and deadline.expired:
                 return _timed_out(worker, deadline)
+            if isinstance(exc, RunStoppedError):
+                # raise_on_error=True: effGen raises what raise_on_error=False would have
+                # returned. Unwrap exc.response so both modes yield the same report.
+                return self._from_response(worker, exc.response)
+            # BackendUnreachableError (raised in both modes), the RuntimeError effGen wraps
+            # unexpected errors in under raise_on_error=True, anything else: report it.
             return _failed(worker, type(exc).__name__, str(exc))
         # With raise_on_error=False effGen folds the hook's exception into a failed
         # response instead of raising it, so the flag is the reliable signal.
         if deadline is not None and deadline.expired:
             return _timed_out(worker, deadline)
+        return self._from_response(worker, response)
 
+    @staticmethod
+    def _from_response(worker: str, response: Any) -> WorkerResult:
         ok = bool(response.success)
         output = str(response.output)
         return WorkerResult(

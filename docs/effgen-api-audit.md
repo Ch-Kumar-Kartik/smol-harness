@@ -216,7 +216,7 @@ The user-namespace prerequisite was checked on this host on 2026-10-16: `unshare
 | Mixed providers | Plausible (independent `BaseModel` instances per agent) | Not started | Not tested | Unverified on a real run |
 | Quantization | Verified (source): bf16/fp16, bnb 8-bit, bnb NF4, Ollama GGUF tags | Not started | Not tested | FP4 not supported by effGen API |
 | Tool execution | Verified (source) | Not started | Not tested | `FileOperations` + sandboxed shell |
-| Execution limits | Partial: steps yes, wall clock no (hooks verified) | Worker deadline implemented (cooperative); iteration caps are effGen's; `max_delegations`/truncation pending (T2.3) | Tested with scripted models (T2.1) | Deadline middleware needed |
+| Execution limits | Partial: steps yes, wall clock no (hooks verified) | Worker deadline (cooperative, T2.1) and failure propagation (T2.2) implemented; iteration caps are effGen's; `max_delegations`/truncation pending (T2.3) | Tested with scripted models (T2.1, T2.2) | Deadline middleware needed |
 
 Status values: Not started, In progress, Implemented (unverified), Tested, Blocked.
 
@@ -302,6 +302,27 @@ Status values: Not started, In progress, Implemented (unverified), Tested, Block
 - Source-level only: native tool calling, streaming and `run_async` dispatch through the same `_generate` / `_execute_tool` wrappers (`agent_generation.py:_generate`, `agent_tool_execution.py:_execute_tool`), so the hooks should apply there, but this was not run.
 - Limitations: **cooperative timeout only**; worst-case overrun is one model call or one tool call. `ToolMetadata.timeout_seconds` remains unenforced by effGen's core loop (§1.8).
 - Decisions: detect timeouts by the middleware's `expired` flag, not by parsing effGen's error text or type, so both `raise_on_error` modes work.
+
+### 2026-10-16 – T2.2 Worker failure propagation
+- Added: `RunStoppedError` unwrapping in `DelegateTool`, `WorkerResult.delegation_id`.
+- effGen APIs used: `RunStoppedError` (`.response`, `.stop_reason`, `.partial`), `BackendUnreachableError`, `AgentResponse.termination/stop_reason/metadata`, `AgentConfig.raise_on_error`.
+- Files: `src/smol_harness/delegation.py`, `tests/test_limits.py`.
+- Tests: `uv run pytest -q` → 109 passed.
+- **Exact worker exception paths, verified at runtime (effGen 1.3.0, scripted models, ReAct):**
+
+  | Failure | `raise_on_error=False` | `raise_on_error=True` |
+  |---|---|---|
+  | Iteration cap (`max_iterations=2`) | returns `success=False`, `termination="stuck"`, `stop_reason="max_iterations_partial"`, output `Stopped after 2 iterations without a final answer: ...` | raises `effgen.errors.RunStoppedError` (a `RuntimeError`); `.response.termination="stuck"`, `.stop_reason="max_iterations_partial"` |
+  | Worker tool failing on its own side (3 attempts) | returns `termination="tool_failed"`, `stop_reason="tool_failed"`, output `The 'flaky' tool failed on its own side after 3 attempts (ConnectionError...` | raises `RunStoppedError` with `.stop_reason="tool_failed"` |
+  | Backend unreachable (`BackendUnreachableError` from the model) | **raises `BackendUnreachableError`** (not a `RuntimeError`; message `<provider> did not answer (model='m'): connection refused. Nothing answered at that endpoint...`) | same: raised |
+  | Unexpected model exception (`ValueError("boom")`) | returns `success=False`, `termination="error"`, `stop_reason="generation_failed"`, `metadata["error"]["type"]="ValueError"` | raises plain `RuntimeError("ValueError: boom")`; original type only in the text |
+
+- `BackendUnreachableError` therefore reaches `DelegateTool` as an exception in both modes. It is reported as `status="failed"`, `error_type="BackendUnreachableError"`, `termination=None`.
+- **Generation retries (source-confirmed, then observed):** for transient or unknown error categories (including unreachable and unexpected exceptions), `_generate_instrumented` makes 3 attempts with sleeps `[0.5, 1.0]` s (hard-coded `max_retries=3`, `backoff_delays=[0.5, 1.0, 2.0]`; no config option). Non-retryable categories (auth, not found, refusal, invalid request) and rate limits fail fast. Test-only: `effgen.core.ledger.backoff_sleep` is replaced by a recorder; the tests assert `attempts == 3` and sleeps `[0.5, 1.0]`.
+- **`repeated_tool_result` guard (important):** a run whose tool returns the same result text twice is stopped: `termination="stuck"`, `stop_reason="repeated_tool_result"`, output `'orch' did not write an answer: 'delegate' returned the same result twice...`, `success=False`. Two failed delegations of *different* tasks produced byte-identical JSON and triggered it after 2 of 3 delegations. Fix: `delegation_id` makes each report unique. A parent repeating the *identical call* is stopped differently: `stop_reason="loop_detected"`, and effGen does not re-dispatch the repeated call (1 worker record, 4 parent calls).
+- **`tool_failed` for the parent:** never observed from worker failures of any kind (8 combinations) nor from repeated worker failures. It was only produced for a *worker's own* failing tool.
+- Limitations: unexpected-exception reports differ by path (`worker_run_failed` vs `RuntimeError`) because effGen drops the response when wrapping; `iterations` is 0 when no response exists.
+- Decisions: unwrap `RunStoppedError.response` instead of forcing `raise_on_error=False` on workers (keeps the user's config; the registry does not override it).
 
 (Further entries follow this format.)
 

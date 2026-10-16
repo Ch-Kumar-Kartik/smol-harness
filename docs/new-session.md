@@ -1,6 +1,6 @@
 # New Session Handoff
 
-_Last updated: 2026-10-16 (after T2.1: worker deadline)._
+_Last updated: 2026-10-16 (after T2.2: failure propagation)._
 
 ## 1. Project overview
 
@@ -28,9 +28,9 @@ Docs plus the T0.1 project skeleton. No harness logic yet.
 | `pyproject.toml`, `uv.lock`, `.python-version` | uv project (Python 3.12, `effgen==1.3.0`, dev: pytest, pyyaml) |
 | `src/smol_harness/__init__.py` | Package stub (docstring only) |
 | `tests/test_import.py` | Checks effGen is 1.3.0 and the package imports |
-| `src/smol_harness/delegation.py` | `WorkerResult`, `WorkerRecord`, `WorkerRegistry`, `DelegateTool`, `DeadlineMiddleware`, `WorkerTimeout`. No `max_delegations` or truncation yet. |
+| `src/smol_harness/delegation.py` | `WorkerResult`, `WorkerRecord`, `WorkerRegistry`, `DelegateTool`, `DeadlineMiddleware`, `WorkerTimeout`; every result carries `delegation_id`. No `max_delegations` or truncation yet. |
 | `src/smol_harness/harness.py` | `build_harness(..., worker_timeout_s)`, `Harness.run(task) -> HarnessResult` (fresh orchestrator + record list per run) |
-| `tests/test_limits.py` | 15 tests of the cooperative worker deadline |
+| `tests/test_limits.py` | 47 tests: cooperative worker deadline (T2.1) and failure propagation (T2.2) |
 | `tests/test_e2e_delegation.py` | 23 end-to-end tests: delegation flow, isolation, records, U11, orchestrator-memory regression |
 | `tests/test_delegation.py` | 22 tests of the delegation layer through `BaseTool.execute()` |
 | `tests/conftest.py` | `ScriptedModel` deterministic fake effGen `BaseModel` (+ `scripted_model` fixture) |
@@ -42,31 +42,32 @@ The remaining planned layout (`src/smol_harness/{config,models,tools,delegation,
 
 | Area | State |
 |---|---|
-| Implemented and verified | T0.1 bootstrap; T1.1 `ScriptedModel`; T1.2 delegation layer; T1.3 end-to-end orchestrator→worker→orchestrator. **M1 complete**; T2.1 cooperative worker deadline (77 tests pass) |
+| Implemented and verified | T0.1 bootstrap; T1.1 `ScriptedModel`; T1.2 delegation layer; T1.3 end-to-end orchestrator→worker→orchestrator. **M1 complete**; T2.1 cooperative worker deadline; T2.2 failure propagation (109 tests pass) |
 | Partially implemented | Nothing |
-| Not yet implemented | T2.2–T2.3 (failure-kind mapping review, `max_delegations`, truncation), `delegation_id`, config (YAML), real models (Ollama/HF), workspace tools, CLI |
+| Not yet implemented | T2.3 (`max_delegations`, truncation), `duration_s`, config (YAML), real models (Ollama/HF), workspace tools, CLI |
 | Known limitations (by design) | Sequential workers only; depth 1; **the worker timeout is cooperative** (checked before model/tool calls; an in-flight generation or tool is never interrupted); no orchestrator deadline; FP4 unsupported (effGen hard-codes NF4) |
 
 ## 4. Most recent session
 
-- **Goal:** T2.1 (worker deadline) plus the requested orchestrator-memory regression test.
+- **Goal:** T2.2 only: consistent structured worker failures that never stop the parent.
 - **Done:**
-  - Regression test `test_orchestrator_memory_does_not_carry_across_runs`; mutation-verified, harness restored.
-  - `DeadlineMiddleware` / `WorkerTimeout` / `status="timeout"`, wired through `DelegateTool(worker_timeout_s)` and `build_harness(worker_timeout_s)`.
-  - 15 limits tests. Details: `docs/implementation-plan.md` §4.
-- **Files:** modified `delegation.py`, `harness.py`, `tests/test_e2e_delegation.py`; created `tests/test_limits.py`. Docs: plan, this file, audit, one row in `architecture.md` §10.
-- **Tests:** `uv run pytest tests/test_limits.py -q` → 15 passed; `uv run pytest -q` → 77 passed (CPU, ~7 s). Three deadline mutations each fail tests.
-- **U4 answered:** middleware exceptions propagate. See audit Part 3.
-- **Problems:** none.
-- **Unresolved:** U5–U8, U10. The 120 s async-bridge cap (audit T1.2 entry) remains source-level only.
+  - `RunStoppedError` is unwrapped so both `raise_on_error` modes give one report.
+  - `delegation_id` added to every `WorkerResult` (see finding below).
+  - 32 new tests in `tests/test_limits.py`: raw effGen failure surfaces (pinned), `DelegateTool` mapping, parent continuation. Details: `docs/implementation-plan.md` §4.
+- **Files:** modified `src/smol_harness/delegation.py`, `tests/test_limits.py`. Docs: plan, this file, audit, `architecture.md` §5/§6 (`delegation_id`).
+- **Tests:** `uv run pytest tests/test_limits.py -q` → 47 passed; `uv run pytest -q` → 109 passed (CPU, ~7 s). Mutations fail tests and were restored.
+- **Key finding:** effGen's `repeated_tool_result` guard stops a run after two identical `delegate` results, even for different tasks. Two failing delegations in a row did exactly that. `delegation_id` fixes it. (Also applies to two identical successes.)
+- **Other findings** (audit Part 3): exact exception paths per failure kind; generation retries 3× with sleeps and no knob.
+- **Problems:** my first parent test failed (2 of 3 delegations ran), which exposed the guard above. Not a test bug.
+- **Unresolved:** U5–U8, U10; native tool calling, streaming and `run_async` paths untested.
 
 ## 5. Current task and next steps
 
-- **Current milestone:** M2 (execution controls). T2.1 done. **Waiting for user approval.**
-- **Next task:** T2.2 Failure propagation. Check scope first: the tests already cover a worker whose model raises, a worker that never finishes (`stuck`), an unknown worker, and a worker construction failure (T1.2/T1.3), all ending with the orchestrator completing. What T2.2 still adds is the explicit `BackendUnreachableError` and `RunStoppedError` (iteration cap) cases and a re-check that none ends the parent as `tool_failed`.
-- **Then:** T2.3 `max_iterations` per agent, `max_delegations`, report truncation.
-- **Relevant files:** `docs/implementation-plan.md` T2.2–T2.3; `src/smol_harness/delegation.py`; `tests/test_limits.py`.
-- **Open questions:** `delegation_id` / `duration_s` (architecture §5) are still unbuilt. Decide whether T2.3 adds them.
+- **Current milestone:** M2. T2.1 and T2.2 done; T2.3 remains. **Waiting for user approval.**
+- **Next task:** T2.3 `max_iterations` per agent, `max_delegations`, report truncation (`delegation.py`, `tests/test_limits.py`). Per-agent `max_iterations` is already enforced by effGen and covered by the T2.2 iteration-cap tests, so the real work is `max_delegations` and `max_report_chars` (plus `duration_s` if wanted).
+- **Relevant files:** `docs/implementation-plan.md` T2.3; `docs/architecture.md` §5, §10; `src/smol_harness/delegation.py`; `tests/test_limits.py` (helpers `failing_worker_cfg`, `delegate_turn`, `backoff_sleeps` fixture).
+- **Design cautions for T2.3:** a refused (over-limit) delegation and a truncated report must stay *unique* per delegation (keep `delegation_id`), must remain valid JSON (truncate fields, not the serialized string), and must not be a failed `ToolResult`.
+- **After M2:** M3 (config, real models) needs Ollama (not installed) for T3.3; M4 (workspace tools) depends only on T3.1.
 
 ## 6. Known issues and warnings
 
@@ -105,7 +106,7 @@ Verified on 2026-10-16 (Linux, uv 0.11.29):
 cd /home/ch_kartik/Projects/Active/smol-harness
 uv sync --locked                 # creates .venv with Python 3.12 + effgen 1.3.0 (~2 min cold: torch/CUDA wheels)
 uv run python -c "import effgen; print(effgen.__version__)"   # -> 1.3.0
-uv run pytest -q                 # -> 77 passed
+uv run pytest -q                 # -> 109 passed
 ```
 
 Not yet available: running the harness, integration tests, smoke tests. They'll be added after T1.3 and T5.1.

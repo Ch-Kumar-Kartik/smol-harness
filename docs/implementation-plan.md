@@ -140,7 +140,7 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 
 **T2.2 Failure propagation**
 
-- **Status:** Not started
+- **Status:** Completed (2026-10-16). Verification: see §4.
 - **Dependencies:** T2.1.
 - **Changes:**
   - Map worker `RunStoppedError` (iteration cap), arbitrary exceptions and `BackendUnreachableError` to `status="failed"` with an error string.
@@ -266,10 +266,10 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 
 ## 3. Current active goal
 
-- **Milestone:** M2 (execution controls and failure propagation, scripted). T2.1 done.
-- **Current task:** **T2.2 Failure propagation** (Not started; awaiting approval).
-- **Why:** M2 completes Feature F; T2.2 maps remaining worker failure kinds and re-verifies that none ends the orchestrator as `tool_failed`.
-- **What must be achieved:** see T2.2 acceptance criteria. Note that part of T2.2 is already covered (see §4, T1.3 and T2.1): re-check its scope against the existing tests before writing new ones.
+- **Milestone:** M2 (execution controls and failure propagation, scripted). T2.1 and T2.2 done.
+- **Current task:** **T2.3 `max_iterations` per agent, `max_delegations`, report truncation** (Not started; awaiting approval).
+- **Why:** last M2 task: bounds the parent's delegation count and the report size.
+- **What must be achieved:** see T2.3 acceptance criteria. Per-agent `max_iterations` is already enforced by effGen and tested (T2.2 iteration-cap cases); re-check what is left of that bullet.
 - **How success is verified:** `uv run pytest tests/test_limits.py -q`.
 - **First executable development milestone:** **M1 (T1.1 → T1.3): reached 2026-10-16.** `tests/test_e2e_delegation.py` passes.
 
@@ -346,9 +346,26 @@ Milestone order follows the brief: the **delegation path first**, using scripted
 - **Deviations / notes:** the timeout is one value for all workers (`Limits.worker_timeout_s` shape), not per worker. `clock` is an injectable parameter on `DelegateTool` for deterministic tests; `Harness` does not expose it. No `duration_s` or `delegation_id` yet. `Harness`/`build_harness` expose `worker_timeout_s`, which is a small addition beyond the plan text so the limit is reachable end to end.
 - **Debt / limitations:** the orchestrator has no deadline (post-MVP). `max_delegations` and report truncation remain (T2.3).
 
+### T2.2 Worker failure propagation (2026-10-16)
+
+- **Files:** `src/smol_harness/delegation.py` (`RunStoppedError` unwrapping, `_from_response`, `WorkerResult.delegation_id`), `tests/test_limits.py` (+32 tests, now 47). `harness.py` unchanged.
+- **Implemented:**
+  - `DelegateTool` handles a raised `RunStoppedError` by reporting its `.response` exactly as the non-raising path does, so `raise_on_error=True` and `False` give the same `WorkerResult` for iteration-cap and worker-tool failures (status `failed`, `error_type="worker_run_failed"`, termination `stuck` / `tool_failed`, iterations and tool calls preserved).
+  - `WorkerResult.delegation_id` (`d1`, `d2`, ... per `DelegateTool`, i.e. per run) on every result.
+  - A deadline-expired worker still reports `timeout` (checked first); an unrelated failure with a deadline set stays `failed`.
+- **Verification (all run):** `uv run pytest tests/test_limits.py -q` → 47 passed. `uv run pytest -q` → 109 passed. Mutations (no `delegation_id`; `RunStoppedError` not unwrapped) each fail tests and were restored.
+- **Acceptance:** four worker failure kinds (iteration cap, backend unreachable, unexpected exception, worker tool failing on its own side) × both `raise_on_error` settings give valid JSON with `status="failed"` and meaningful `error` / `error_type` / `termination`; in all 8 cases the orchestrator receives the report, finishes `success=True`, `termination="done"`, never `tool_failed`.
+- **Actual effGen exception paths** (exact types, audit Part 3): iteration cap and worker-tool failure raise `RunStoppedError` only under `raise_on_error=True`; `BackendUnreachableError` is raised under **both** settings and is not a `RuntimeError`; an unexpected model exception becomes a plain `RuntimeError("ValueError: boom")` under `True` and a failed response under `False`.
+- **Deviation / finding:** `delegation_id` (planned for T2.3-ish, architecture §5) was pulled forward because T2.2's requirement that a recoverable worker failure must not stop the parent failed without it: two identical failure reports from *different* delegations triggered effGen's `repeated_tool_result` guard and ended the parent as `stuck` (`success=False`). The same would have hit two identical *successful* reports.
+- **Debt / limitations:**
+  - `error_type` differs by path for unexpected exceptions (`worker_run_failed` vs `RuntimeError`) because effGen drops the response when it wraps them.
+  - effGen retries a failing generation 3× with 0.5 s / 1.0 s sleeps and no config knob, so a dead backend costs ~1.5 s per delegation (worker deadline cannot interrupt it). Tests no-op `effgen.core.ledger.backoff_sleep` and assert the retries.
+  - A parent that retries the *identical* failing delegation is stopped by effGen (`loop_detected`) without the call being re-run.
+  - `iterations` is 0 when no response exists (unreachable / wrapped exceptions).
+
 ## 5. Upcoming work
 
-After T2.1: T2.2 → T2.3. Do M3 before M4 only if Ollama is installed by then; otherwise do M4 first (M4 depends only on T3.1).
+After T2.2: T2.3. Do M3 before M4 only if Ollama is installed by then; otherwise do M4 first (M4 depends only on T3.1).
 
 ## 6. Changes to scope or architecture
 

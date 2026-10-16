@@ -141,7 +141,7 @@ sequenceDiagram
     H-->>User: final output + worker records
 ```
 
-### Delegate tool contract (T1.2 implements the fields below except `delegation_id`, `duration_s`, the `timeout` status and truncation)
+### Delegate tool contract (implemented except `duration_s` and truncation; `delegation_id` and the `timeout` status were added in T2.2 / T2.1)
 
 - **Input:**
   - `worker`: enum of configured worker names.
@@ -156,6 +156,7 @@ sequenceDiagram
 - **Failure semantics:**
   - The tool itself does **not** report `success: False` to effGen. A failed worker is a *successful* tool call whose payload says `status: "failed"`. This keeps effGen's `tool_failed` termination from ending the orchestrator run because of a worker failure. The orchestrator decides whether to retry, re-delegate or answer. **Verify in T2.2.**
   - **As implemented in T1.2:** an unknown worker name or a blank task is also a structured `status: "failed"` result (`error_type` `unknown_worker` / `invalid_arguments`). Missing or non-string `worker`/`task` are rejected by effGen's own parameter validation, which returns a failed `ToolResult` (error text, not JSON). `max_delegations` (T2.3) is not built yet.
+- **`delegation_id` is load-bearing, not cosmetic (T2.2):** effGen ends a run whose tool "returned the same result twice" (`stop_reason=repeated_tool_result`, `termination=stuck`). Without a unique id, two identical reports from different delegations (e.g. two failures, or two "all tests passed") would stop the orchestrator. The id (`d1`, `d2`, ... per run) keeps every report distinct.
 - **Task envelope:** a smolagents-style template. It says who the worker is and that it is helping a manager, then gives the task and context, and asks for an outcome with a short summary, details, files touched, and anything unresolved.
 
 ## 6. Subagent spawning strategy
@@ -165,7 +166,7 @@ sequenceDiagram
   - Only the orchestrator holds `delegate`.
   - Workers are built with `enable_sub_agents=False` and `mode=AgentMode.SINGLE`, and `config.py` rejects `delegate` in a worker tool list.
 - **Execution is sequential.** effGen runs a turn's tool calls through `_execute_tool` one by one, and the Transformers engine serializes generation anyway. Parallel execution is post-MVP; effGen's `SubAgentManager.execute_parallel` / thread executors are the pattern to study then.
-- **Lifecycle (as implemented in T1.3):** the registry holds definitions only. `DelegateTool` appends one `WorkerRecord(worker, task, context, result)` per finished delegation (`completed` or `failed`) to a **per-run** list owned by `Harness.run`, which also builds a fresh orchestrator `Agent` per run. Exposed as `HarnessResult.workers`. No persistence. Still planned for M2: `delegation_id`, timing and the `timeout` status.
+- **Lifecycle (as implemented in T1.3):** the registry holds definitions only. `DelegateTool` appends one `WorkerRecord(worker, task, context, result)` per finished delegation (`completed` or `failed`) to a **per-run** list owned by `Harness.run`, which also builds a fresh orchestrator `Agent` per run. Exposed as `HarnessResult.workers`. No persistence. Since then: the `timeout` status (T2.1) and `delegation_id` (T2.2). Still planned: timing (`duration_s`).
 
 ## 7. Context isolation strategy
 
