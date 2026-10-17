@@ -9,8 +9,16 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import platform
 import re
-from pathlib import Path
+import shlex
+import shutil
+import signal
+import socket
+import sys
+import tempfile
+import time
+from pathlib import Path, PureWindowsPath
 
 import pytest
 from conftest import ScriptedModel
@@ -23,7 +31,10 @@ import smol_harness.harness as harness_mod
 import smol_harness.tools as tools_mod
 from smol_harness.config import KNOWN_TOOLS, loads_config
 from smol_harness.harness import build_harness
-from smol_harness.tools import TOOL_NAMES, ToolBuildError, build_tools, resolve_workspace
+from effgen.security.sandbox import SandboxResult, SubprocessSandbox
+from smol_harness.tools import (
+    TOOL_NAMES, ShellSandboxError, ShellTool, ToolBuildError, _is_filesystem_root, build_tools, resolve_workspace,
+)
 
 WEB_LIKE = re.compile(r"web|search_engine|url_fetch|http", re.I)
 
@@ -234,13 +245,6 @@ def test_duplicates_and_bare_strings_are_rejected(layout):
         build_tools("file_operations", layout[0])
 
 
-def test_shell_fails_closed_until_t42(layout):
-    with pytest.raises(ToolBuildError, match="T4.2"):
-        build_tools(["shell"], layout[0])
-    with pytest.raises(ToolBuildError, match="T4.2"):
-        build_tools(["file_operations", "shell"], layout[0])
-
-
 def test_names_are_checked_before_the_workspace(tmp_path):
     with pytest.raises(ToolBuildError, match="unknown tool"):
         build_tools(["web_search"], tmp_path / "missing")
@@ -370,3 +374,584 @@ def test_effgen_refuses_credential_filenames_and_content(fo, layout):
     refused(run(fo, operation="read", path=".env"), "credentials")
     (layout[0] / "settings.txt").write_text("API_KEY=abc\nDB_PASSWORD=xyz\n")
     refused(run(fo, operation="read", path="settings.txt"), "credentials")
+
+
+# ======================================================================================================
+# T4.2: sandboxed shell. These run effGen's real SubprocessSandbox (Linux user/mount/net/PID namespaces)
+# on temporary workspaces: no mocks for the security properties. A host that cannot provide the namespaces
+# makes them FAIL, not skip: the shell is unusable there by design (see test_degraded_sandbox_*).
+# ======================================================================================================
+linux_only = pytest.mark.skipif(platform.system() != "Linux", reason="the shell sandbox is Linux-only (namespaces)")
+
+
+def sh(tool: ShellTool, command: str, **kw):
+    return run(tool, command=command, **kw)
+
+
+def out(result) -> dict:
+    assert result.output is not None, result.error
+    return result.output
+
+
+@pytest.fixture
+def shell(layout):
+    (tool,) = build_tools(["shell"], layout[0])
+    return tool
+
+
+def proc_cmdlines() -> dict[int, str]:
+    found = {}
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit():
+            try:
+                found[int(entry.name)] = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            except OSError:
+                pass
+    return found
+
+
+def survivors(marker: str) -> list[int]:
+    return [pid for pid, cmd in proc_cmdlines().items() if marker in cmd and pid != os.getpid()]
+
+
+@pytest.fixture
+def marker():
+    """A unique `sleep` duration that identifies this test's processes; any survivor is killed on exit."""
+    m = f"{5000 + (os.getpid() % 1000)}.{time.monotonic_ns() % 1_000_000:06d}"
+    yield m
+    for pid in survivors(f"sleep {m}"):
+        os.kill(pid, signal.SIGKILL)
+
+
+# ---- valid execution, workspace placement ------------------------------------------------------------------
+@linux_only
+def test_harmless_command_runs(shell):
+    r = sh(shell, "echo hello; echo oops >&2")
+    assert r.success, r.error
+    o = out(r)
+    assert (o["exit_code"], o["stdout"], o["stderr"], o["timed_out"]) == (0, "hello\n", "oops\n", False)
+    assert (o["filesystem_confined"], o["network_isolated"]) == (True, True)
+    assert "hello" in o["result"]  # what effGen shows the model for a successful call
+
+
+@linux_only
+def test_command_starts_in_the_workspace_and_writes_land_there(shell, layout):
+    ws = layout[0]
+    assert out(sh(shell, "pwd"))["stdout"].strip() == str(ws)
+    assert out(sh(shell, "cat a.txt"))["stdout"] == "inside\n"
+    sh(shell, "mkdir -p sub && echo built > sub/made.txt && cd sub && pwd")
+    assert (ws / "sub/made.txt").read_text() == "built\n"
+    assert out(sh(shell, "cd sub && pwd"))["stdout"].strip() == str(ws / "sub")
+
+
+@linux_only
+def test_shell_and_file_operations_share_the_workspace(layout):
+    fo, sht = build_tools(["file_operations", "shell"], layout[0])
+    data(run(fo, operation="write", path="t.txt", content="from file_operations"))
+    assert out(sh(sht, "cat t.txt"))["stdout"] == "from file_operations"
+    sh(sht, "echo from shell > s.txt")
+    assert data(run(fo, operation="read", path="s.txt")) == "from shell\n"
+
+
+@linux_only
+def test_non_zero_exit_is_a_failure_whose_output_reaches_the_model(shell):
+    r = sh(shell, "echo partial; echo boom-marker >&2; exit 3")
+    assert not r.success
+    assert out(r)["exit_code"] == 3 and out(r)["stdout"] == "partial\n"
+    # effGen shows a model only `error` for a failed result, so the output must be in it.
+    assert "exit code: 3" in r.error and "boom-marker" in r.error and "partial" in r.error
+
+
+@linux_only
+def test_a_commands_own_exit_124_is_not_reported_as_a_timeout(shell):
+    r = sh(shell, "exit 124")
+    assert not r.success and out(r)["exit_code"] == 124 and out(r)["timed_out"] is False
+
+
+@linux_only
+def test_stdin_is_empty_and_cannot_consume_the_script(shell):
+    r = sh(shell, "cat; echo after")
+    assert r.success and out(r)["stdout"] == "after\n"
+
+
+@linux_only
+def test_output_is_truncated_to_the_tail(shell):
+    r = sh(shell, "python3 -c \"print('x' * 30000); print('THE-END')\"")
+    o = out(r)
+    assert o["truncated"] and len(o["stdout"]) < ShellTool.MAX_OUTPUT_CHARS + 100
+    assert o["stdout"].rstrip().endswith("THE-END") and "earlier characters omitted" in o["stdout"]
+
+
+# ---- invalid workspace / arguments ---------------------------------------------------------------------------
+def test_shell_rejects_invalid_workspaces(tmp_path):
+    with pytest.raises(ToolBuildError, match="does not exist"):
+        build_tools(["shell"], tmp_path / "missing")
+    f = tmp_path / "f.txt"
+    f.write_text("x")
+    with pytest.raises(ToolBuildError, match="not a directory"):
+        ShellTool(f)
+    with pytest.raises(ToolBuildError, match="non-empty"):
+        ShellTool("")
+
+
+@linux_only
+@pytest.mark.parametrize("args", [
+    {}, {"command": ""}, {"command": "   \n"}, {"command": "echo a\x00b"}, {"command": 5}, {"command": None},
+    {"command": "x" * (ShellTool.MAX_COMMAND_CHARS + 1)},
+    {"command": "echo hi", "timeout": 0}, {"command": "echo hi", "timeout": -1},
+    {"command": "echo hi", "timeout": ShellTool.MAX_TIMEOUT_S + 1}, {"command": "echo hi", "timeout": "soon"},
+    {"command": "echo hi", "timeout": True}, {"command": "echo hi", "timeout": 2.5},
+    {"command": "echo hi", "network_enabled": True}, {"command": "echo hi", "memory_limit": "64g"},
+    {"command": "echo hi", "language": "python"}, {"command": "echo hi", "files": {"a": "b"}},
+])
+def test_invalid_arguments_are_rejected_and_nothing_runs(shell, layout, args):
+    if args.get("command") == "echo hi":
+        args = {**args, "command": "touch ran.marker"}
+    r = run(shell, **args)
+    assert not r.success and r.error
+    assert not (layout[0] / "ran.marker").exists()
+
+
+@linux_only
+def test_timeout_argument_is_capped_by_the_tool_configuration(layout):
+    tool = ShellTool(layout[0], max_timeout_s=3)
+    assert not sh(tool, "echo hi", timeout=4).success
+    assert sh(tool, "echo hi", timeout=3).success
+    with pytest.raises(ToolBuildError, match="max_timeout_s"):
+        ShellTool(layout[0], max_timeout_s=ShellTool.MAX_TIMEOUT_S + 1)
+    with pytest.raises(ToolBuildError, match="memory_limit"):
+        ShellTool(layout[0], memory_limit="lots")
+
+
+# ---- write confinement, read characterisation -----------------------------------------------------------------
+@linux_only
+def test_writes_outside_the_workspace_are_refused(shell, layout):
+    ws, outside = layout
+    for cmd in (f"echo pwned > {outside}/new.txt", f"echo pwned > {outside}/secret.txt", "echo pwned > ../outside/new2.txt",
+                f"echo pwned > {ws.parent}/sibling.txt", f"mkdir {outside}/d", f"rm {outside}/secret.txt",
+                f"mv a.txt {outside}/moved.txt", f"cp a.txt {outside}/copied.txt"):
+        r = sh(shell, cmd)
+        assert not r.success and "Read-only file system" in out(r)["stderr"], (cmd, out(r))
+    outside_unchanged(outside)
+    assert not (ws.parent / "sibling.txt").exists() and (ws / "a.txt").exists()
+
+
+@linux_only
+def test_symlinks_cannot_be_used_to_write_outside(shell, layout):
+    ws, outside = layout
+    r = sh(shell, f"ln -s {outside} dir_link && ln -s {outside}/secret.txt file_link && echo pwned > dir_link/x.txt; "
+                  "echo pwned > file_link; echo pwned > dir_link/secret.txt")
+    assert "Read-only file system" in out(r)["stderr"]
+    outside_unchanged(outside)  # the links exist inside the workspace, the writes through them were refused
+
+
+@linux_only
+def test_the_sandbox_cannot_remount_its_way_out(shell, layout):
+    r = sh(shell, f"mount -o remount,rw,bind {layout[0].parent} 2>&1; mount -o remount,rw / 2>&1; "
+                  f"unshare --user --map-root-user --mount sh -c 'mount -o remount,rw,bind {layout[0].parent} 2>&1; "
+                  f"echo pwned > {layout[1]}/r.txt' 2>&1; true")
+    outside_unchanged(layout[1])
+    assert not (layout[0].parent / "r.txt").exists(), out(r)
+
+
+@linux_only
+def test_host_tmp_writes_do_not_reach_the_host(shell):
+    name = f"smol-t42-{os.getpid()}-{time.monotonic_ns()}"
+    sh(shell, f"echo x > /tmp/{name} 2>/dev/null; echo x > /var/tmp/{name} 2>/dev/null; true")
+    assert not Path("/tmp", name).exists() and not Path("/var/tmp", name).exists()
+
+
+@linux_only
+def test_reads_outside_the_workspace_are_NOT_confined(shell, layout):
+    # Documented limitation (audit Part 3, T4.2): reads are a deny-list, not confinement. If this ever
+    # starts failing, the boundary got stronger: update the docs, do not weaken the test silently.
+    assert out(sh(shell, f"cat {layout[1]}/secret.txt"))["stdout"] == "outside secret\n"
+    assert out(sh(shell, "cat ../outside/secret.txt"))["stdout"] == "outside secret\n"
+    (layout[0] / "dir_link").symlink_to(layout[1], target_is_directory=True)
+    assert out(sh(shell, "cat dir_link/secret.txt"))["stdout"] == "outside secret\n"
+    assert out(sh(shell, "cat /etc/hostname"))["exit_code"] == 0
+
+
+@linux_only
+def test_shell_reads_what_file_operations_refuses(shell, layout):
+    # The shell is a wider tool than file_operations: no extension allowlist, no credential-name filter.
+    (layout[0] / ".env").write_text("API_KEY=abc\nDB_PASSWORD=xyz\n")
+    (layout[0] / "Makefile").write_text("all:\n")
+    assert "API_KEY=abc" in out(sh(shell, "cat .env"))["stdout"]
+    assert out(sh(shell, "cat Makefile"))["stdout"] == "all:\n"
+
+
+@linux_only
+def test_credential_stores_under_home_are_masked(shell, layout, monkeypatch):
+    home = layout[1] / "fakehome"
+    (home / ".ssh").mkdir(parents=True)
+    (home / ".ssh" / "id_test").write_text("PRIVATE-KEY-MATERIAL\n")
+    (home / ".netrc").write_text("machine x password PASSWORD-MATERIAL\n")
+    monkeypatch.setenv("HOME", str(home))  # effGen's sandbox masks "$HOME/.ssh", "$HOME/.netrc", ...
+    r = sh(shell, "cat $HOME/.ssh/id_test $HOME/.netrc 2>&1; ls $HOME/.ssh | wc -l")
+    assert "PRIVATE-KEY-MATERIAL" not in out(r)["stdout"] and "PASSWORD-MATERIAL" not in out(r)["stdout"]
+    assert (home / ".ssh" / "id_test").read_text() == "PRIVATE-KEY-MATERIAL\n"  # the host copy is untouched
+
+
+# ---- network ----------------------------------------------------------------------------------------------------
+@linux_only
+def test_network_is_blocked(shell):
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    port = srv.getsockname()[1]
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=2).close()  # control: reachable from the host
+        for cmd in (f"bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}'",
+                    f"python3 -c \"import socket; socket.create_connection(('127.0.0.1', {port}), 2)\"",
+                    "python3 -c \"import socket; socket.create_connection(('93.184.216.34', 80), 2)\"",
+                    "python3 -c \"import socket; socket.getaddrinfo('example.com', 80)\""):
+            r = sh(shell, cmd)
+            assert not r.success, (cmd, out(r))
+        assert out(sh(shell, "awk 'NR>2 {sub(/:.*/, \"\", $1); print $1}' /proc/net/dev"))["stdout"].split() == ["lo"]
+    finally:
+        srv.close()
+
+
+# ---- host Unix sockets (not covered by effGen's network namespace) ----------------------------------------
+HOST_SOCKETS = ["/run/systemd/resolve/io.systemd.Resolve", "/run/dbus/system_bus_socket", "/run/docker.sock",
+                f"/run/user/{os.getuid()}/bus", f"/run/user/{os.getuid()}/systemd/private"]
+CONNECT = "python3 -c \"import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(2); s.connect(sys.argv[1])\" "
+
+
+def host_can_connect(path: str) -> bool:
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(2)
+    try:
+        s.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+@linux_only
+@pytest.mark.parametrize("path", HOST_SOCKETS)
+def test_host_sockets_under_run_are_unreachable(shell, path):
+    if not host_can_connect(path):
+        pytest.skip(f"{path} is absent or not connectable on this host")
+    r = sh(shell, CONNECT + shlex.quote(path))
+    assert not r.success and ("No such file" in out(r)["stderr"]), out(r)  # hidden, not merely refused
+
+
+@linux_only
+def test_effgen_sandbox_alone_reaches_host_sockets(layout):
+    # Regression pin (audit Part 3, T4.2): effGen's net namespace leaves pathname Unix sockets reachable, which
+    # is why ShellTool hides /run. If this fails, effGen closed the gap: review _HIDE_HOST_SOCKETS.
+    from effgen.security.sandbox import SandboxConfig
+    path = next((p for p in HOST_SOCKETS if host_can_connect(p)), None)
+    if path is None:
+        pytest.skip("no connectable host socket under /run on this host")
+    cfg = SandboxConfig(backend="subprocess", timeout=10, memory_limit="1g", docker_image="unused", workdir=str(layout[0]))
+    result = asyncio.run(SubprocessSandbox().run(CONNECT + shlex.quote(path), "bash", cfg))
+    assert result.network_isolated and result.exit_code == 0, result.stderr
+
+
+@linux_only
+def test_dns_cannot_leak_through_the_host_resolver(shell):
+    for cmd in ("getent hosts example.com", "python3 -c \"import socket; socket.getaddrinfo('example.com', 80)\""):
+        assert not sh(shell, cmd).success, cmd
+
+
+@linux_only
+def test_run_is_an_empty_read_only_directory_inside_the_sandbox(shell):
+    r = sh(shell, "ls -A /run | wc -l; touch /run/x 2>&1; true")
+    assert out(r)["stdout"].splitlines()[0] == "0" and "Read-only" in out(r)["stdout"]
+
+
+@linux_only
+def test_host_tmp_is_hidden_only_when_the_workspace_is_outside_tmp(layout):
+    # Documented limitation: with the workspace under /tmp (as in these tests) effGen cannot give a private /tmp,
+    # so sockets in the host /tmp stay reachable. A workspace elsewhere gets a private, empty /tmp.
+    probe_dir = Path(tempfile.mkdtemp(prefix="smol-t42-host-tmp-", dir="/tmp"))
+    sock = socket.socket(socket.AF_UNIX)
+    sock.bind(str(probe_dir / "s.sock"))
+    sock.listen(1)
+    try:
+        under_tmp = ShellTool(layout[0])
+        assert sh(under_tmp, f"test -S {probe_dir}/s.sock").success  # visible: the documented gap
+        elsewhere = Path(tempfile.mkdtemp(prefix=".t42-ws-", dir=Path(__file__).resolve().parents[1]))
+        try:
+            assert not str(elsewhere).startswith("/tmp")
+            assert not sh(ShellTool(elsewhere), f"test -e {probe_dir}").success  # hidden
+        finally:
+            shutil.rmtree(elsewhere, ignore_errors=True)
+    finally:
+        sock.close()
+        shutil.rmtree(probe_dir, ignore_errors=True)
+
+
+# ---- timeout and child processes ----------------------------------------------------------------------------------
+@linux_only
+def test_command_exceeding_its_timeout_is_killed(shell, marker):
+    start = time.monotonic()
+    r = sh(shell, f"echo started; sleep {marker}", timeout=2)
+    assert time.monotonic() - start < 8
+    o = out(r)
+    assert not r.success and o["timed_out"] and "timed out after 2s" in r.error and o["stdout"] == "started\n"
+    assert survivors(f"sleep {marker}") == []
+
+
+@linux_only
+def test_every_spawned_process_dies_with_the_timeout(shell, marker):
+    cmd = (f"sleep {marker} & setsid sleep {marker} & nohup sleep {marker} >/dev/null 2>&1 & "
+           f"(trap '' TERM; sleep {marker}) & sleep {marker}")
+    start = time.monotonic()
+    r = sh(shell, cmd, timeout=2)
+    assert time.monotonic() - start < 10 and out(r)["timed_out"]
+    assert survivors(f"sleep {marker}") == []
+
+
+@linux_only
+def test_a_term_ignoring_command_is_killed_after_the_grace_period(shell, marker):
+    start = time.monotonic()
+    r = sh(shell, f"trap '' TERM; while true; do sleep {marker}; done", timeout=2)
+    assert out(r)["timed_out"] and time.monotonic() - start < 10
+    assert survivors(f"sleep {marker}") == []
+
+
+@linux_only
+def test_background_processes_do_not_outlive_a_command_that_exits(shell, marker):
+    start = time.monotonic()
+    r = sh(shell, f"sleep {marker} & setsid sleep {marker} & echo done")
+    assert r.success and out(r)["stdout"] == "done\n" and time.monotonic() - start < 8
+    assert survivors(f"sleep {marker}") == []
+
+
+@linux_only
+def test_effgen_timeout_path_leaves_children_and_blocks(layout):
+    # Regression pin (audit Part 3, T4.2): on its own deadline (timeout + 2 s) SubprocessSandbox.run kills only the
+    # outer `unshare`, leaves the descendants running, and then waits for their pipes to close, so it returns only
+    # when they end by themselves. ShellTool avoids this by timing out inside the PID namespace. If upstream fixes it,
+    # this test fails: review ShellTool's workaround and relax the pin.
+    from effgen.security.sandbox import SandboxConfig
+    duration = f"4.{time.monotonic_ns() % 1_000_000:06d}"
+    cfg = SandboxConfig(backend="subprocess", timeout=1, memory_limit="256m", docker_image="unused", workdir=str(layout[0]))
+
+    async def scenario():
+        task = asyncio.create_task(SubprocessSandbox().run(f"sleep {duration} & sleep {duration}", "bash", cfg))
+        await asyncio.sleep(3.5)  # effGen's own deadline (1 + 2 s) has passed
+        alive, done = survivors(f"sleep {duration}"), task.done()
+        return alive, done, await task
+
+    start = time.monotonic()
+    alive, done_early, _ = asyncio.run(scenario())
+    assert alive and not done_early  # children still running, and run() still has not returned
+    assert time.monotonic() - start >= 3.9  # it returned only once they exited on their own
+
+
+# ---- memory ---------------------------------------------------------------------------------------------------
+ALLOC = "python3 -c \"x = bytearray(512 << 20); print('allocated')\""
+
+
+@linux_only
+def test_memory_limit_is_enforced(layout):
+    small, large = ShellTool(layout[0], memory_limit="256m"), ShellTool(layout[0], memory_limit="2g")
+    r = sh(small, ALLOC)
+    assert not r.success and "MemoryError" in out(r)["stderr"] and out(r)["stdout"] == ""
+    assert out(sh(large, ALLOC))["stdout"] == "allocated\n"
+    assert out(sh(small, "ulimit -v"))["stdout"].strip() == str(256 * 1024)
+
+
+@linux_only
+def test_default_memory_limit_runs_a_real_pytest_run(shell, layout):
+    (layout[0] / "test_sample.py").write_text("def test_ok():\n    assert 1 + 1 == 2\n\ndef test_bad():\n    assert 1 + 1 == 3\n")
+    assert out(sh(shell, "ulimit -v"))["stdout"].strip() == str(1024 * 1024)
+    r = sh(shell, f"{shlex.quote(sys.executable)} -m pytest -q -p no:cacheprovider test_sample.py", timeout=60)
+    assert not r.success and out(r)["exit_code"] == 1  # a failing test is a failed result...
+    assert "1 failed, 1 passed" in r.error and "assert 1 + 1 == 3" in r.error  # ...that shows the model why
+
+
+# ---- the sandbox is required: fail closed ---------------------------------------------------------------------------
+def test_shell_is_refused_off_linux(layout, monkeypatch):
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    with pytest.raises(ToolBuildError, match="needs Linux") as e:
+        build_tools(["shell"], layout[0])
+    assert "WSL2" in str(e.value)
+    assert [t.name for t in build_tools(["file_operations"], layout[0])] == ["file_operations"]  # unaffected
+
+
+@pytest.mark.parametrize("missing", ["unshare", "timeout", "bash"])
+def test_shell_is_refused_without_its_host_binaries(layout, monkeypatch, missing):
+    import shutil
+    real = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **k: None if name == missing else real(name, *a, **k))
+    with pytest.raises(ToolBuildError, match=missing):
+        build_tools(["shell"], layout[0])
+
+
+@linux_only
+def test_degraded_sandbox_runs_nothing_and_fails_closed(layout, monkeypatch):
+    # Simulate a host without user namespaces: this is the state in which effGen quietly runs plain `bash`.
+    monkeypatch.setattr(SubprocessSandbox, "_caps_probed", True)
+    monkeypatch.setattr(SubprocessSandbox, "_userns_ok", False)
+    monkeypatch.setattr(SubprocessSandbox, "_mountns_ok", False)
+    monkeypatch.setattr(SubprocessSandbox, "_pidns_ok", False)
+    tool = ShellTool(layout[0])
+    r = sh(tool, "touch ran.marker; echo hi")
+    assert not r.success and "did not enforce" in r.error and "refusing to use the shell" in r.error
+    assert not (layout[0] / "ran.marker").exists()  # only the fixed no-op probe ran, never the command
+    assert r.output is None
+
+
+@linux_only
+@pytest.mark.parametrize("flags", [dict(filesystem_confined=False), dict(network_isolated=False),
+                                   dict(process_table_isolated=False), dict(writable_root="/elsewhere"),
+                                   dict(error="spawn failed")])
+def test_each_missing_guarantee_is_fatal(layout, monkeypatch, flags):
+    good = dict(stdout="", stderr="", exit_code=0, filesystem_confined=True, network_isolated=True,
+                process_table_isolated=True, writable_root=str(layout[0]))
+
+    async def fake_run(self, code, language, config):
+        return SandboxResult(**{**good, **flags})
+
+    monkeypatch.setattr(SubprocessSandbox, "run", fake_run)
+    tool = ShellTool(layout[0])
+    r = sh(tool, "echo hi")
+    assert not r.success and (r.error.startswith("Tool execution failed") or "sandbox" in r.error)
+    assert tool._verified is False  # a failed proof is never cached
+
+
+@linux_only
+def test_a_sandbox_that_never_returns_is_cut_off(layout, monkeypatch):
+    good = dict(stdout="", stderr="", exit_code=0, filesystem_confined=True, network_isolated=True,
+                process_table_isolated=True, writable_root=str(layout[0]))
+
+    async def fake_run(self, code, language, config):
+        if "sleep" in code:
+            await asyncio.sleep(60)
+        return SandboxResult(**good)
+
+    monkeypatch.setattr(SubprocessSandbox, "run", fake_run)
+    monkeypatch.setattr(ShellTool, "SANDBOX_SLACK_S", 0)
+    monkeypatch.setattr(ShellTool, "HARD_DEADLINE_SLACK_S", 1)
+    start = time.monotonic()
+    r = sh(ShellTool(layout[0]), "sleep 100", timeout=1)
+    assert not r.success and "hard deadline" in r.error and time.monotonic() - start < 6
+
+
+@linux_only
+def test_the_sandbox_backend_is_pinned_to_subprocess(layout, monkeypatch):
+    seen = []
+    real_run = SubprocessSandbox.run
+
+    async def spy(self, code, language, config):
+        seen.append((config.backend, config.network_enabled, config.workdir))
+        return await real_run(self, code, language, config)
+
+    monkeypatch.setattr(SubprocessSandbox, "run", spy)
+    monkeypatch.setenv("EFFGEN_SANDBOX_BACKEND", "off")  # must not be honoured
+    monkeypatch.setenv("EFFGEN_SANDBOX_MEMORY", "4g")
+    tool = ShellTool(layout[0])
+    assert sh(tool, "echo hi").success
+    assert out(sh(tool, "ulimit -v"))["stdout"].strip() == str(1024 * 1024)
+    assert seen and all(s == ("subprocess", False, str(layout[0])) for s in seen)
+
+
+# ---- allowlists ---------------------------------------------------------------------------------------------------
+def test_shell_is_absent_unless_allowlisted(layout):
+    assert [t.name for t in build_tools(["file_operations"], layout[0])] == ["file_operations"]
+    assert build_tools([], layout[0]) == []
+    assert "shell" in TOOL_NAMES and "shell" in KNOWN_TOOLS
+
+
+@linux_only
+def test_shell_instances_are_fresh_and_isolated_per_agent(layout):
+    (a,), (b,) = build_tools(["shell"], layout[0]), build_tools(["shell"], layout[0])
+    assert a is not b and isinstance(a, ShellTool)
+
+
+@linux_only
+def test_shell_parameter_schema_exposes_only_command_and_timeout(shell):
+    assert [p.name for p in shell.metadata.model_facing_parameters] == ["command", "timeout"]
+
+
+@linux_only
+def test_an_agent_without_shell_cannot_reach_it_and_one_with_shell_can(layout):
+    ws, outside = layout
+    held: dict[str, list[str]] = {}
+
+    class RecordingAgent(harness_mod.Agent):
+        def __init__(self, config, *a, **kw):
+            super().__init__(config, *a, **kw)
+            held[config.name] = sorted(self.tools)
+
+    call = lambda tool, **args: f"Thought: go.\nAction: {tool}\nAction Input: {json.dumps(args)}"  # noqa: E731
+    final = "Thought: done.\nFinal Answer: ok"
+    shell_worker = ScriptedModel([
+        call("shell", command="pwd > where.txt; echo boom-marker >&2; exit 3"), call("shell", command="touch built.txt"), final,
+    ], name="shell-worker")
+    files_only = ScriptedModel([call("shell", command="touch smuggled.txt"), final], name="files-worker")
+    orch = ScriptedModel([
+        'Thought: d.\nAction: delegate\nAction Input: {"worker": "builder", "task": "build"}',
+        'Thought: d.\nAction: delegate\nAction Input: {"worker": "reader", "task": "try to use the shell"}',
+        'Thought: done.\nFinal Answer: finished',
+    ], name="orch")
+    harness = build_harness(
+        cfg(orch, "orch", build_tools(["file_operations"], ws)),
+        {"builder": cfg(shell_worker, "builder", build_tools(["file_operations", "shell"], ws)),
+         "reader": cfg(files_only, "reader", build_tools(["file_operations"], ws))},
+        {"builder": "runs commands", "reader": "reads files"},
+    )
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(harness_mod, "Agent", RecordingAgent)
+        mp.setattr(delegation_mod, "Agent", RecordingAgent)
+        result = harness.run("go")
+
+    assert result.success, result.output
+    assert held == {"orch": ["delegate", "file_operations"], "builder": ["file_operations", "shell"], "reader": ["file_operations"]}
+    assert not any(WEB_LIKE.search(n) for names in held.values() for n in names)
+    assert (ws / "where.txt").read_text().strip() == str(ws) and (ws / "built.txt").exists()
+    assert not (ws / "smuggled.txt").exists()  # the worker without `shell` could not run it
+    assert any("boom-marker" in str(c.prompt) for c in shell_worker.calls)  # a failing command's stderr reached the model
+    assert any("not found" in str(c.prompt).lower() or "unknown tool" in str(c.prompt).lower()
+               or "available" in str(c.prompt).lower() for c in files_only.calls[1:])
+    outside_unchanged(outside)
+
+
+# ---- regression pins for effGen behaviour the shell depends on (audit §1.8) ----------------------------------------
+@linux_only
+def test_effgen_strips_unknown_parameters_so_the_tool_must_reject_them(layout):
+    from effgen.tools.builtin.file_ops import FileOperations as FO
+    fo = FO(allowed_directories=[str(layout[0])])
+    assert run(fo, operation="read", path="a.txt", network_enabled=True).success  # silently ignored by effGen itself
+    assert not run(ShellTool(layout[0]), command="echo hi", network_enabled=True).success  # rejected by ShellTool
+
+
+# ---- T4.1 correction: dangerous workspace roots ---------------------------------------------------------------------
+def test_filesystem_roots_are_rejected_as_workspaces():
+    with pytest.raises(ToolBuildError, match="filesystem root"):
+        resolve_workspace(Path("/").anchor)
+    with pytest.raises(ToolBuildError, match="filesystem root"):
+        build_tools(["file_operations"], "/")
+
+
+def test_home_directory_and_its_ancestors_are_rejected_but_subdirectories_are_not(tmp_path, monkeypatch):
+    home = tmp_path / "users" / "me"
+    project = home / "projects" / "repo"
+    project.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    for bad in (home, home.parent, tmp_path):
+        with pytest.raises(ToolBuildError, match="contains the home directory"):
+            build_tools(["file_operations"], bad)
+    assert resolve_workspace(project) == project.resolve()
+    assert resolve_workspace(home / "projects") == (home / "projects").resolve()
+
+
+def test_a_symlink_to_the_filesystem_root_is_rejected(tmp_path):
+    (tmp_path / "rootlink").symlink_to("/", target_is_directory=True)
+    with pytest.raises(ToolBuildError, match="filesystem root"):
+        resolve_workspace(tmp_path / "rootlink")
+
+
+def test_root_detection_follows_windows_drive_semantics():
+    # Pure-path semantics only: this is NOT a test on Windows (no Windows host was available).
+    assert _is_filesystem_root(PureWindowsPath("C:\\")) and _is_filesystem_root(PureWindowsPath("D:/"))
+    assert _is_filesystem_root(PureWindowsPath("\\\\server\\share\\"))
+    assert not _is_filesystem_root(PureWindowsPath("C:\\work\\repo")) and not _is_filesystem_root(PureWindowsPath("C:\\work"))

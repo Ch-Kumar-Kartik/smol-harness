@@ -217,7 +217,7 @@ Convention since T3.2b: tests that load a real checkpoint carry the `real_model`
 - **Acceptance:** An Ollama orchestrator with an HF worker (and the reverse) completes a trivial delegated task end-to-end. Record whether the small model follows the delegate tool contract.
 - **Tests:** `tests/integration/test_mixed.py` (manual / marked).
 
-### M4: Workspace tools. **Status: IN PROGRESS (T4.1 verified; T4.2 not started)**
+### M4: Workspace tools. **Status: T4.1 and T4.2 done for trusted local development (T4.2 is NOT a complete security boundary; R1 unresolved). T4.3 contingent.**
 
 **T4.1 `tools.py` registry + `file_operations`** (workspace-confined file operations)
 
@@ -239,9 +239,9 @@ Convention since T3.2b: tests that load a real checkpoint carry the `real_model`
 
 **T4.2 Sandboxed `shell` tool**
 
-- **Status:** Not started. **This is the next active task.**
-- **Dependencies:** T4.1 (done): replace `_shell` in `src/smol_harness/tools.py` (it currently raises `ToolBuildError` mentioning T4.2), and update `test_shell_fails_closed_until_t42` in `tests/test_tools.py`.
-- **Changes:** A `CodeExecutor` subclass exposing `command` (and capped `timeout`). It pins bash, network off and the configured memory limit, and requires the subprocess backend. Fail closed if the sandbox does not initialize.
+- **Status:** **Completed for trusted local development only (2026-10-17).** All six acceptance criteria below were met and verified, so none was weakened. What is *not* achieved is a complete isolation boundary, which the criteria did not ask for but the word "sandbox" suggests: host file **reads** are not confined, and host Unix sockets outside `/run` stay reachable (**R1, unresolved**). **Accepted scope (user decision, 2026-10-17): the shell is for trusted local development and controlled test repositories only. Untrusted repositories and adversarial agent workloads must NOT run in this sandbox; they require a dedicated, independently isolated container or VM whose controls are separately verified. No seccomp filter, new backend or other isolation infrastructure will be added in the MVP.** Record: §4 (T4.2). The text below is the plan as written before the task.
+- **Dependencies:** T4.1 (done).
+- **Changes (as planned; as built it is a `BaseTool` over `SubprocessSandbox`, see §4):** A `CodeExecutor` subclass exposing `command` (and capped `timeout`). It pins bash, network off and the configured memory limit, and requires the subprocess backend. Fail closed if the sandbox does not initialize.
 - **Acceptance:**
   - `echo` works.
   - Writing outside the workspace fails.
@@ -259,16 +259,43 @@ Convention since T3.2b: tests that load a real checkpoint carry the `real_model`
 
 ### M5: CLI and end-to-end coding smoke test
 
+**T5.0 Assemble a harness from `HarnessConfig`** (inserted 2026-10-17; before T5.1)
+
+- **Status:** Not started. **This is the next executable task.**
+- **Objective:** one call turns a validated `HarnessConfig` into a runnable `Harness` that owns its models: `build_harness_from_config(config, *, cache=None, tool_calling_mode="react") -> Harness`, plus `Harness.close()` / context manager. Responsibilities stay separate: `config.py` only parses and validates (unchanged), `models.py` only loads and owns models (`ModelCache`), `tools.py` only builds tools, `delegation.py` untouched, and `harness.py` does the wiring (the module the architecture already assigns it). No new module, no new abstraction.
+- **Dependencies:** T3.1 (`HarnessConfig`), T3.2 (`ModelCache`, `build_model`), T4.1 and T4.2 (`build_tools`), M1/M2 (`build_harness`, `Harness`). Not T3.3 to T3.5 (real models).
+- **Expected files:** modify `src/smol_harness/harness.py` (add the function, `Harness.close`, `__enter__/__exit__`; keep `build_harness` and its signature working, since 100+ tests use it); create `tests/test_harness_config.py`. No change to `config.py`, `models.py`, `tools.py`, `delegation.py` unless a test proves a defect (then record it). No effGen change.
+- **Current interfaces (inspected 2026-10-17):** `build_harness(orchestrator: AgentConfig, workers: Mapping[str, AgentConfig], descriptions, worker_timeout_s, max_delegations, max_report_chars) -> Harness` takes already-built `AgentConfig`s holding model *instances*; `Harness` has no `close`; `ModelCache.get(spec)` builds each distinct frozen `ModelSpec` once and `close()` unloads all (idempotent, `ExceptionGroup` on unload failures, usable as a context manager); `build_tools(names, workspace)` builds fresh tool instances and validates the workspace; `AgentSpec(name, model, tools, max_iterations, description, system_prompt)`; `Limits(max_delegations, max_report_chars, worker_timeout_s, max_depth)`.
+- **Design:**
+  1. **Validate before loading anything.** For every agent (orchestrator first, then workers in config order) call `build_tools(spec.tools, config.workspace)`. Any `ToolBuildError` (bad workspace, dangerous root, `shell` unavailable off Linux or without `unshare`) aborts assembly before any model is built.
+  2. **Then load models** through one `ModelCache` (the injected `cache` if given, else a new one that the `Harness` owns). Agents with equal `ModelSpec` share one instance (the existing cache rule); distinct specs never do.
+  3. **Map each `AgentSpec` to an `AgentConfig`:** `name`, `model` (instance), `tools` (the instances from step 1; the orchestrator's `delegate` is still added by `Harness.run`, never here), `max_iterations`, `system_prompt` when set, `tool_calling_mode` (a parameter, default `"react"`, because ReAct is the only mode verified with the small local model; it is not a YAML field), the same fixed flags the e2e tests use (`capability_probe=False`, `enable_memory=False`, `raise_on_error=False`; confirm each against audit §1.1 and §1.4 before keeping it), and for Ollama specs `max_context_length=spec.context_length`. HF specs get no `max_context_length` (no config field; known gap, audit Part 2).
+  4. **Register workers** with `description` from `AgentSpec`, and pass `Limits` (`worker_timeout_s`, `max_delegations`, `max_report_chars`) to `Harness`. `max_depth` is fixed at 1 already.
+  5. **Ownership and cleanup:** `Harness.close()` unloads the models of a cache it owns, is idempotent, and does nothing to an injected cache (the caller owns it). `Harness` is a context manager. `run()` after `close()` raises `RuntimeError`. If assembly fails after some models loaded, the models loaded so far are unloaded before the exception propagates (no leak), and the original error is the one raised.
+  6. **Tool lifetime:** tool instances are shared by all delegations of one agent within a harness (the worker registry builds a fresh `Agent` per delegation around the same `AgentConfig`); they hold no per-run state (`ShellTool` caches only its sandbox proof). Different agents never share a tool instance.
+- **Failure behaviour (all raise before any `run`, no partial harness is returned):** `ToolBuildError` for tools or workspace (raised before any model load; `build_model` is never called); `ModelLoadError` (from `ModelCache`) for a model, with the cache cleaned up; `ConfigError` is not this function's concern (already raised by parsing). No retries, no fallbacks, no silently dropped tools or agents.
+- **Acceptance:**
+  - A harness built from a two-worker config runs a delegated task end to end with scripted models and real tools, and returns the same `HarnessResult` shape as today.
+  - Each agent holds exactly its allowlisted tools (orchestrator `{delegate} ∪ allowlist`, workers their own, `[]` means none; no worker holds `delegate`; no web-like tool anywhere).
+  - Equal specs share one model instance; different specs do not; `build_model` is called once per distinct spec.
+  - `close()` unloads every owned model exactly once, is idempotent, leaves an injected cache open, and `run()` afterwards raises; the context manager closes on normal exit and on an exception inside the block.
+  - An invalid workspace, a dangerous root, or an unbuildable `shell` fails before any model is built; a model failure on the second distinct spec unloads the first.
+  - `Limits` reach the harness (a config with `max_delegations: 1` refuses the second delegation; a tiny `worker_timeout_s` times out a scripted slow worker).
+  - Default suite stays CPU-only, no network, no real model; baseline 601 passed, 3 skipped, plus the new tests; `uv lock --check` unchanged.
+- **Tests (deterministic, `tests/test_harness_config.py`):** patch `smol_harness.models.build_model` to return `ScriptedModel`s keyed by `spec.model` (recording calls and `unload`); configs through `loads_config` with a temporary workspace; cases for each acceptance bullet above, plus tool-instance non-sharing across agents and system-prompt/iteration/context-length mapping. A `shell` agent test is `linux_only`.
+- **Out of scope:** the CLI, YAML changes (a `tool_calling_mode`, HF `max_context_length`, shell `memory_limit` / `max_timeout_s` fields are possible later tasks), real models, Ollama/HF loading, any sandbox change, parallel agents.
+- **Open questions for the user (defaults chosen above; say if you disagree):** (1) `tool_calling_mode` default `"react"` as a function parameter rather than a YAML field; (2) HF context window stays unset until a config field is approved.
+
 **T5.1 CLI**
 
 - **Status:** Not started
-- **Dependencies:** T3.1, T4.2.
+- **Dependencies:** T3.1, T4.2, T5.0.
 - **Acceptance:** `uv run python -m smol_harness --config configs/example.yaml --task "..." --json` prints the final output plus worker records. The exit code is non-zero on orchestrator failure.
 
 **T5.2 Toy-repo smoke test**
 
 - **Status:** Not started
-- **Dependencies:** T5.1, T3.5.
+- **Dependencies:** T5.1, T3.5. Trusted repositories only (T4.2 scope); never an untrusted repository.
 - **Acceptance:** In a temporary git repo with one failing unit test:
   1. the orchestrator delegates "fix the bug";
   2. the worker edits the file;
@@ -288,10 +315,9 @@ Convention since T3.2b: tests that load a real checkpoint carry the `real_model`
 ## 3. Current active goal
 
 - **Milestone:** M3 is **in progress, not complete**: T3.1, T3.2, T3.2a, T3.2b, T3.2c are done; T3.3 is blocked (Ollama not installed); T3.4 and T3.5 are not started (need `bitsandbytes`/GPU runs and an Ollama server). M4 (workspace tools): T4.1 done; T4.2 next.
-- **Current task:** **T4.2 sandboxed `shell` tool**, status **Not started** (awaiting approval to begin).
-- **Why:** agents now have workspace-confined file operations (T4.1); the MVP still needs a sandboxed shell to run tests and content search before the CLI (T5.1).
-- **What must be achieved:** see the T4.2 entry in §2.
-- **How success is verified:** `uv run pytest tests/test_tools.py -q`, then `uv run pytest -q` (baseline 531 passed, 3 skipped).
+- **Current task:** none active. **T4.2 is Completed for trusted local development only** (R1 accepted, unresolved; §4). **Next executable task: T5.0, assemble a harness from `HarnessConfig`** (§2, M5), then T5.1. Nothing is started.
+- **Why:** agents have workspace-confined file operations (T4.1) and a shell for trusted development (T4.2); `HarnessConfig`, `ModelCache`, `build_tools` and `build_harness` exist but nothing connects them, so no configured harness can run yet (T5.0), and the CLI (T5.1) needs that.
+- **How success is verified:** `uv run pytest tests/test_tools.py -q` (121 passed), then `uv run pytest -q` (601 passed, 3 skipped).
 - **First executable development milestone:** **M1 (T1.1 → T1.3): reached 2026-10-16.** `tests/test_e2e_delegation.py` passes.
 
 ## 4. Completed work
@@ -523,10 +549,44 @@ Convention since T3.2b: tests that load a real checkpoint carry the `real_model`
   - Reads of the whole workspace are allowed, including `.git/` contents with allowed extensions.
 - **Deviations from the proposed design:** none in substance. Additions: the read-back of the kept root (closes the fallback above), the empty-path and access checks, rejection of duplicates and bare strings. `ToolBuildError` subclasses `ValueError`, as proposed.
 
+### T4.2 Sandboxed `shell` tool (2026-10-17)
+
+- **Files:** modified `src/smol_harness/tools.py` (now about 270 lines) and `tests/test_tools.py` (121 tests, 70 new). No effGen change, no `build_harness` wiring, no config change.
+- **Backend selected:** effGen's `SubprocessSandbox`, instantiated directly (never `get_sandbox`, so `EFFGEN_SANDBOX_BACKEND` cannot select `off`, and Docker is never used). **Deviation from the plan:** `ShellTool` is a small `BaseTool` over `SubprocessSandbox` (both public in `effgen`), not a `CodeExecutor` subclass: `CodeExecutor` exposes language, network and memory as model-facing parameters and would need private attributes (`_sandbox`, `_sandbox_config`) to pin them. Reused: `SubprocessSandbox` (all isolation), `SandboxConfig`, `BaseTool`, `ParameterSpec`.
+- **API:** `ShellTool(workspace, *, memory_limit="1g", max_timeout_s=300)`; `build_tools(["shell"], workspace)` builds one with defaults (the YAML has no field for them yet). Parameters: `command` (1..10,000 chars, no NUL, not blank) and `timeout` (1..300 s, default 30). Unknown parameters are **rejected** (effGen's `BaseTool` would silently drop them). Result: `exit_code`, `stdout`, `stderr`, `timed_out`, `truncated`, `filesystem_confined`, `network_isolated`, `writable_root`; non-zero exit or timeout is a failed result whose `error` carries the exit code and the last 8,000 characters of each stream (effGen shows a model only `error` for failures, so a failing `pytest` reaches it with its output); stdin is `/dev/null`.
+- **Fail closed (three layers):** (1) at build time: not Linux, or `bash`/`unshare`/`timeout` missing → `ToolBuildError` (the message names WSL2 for Windows, not tested); (2) before the first command, a fixed no-op runs through the same path and the sandbox must report write confinement to exactly the workspace, network isolation and a private process table, otherwise `ShellSandboxError` and the model's command never runs (tested: with user namespaces simulated away, effGen quietly runs plain `bash`, and the command's marker file was not created); (3) every result is re-checked and discarded if a guarantee is missing. A failed proof is never cached.
+- **Acceptance results (all through `BaseTool.execute()` with the real sandbox on this host; Linux 6.18, unprivileged user namespaces available):**
+
+| # | Requirement | Result |
+|---|---|---|
+| 1 | harmless command | `echo`, `pwd`, pipes, `&&` work; `exit 3` gives `exit_code=3` and a failed result with the output in `error` |
+| 2 | starts in the workspace | `pwd` is the workspace; relative reads/writes hit it; `file_operations` and `shell` see the same files |
+| 3 | writes outside refused | 8 write forms (redirect, `mkdir`, `rm`, `mv`, `cp`, `../`, absolute, sibling) → `Read-only file system`; writes through file/directory symlinks refused; `mount -o remount,rw` and a nested `unshare` remount denied; host `/tmp` writes never reach the host |
+| 4 | reads outside | **NOT confined** (tested and pinned): sibling directories, `/etc`, symlinks to outside, `.env`, extensionless files all readable; `~/.ssh`, `~/.netrc` etc. masked by effGen's deny-list (tested with a fake `$HOME`). The shell therefore reads what `file_operations` refuses |
+| 5 | network | TCP to host loopback and to a public IP, and DNS: all fail; only `lo` in `/proc/net/dev`. See R1 for what is *not* covered |
+| 6 | timeout | `sleep` with `timeout=2` returned in under 8 s, `timed_out=True`; a command's own `exit 124` is not reported as a timeout |
+| 7 | children | background, `setsid`, `nohup`, `trap '' TERM` loops: none survived (checked in the host `/proc`); backgrounded daemons are also killed when a command exits normally |
+| 8 | memory | `ulimit -v` enforced: 512 MiB allocation fails with `MemoryError` at 256m and succeeds at 2g; default 1g; a real `pytest` run (1 pass, 1 fail) works under the default |
+| 9 | allowlist | a worker built without `shell` that asks for it runs nothing (marker file absent); the shell has no way to call other agent tools; the only parameters are `command` and `timeout`; `delegate`/web names still unbuildable |
+| 10 | sandbox unavailable | off Linux, missing binaries, no namespaces, each missing guarantee, spawn error, a sandbox that never returns: all fail, none run the command |
+
+- **Two effGen defects found and worked around (no effGen change; pinned by regression tests; audit Part 3):**
+  - **Timeout does not clean up and can hang.** On its own deadline `SubprocessSandbox.run` kills only the outer `unshare`, leaves every descendant running, and then awaits `proc.wait()`, which asyncio resolves only after all pipes close. A command that leaves a background process makes `run()` block until that process ends (measured: orphaned `sleep`s alive and the call stuck). Workaround: `ShellTool` runs `timeout -k 2 N bash -c <cmd>` as the script inside the PID namespace; when PID 1 exits the kernel kills everything left in it. effGen's own deadline stays as a later backstop, plus a hard `asyncio.wait_for` of ours.
+  - **A network namespace does not isolate pathname Unix sockets** (R1 below). Workaround: an empty read-only tmpfs over `/run` before each command.
+- **R1: UNRESOLVED SECURITY LIMITATION, accepted for trusted local development (user decision, 2026-10-17).** On this host (a desktop in the `docker` and `wheel` groups) the unmasked sandbox could **connect** to the Docker daemon socket (root-equivalent), the session and system D-Bus, the systemd user manager's private socket, gpg-agent and PipeWire, and systemd-resolved answered DNS (an egress channel through query names). I only tested connectivity; I did not send commands to any of them or try to exploit this. The `/run` mask closes all of those (tested; mutation-checked: removing the mask fails the tests). **Still reachable:** any other pathname Unix socket the user can reach, e.g. on this host `~/.cache/docker-secrets-engine/engine.sock`, editor and agent sockets under `~/` (`~/.codex`, `~/.local/share/zed`, `~/.zeron`), `/etc/pacman.d/gnupg/S.*`, and, when the **workspace is under `/tmp`**, every socket in the host `/tmp` (effGen gives a private `/tmp` only when the workspace is elsewhere; tested both ways). A path deny-list cannot enumerate these. A hostile command (e.g. a prompt-injected agent) could talk to them; a merely buggy small model will not. **Decision:** accepted for the MVP in the trusted scope only; the shell must not run untrusted repositories or adversarial workloads. For those, a dedicated, independently isolated container or VM is required, with its controls verified separately (the harness would run inside it; this also is the route for Windows). **Not doing:** a seccomp filter, new sandbox backends or other isolation infrastructure. Consequences to keep in mind: do not put secrets, `.env` files or other sensitive data in a workspace or anywhere the user can read when running the shell; do not run it on a machine whose user can reach a Docker socket under a non-`/run` path or other sensitive local services; prefer a workspace outside `/tmp`.
+- **Unix-level facts measured (for tuning):** `ulimit -u 256` counts the user's *total* processes (148 running here); a user with more than about 256 processes cannot fork inside the sandbox. A trivial command takes about 0.1 to 0.3 s. Output cap 8,000 chars per stream (tail). The default memory floor is 1g (effGen's 256m default also ran a trivial `pytest`, but node/V8 and real toolchains need more; U8 answered only for a trivial suite).
+- **Not enforced (documented limits):** reads (R1 and item 4); CPU quota beyond `ulimit -t` (timeout + 5 s of CPU time); disk quota inside the workspace; output volume before truncation (a command can print gigabytes into a pipe until the timeout); process count is per user not per sandbox; `/dev` devices (e.g. `/dev/kvm`, GPU) stay reachable; hard links and bind mounts inside the workspace; kernel/namespace escapes (this is not a VM or a container boundary); `ulimit -v` is address space, not resident memory. After a **hard-deadline** failure (effGen's backstop never returned) processes may still be running; the normal path cannot leave any.
+- **Scope and prohibitions:** **Accepted scope (user decision, 2026-10-17): the shell is for trusted local development and controlled test repositories only. Untrusted repositories and adversarial agent workloads must NOT run in this sandbox; they require a dedicated, independently isolated container or VM whose controls are separately verified. No seccomp filter, new backend or other isolation infrastructure will be added in the MVP.** Unresolved at the end of T4.2: no host **read** isolation (any file the user can read is readable); Unix sockets outside `/run` reachable (R1); DNS is blocked only because `/run` (systemd-resolved) is hidden and the network namespace has no interfaces; a resolver reachable through some other socket path would not be covered; kernel or namespace escapes are out of scope of what was tested.
+- **Windows 11 (the eventual experiment machine):** **not tested, not supported natively.** Off Linux, effGen's `SubprocessSandbox` returns a plain `bash -c` plan with no isolation (source-level), so `ShellTool` refuses to build (`platform.system() != "Linux"`; tested by monkeypatching, not on Windows). Docker is no alternative: effGen's `DockerSandbox` does not mount the workspace. The practical route is to run the whole harness inside **WSL2** with the repository on the WSL ext4 filesystem (not `/mnt/c`), where the same Linux code path applies. **Windows and WSL2 compatibility are unverified.** WSL2 needs unprivileged user namespaces and `unshare`, `timeout`, `bash`; none of that was verified, and R1 applies there too (a WSL distro normally has no Docker or D-Bus session unless the user installs them, which would make R1 smaller, but this is unmeasured). `resolve_workspace`'s drive-root check is tested with `PureWindowsPath` semantics only.
+- **T4.1 correction:** `resolve_workspace` now also rejects a filesystem root (`/`, a drive root or a UNC share root via `path.parent == path`, including a symlink that resolves to `/`) and the home directory or any of its ancestors (so `/home` and `$HOME` are refused; subdirectories are fine). The check runs before the access check so the message is accurate. Tests: `test_filesystem_roots_are_rejected_as_workspaces`, `test_home_directory_and_its_ancestors_are_rejected_but_subdirectories_are_not`, `test_a_symlink_to_the_filesystem_root_is_rejected`, `test_root_detection_follows_windows_drive_semantics`. No other change to the file tool. Not solved (as instructed): check-then-use races.
+- **Verification:** `uv run pytest tests/test_tools.py -q` → 121 passed in 38 s (no skips on this host). `uv run pytest -q` → 601 passed, 3 skipped (the 3 opt-in real-model tests) in 65 s. `uv lock --check` → Resolved 157 packages (no dependency change). Leak check after the suite: no stray processes, no temporary directories. Mutation check: with the `/run` mask removed, the socket tests fail. No real model, no network, no download; all boundary tests ran in `pytest` temp directories, and exploration scripts lived in `/tmp/fo-scripts` (outside the repo). Unix-socket probes were connect-only.
+- **Unverified:** Windows and WSL2; hosts without unprivileged user namespaces (simulated by flipping effGen's cached probe flags, not on a real such host); Docker/Firecracker backends (deliberately unused); behaviour with a model-chosen real workload beyond a small `pytest` run; memory use of the `ulimit -v` floor for big toolchains.
+- **Decisions:** `BaseTool` over `SubprocessSandbox` instead of a `CodeExecutor` subclass; timeout enforced inside the namespace; `/run` hidden by a tiny prelude rather than leaving the gap undocumented; the proof of enforcement runs before the first model command; unknown parameters rejected; failing commands are failed results (the observation carries the output).
+
 ## 5. Upcoming work
 
-1. **T4.2** (sandboxed `shell`, next), then the contingent T4.3 only if needed.
-2. An **unplanned wiring step** to schedule explicitly: `HarnessConfig` → `ModelCache` → `AgentConfig`s → `build_harness` (including `build_tools` and, for HF models, `max_context_length`); it fits with T5.1 (CLI) and T5.2 (toy-repo smoke test).
+1. **T5.0** (next, §2 M5), then **T5.1** (CLI), **T5.2** (toy-repo smoke test, trusted repository only); T4.3 only if T5.2 needs it.
+2. ~~Unplanned wiring step~~ now scheduled as T5.0.
 3. **Blocked or hardware-dependent:** T3.3 (needs Ollama), T3.4 (needs `bitsandbytes` and a real quantized GPU load), T3.5 (needs T3.3 and T3.4).
 4. **Open decisions for the user** (nothing is started): approve or reject a parser adapter for LFM's Pythonic call format or an engine change to send a system-role instruction (native mode); run the opt-in tests on the fanless edge device.
 

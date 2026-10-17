@@ -1,6 +1,6 @@
 # New Session Handoff
 
-_Last updated: 2026-10-16, end of the T4.1 session. Everything below was checked against the working tree on that date._
+_Last updated: 2026-10-17, end of the T4.2 session. Everything below was checked against the working tree on that date._
 
 ## 1. Project overview
 
@@ -9,13 +9,13 @@ _Last updated: 2026-10-16, end of the T4.1 session. Everything below was checked
 - A larger-LLM **orchestrator** delegates self-contained tasks to smaller-LLM **workers** through one `delegate` tool, which works like a smolagents managed agent.
 - Each worker is a fresh `effgen.Agent` with its own context, model, tool allowlist and limits.
 - Models come from Ollama (via effGen's OpenAI-compatible adapter) or local Transformers (bf16/fp16, bnb 8-bit, bnb NF4).
-- Tools: effGen's workspace-confined `FileOperations` (**implemented, T4.1**, via `tools.build_tools`) plus a sandboxed shell built on effGen's `CodeExecutor` subprocess sandbox (**not implemented**, T4.2).
+- Tools: effGen's workspace-confined `FileOperations` (**implemented, T4.1**, via `tools.build_tools`) plus a sandboxed shell, `ShellTool`, over effGen's `SubprocessSandbox` (**implemented, T4.2; Linux only; trusted local development only; unresolved risk R1, see §3 and §6**).
 
 Details: `docs/architecture.md`. effGen facts: `docs/effgen-api-audit.md`. Plan: `docs/implementation-plan.md`.
 
 ## 2. Repository map (verified against the working tree, 2026-10-16)
 
-Source modules, tests and configuration exist; there is **no CLI and no shell tool yet**.
+Source modules, tests and configuration exist; there is **no CLI yet**.
 
 | Path | Purpose |
 |---|---|
@@ -29,14 +29,14 @@ Source modules, tests and configuration exist; there is **no CLI and no shell to
 | `src/smol_harness/harness.py` | `build_harness(...)`, `Harness.run(task) -> HarnessResult` (fresh orchestrator and record list per run). **Takes `AgentConfig`s, not a `HarnessConfig`** |
 | `src/smol_harness/config.py` | YAML to frozen dataclasses with validation: `load_config`, `loads_config`, `parse_config`, `ConfigError`, `ModelSpec`, `AgentSpec`, `Limits`, `HarnessConfig`, `hf_placement_problem`, `KNOWN_TOOLS` |
 | `src/smol_harness/models.py` | `build_model(ModelSpec)`, `loader_args`, `ModelCache`, `ModelLoadError` (CPU/CUDA placement, quantization mapping, post-load checks) |
-| `src/smol_harness/tools.py` | `build_tools(names, workspace)`, `resolve_workspace`, `ToolBuildError`, `TOOL_NAMES`. `file_operations` = effGen `FileOperations(allowed_directories=[workspace])` with the kept root read back; `shell` raises a T4.2 error (fail closed). Not yet called by `build_harness` |
+| `src/smol_harness/tools.py` | `build_tools(names, workspace)`, `resolve_workspace` (rejects missing/non-directory/inaccessible workspaces, filesystem roots, `$HOME` and its ancestors), `ToolBuildError`, `TOOL_NAMES`, `ShellTool`, `ShellSandboxError`, `require_shell_host`. `file_operations` = effGen `FileOperations` with the kept root read back; `shell` = `ShellTool` (see plan §4 T4.2). Not yet called by `build_harness` |
 | `src/smol_harness/__init__.py` | Package docstring only |
 | `configs/example.yaml` | Mixed-provider example (Ollama orchestrator, HF NF4 worker), finite limits |
 | `tests/conftest.py` | `ScriptedModel` fake effGen model, `scripted_model` fixture, and the `--run-real-models` opt-in option / skip hook |
 | `tests/test_scripted_model.py` (15), `test_delegation.py` (22), `test_e2e_delegation.py` (23), `test_limits.py` (77) | M1/M2: fake model, delegation layer, end-to-end orchestrator-worker flow, limits and failure propagation |
 | `tests/test_config.py` (201), `test_models.py` (110), `test_hf_device.py` (8) | M3: configuration, model factory and cache, CPU/CUDA placement against effGen's real engine with a locally generated tiny model |
 | `tests/tool_probe.py`, `test_tool_probe.py` (7), `test_lfm_parser_compat.py` (13) | Tool-calling measurement helper and its scripted validation; model-free pins of how effGen 1.3.0 reads LFM tool-call formats |
-| `tests/test_tools.py` (51) | M4: tool factory, workspace validation, `file_operations` confinement through `BaseTool.execute()`, a scripted harness run with real tools, effGen regression pins |
+| `tests/test_tools.py` (121) | M4: tool factory, workspace validation and dangerous roots, `file_operations` confinement, the real `SubprocessSandbox` shell (writes, reads, network, sockets, timeout, children, memory, fail-closed, allowlists), scripted harness runs with real tools, effGen regression pins. Sandbox tests are `linux_only`; they fail rather than skip on a Linux host without user namespaces |
 | `tests/test_integration_optin.py` (2), `test_import.py` (2) | Guard that real-model tests cannot run without the flag; effGen version/import check |
 | `tests/integration/test_liquid_cpu.py` (1), `test_liquid_tools.py` (2) | **Opt-in** real-model tests for `LiquidAI/LFM2.5-350M` (CPU smoke test; native vs ReAct tool calling and context-window check) |
 
@@ -44,14 +44,15 @@ Not created yet: `src/smol_harness/__main__.py` (T5.1), `tests/integration/test_
 
 ## 3. Current project state
 
-Default suite: **531 passed, 3 skipped** (the 3 opt-in real-model tests); `uv lock --check` passes. Test counts above sum to 534 collected.
+Default suite: **601 passed, 3 skipped** (the 3 opt-in real-model tests; about 65 s); `uv lock --check` passes. Test counts above sum to 604 collected.
 
 **Implemented and verified (with the tests above):**
 
 - **M1, delegation (scripted models):** an orchestrator `Agent` calls a `delegate` tool; each delegation builds a *fresh* worker `Agent` that shares the configured model instance but not its conversation; the parent sees only a JSON report; records are per run; depth is 1.
 - **M2, controls:** cooperative per-worker deadline (checked before model/tool calls, never interrupts one in flight), structured failure reports for every worker failure kind (the parent is never ended as `tool_failed` by them), `max_delegations` (refusals still get unique ids), bounded reports (`max_report_chars`, valid JSON, `truncated` flag), effGen's own `max_iterations`.
 - **M3 so far:** validated YAML configuration (T3.1); model factory and cache with explicit quantization and placement (T3.2); explicit `device: cuda | cpu` for HF models (T3.2a); `LiquidAI/LFM2.5-350M` loaded and run on CPU (fp32) through `build_model`, and tool-calling compatibility measured (T3.2b, T3.2c).
-- **M4 so far (T4.1):** `build_tools(names, workspace)` builds exactly the allowlisted tools (fresh instances; `[]` = none; unknown, web-like, duplicate and `delegate` names refused; `shell` fails closed). `file_operations` is confined to the validated workspace; `../`, absolute, symlink (file, directory, dangling) escapes are refused for reads and writes. This is **path validation, not a sandbox** (limitations in plan §4 T4.1).
+- **M4 so far (T4.1):** `build_tools(names, workspace)` builds exactly the allowlisted tools (fresh instances; `[]` = none; unknown, web-like, duplicate and `delegate` names refused; `shell` is `ShellTool`). `file_operations` is confined to the validated workspace; `../`, absolute, symlink (file, directory, dangling) escapes are refused for reads and writes. This is **path validation, not a sandbox** (limitations in plan §4 T4.1).
+- **M4 (T4.2):** `shell` runs `bash -c <command>` in effGen's `SubprocessSandbox`: starts in the workspace, writes only inside it, no network (DNS included), a timeout that kills every process the command started, `ulimit -v` memory limit (1g default), output tail-truncated, stdin empty; it refuses to build off Linux or without `bash`/`unshare`/`timeout`, and a pre-flight must show the guarantees before the first model command. Details, measurements and limits: plan §4 T4.2. **This is not a complete security boundary:** reads are not confined, Unix sockets outside `/run` are reachable (R1, unresolved), DNS is blocked only through the network namespace plus the hidden `/run`, Windows/WSL2 are unverified. **Accepted scope (2026-10-17): trusted local development and controlled test repositories only. Untrusted repositories and adversarial agent workloads must NOT use it; they need a dedicated, independently isolated container or VM whose controls are verified separately. No seccomp or other extra isolation will be added in the MVP.**
 
 **Liquid AI results (real model, CPU; details in plan §4 and audit §1.12 and Part 3):**
 
@@ -59,23 +60,24 @@ Default suite: **531 passed, 3 skipped** (the 3 opt-in real-model tests); `uv lo
 - **ReAct tool calling worked 2/2** (the tool really executed and its result returned); **native tool calling worked 0/2** (the model writes its default Pythonic `<|tool_call_start|>[add(a=.., b=..)]<|tool_call_end|>`, which effGen's native parser cannot read, so the tool never ran). **Recommended mode for this model: `tool_calling_mode="react"`.**
 - Context: effGen reports 128,000 (from `config.json`); the model card says 32,768. 32,768 is used only as a **conservative planning limit taken from the model card, not a tested maximum**. With `max_context_length=32768` effGen's prompt budget is 20,889 tokens (101,836 without it).
 
-**Not implemented / remaining MVP work:** T4.2 sandboxed `shell` (T4.3 only if needed), CLI (T5.1), toy-repo end-to-end test (T5.2), wiring `HarnessConfig` + `ModelCache` + tools into `build_harness` (unplanned, see §5), `duration_s` in reports, Ollama smoke test (T3.3, blocked), real bnb-quantized GPU load (T3.4), mixed-provider real delegation (T3.5), a config field for `max_context_length`.
+**Not implemented / remaining MVP work:** T5.0 (assemble a harness from config), T4.3 only if needed, CLI (T5.1), toy-repo end-to-end test (T5.2), wiring `HarnessConfig` + `ModelCache` + tools into `build_harness` (unplanned, see §5), `duration_s` in reports, Ollama smoke test (T3.3, blocked), real bnb-quantized GPU load (T3.4), mixed-provider real delegation (T3.5), a config field for `max_context_length`.
 
-**Explicitly not done (do not assume):** no real multi-agent run with any real model (all delegation tests use scripted models); no shell tool exists; nothing builds tools from a `HarnessConfig` inside the harness yet (tests call `build_tools` directly); no Ollama server has been contacted; no bitsandbytes load has been run; the Kaggle dataset is unverified; native tool calling for LFM is unsupported.
+**Explicitly not done (do not assume):** no real multi-agent run with any real model (all delegation tests use scripted models); the shell has only run on this Linux laptop (no Windows or WSL2 run, no real-model run); nothing builds tools from a `HarnessConfig` inside the harness yet (tests call `build_tools` directly); no Ollama server has been contacted; no bitsandbytes load has been run; the Kaggle dataset is unverified; native tool calling for LFM is unsupported.
 
 **Known limitations (by design):** sequential workers only; depth 1; the worker timeout is cooperative; no orchestrator deadline; FP4 unsupported (effGen hard-codes NF4); web search excluded.
 
 ## 4. Most recent session
 
-- **Goal:** T4.1 only: a tool factory with workspace-confined file operations. No shell (T4.2), no harness wiring, no models.
-- **Result:** **Completed and verified.** `src/smol_harness/tools.py` builds effGen's `FileOperations(allowed_directories=[workspace])` per allowlist; escapes via `../`, absolute paths and symlinks (file, directory, dangling) are refused for reads and writes; allowlists, unknown/web names, `delegate` and `shell` (fail closed) behave as specified. Full record: `docs/implementation-plan.md` §4 (T4.1).
-- **Files:** created `src/smol_harness/tools.py`, `tests/test_tools.py`. Docs: plan, this file, audit (§1.9, Part 2, Part 3), architecture §9 (one row clarified, no design change). No other source changed. (The T3.2c test files listed in §2 were still uncommitted at the start of this session; nothing was committed in this session.)
-- **Tests:** `uv run pytest tests/test_tools.py -q` → 51 passed; `uv run pytest -q` → 531 passed, 3 skipped; `uv lock --check` → OK (157 packages, no dependency change). No real-model test was run.
-- **Key fact found:** effGen's `FileOperations` treats a missing allowed directory as a warning and **falls back to `EFFGEN_WORKSPACE` (creating it) or the current directory**. `build_tools` therefore validates the workspace (exists, directory, read/write/search access) and reads back the private `_allowed_directories`, refusing the tool unless it is exactly `[workspace]`. Pinned by regression tests.
-- **Other effGen behaviour pinned:** extensionless files (`Makefile`, `README`, `.gitignore`, `Dockerfile`) are refused for read and write; credential filenames and dotenv-shaped content are refused on read; relative paths resolve against the workspace, not the cwd; `list`/`search` (filename glob) work for repository discovery and drop entries outside the workspace.
-- **Problems:** none open.
-- **Decisions:** reuse `FileOperations` unwrapped (its own checks held for every escape tested); names validated before the workspace, all-or-nothing; the workspace is validated even for `[]`; `delegate` is never built by the factory.
-- **Known limitations:** path validation, not a sandbox: check-then-use race between effGen's resolve and open; hard links / bind mounts not detectable; no write-size cap; the workspace root itself is not restricted. The extension allowlist will block a worker from editing a `Makefile` (watch for it in T5.2).
+- **Goal:** T4.2 only: a sandboxed `shell` tool on effGen's sandbox, verified empirically, plus the T4.1 correction (dangerous workspace roots). No models, no Ollama, no CLI, no effGen change.
+- **Result:** **Completed against the plan's acceptance criteria** (all 10 requested behaviours verified with the real sandbox, see plan §4 T4.2) **for trusted local development only; the isolation is not complete (R1 unresolved) and the user accepted that scope on 2026-10-17.** Two effGen defects were found and worked around:
+  1. **Unix sockets:** effGen's net namespace does not isolate pathname Unix sockets. From inside the sandbox I could *connect* (nothing sent) to the Docker daemon socket (user is in `docker`), the session and system D-Bus, the systemd user manager, gpg-agent; systemd-resolved answered DNS. Fixed for everything under `/run` by an empty read-only tmpfs; **sockets elsewhere (under `$HOME`, host `/tmp` when the workspace is under `/tmp`) remain reachable.**
+  2. **Timeout:** effGen's own timeout path kills only the outer `unshare`, leaves descendants running and then hangs until they exit. Fixed by timing out inside the PID namespace with `timeout -k 2 N`.
+- **Files:** modified `src/smol_harness/tools.py`, `tests/test_tools.py`; docs: plan, this file, audit (§1.9, Part 2, Part 3), architecture §9 (shell row; the shell is a `BaseTool` over `SubprocessSandbox`, not a `CodeExecutor` subclass). Nothing is committed from this session (the T4.1 work was committed as `6ff4666` before it).
+- **Tests:** `uv run pytest tests/test_tools.py -q` → 121 passed (38 s); `uv run pytest -q` → 601 passed, 3 skipped (65 s); `uv lock --check` OK. Mutation check: removing the `/run` mask fails the socket tests. No real-model test run.
+- **Safety of the work itself:** every boundary test ran in `pytest` temp directories or throwaway dirs under `/tmp`; socket probes were connect-only; no exploit was attempted; exploration scripts are in `/tmp/fo-scripts` (not in the repo).
+- **Problems:** none open; R1 is an accepted, unresolved limitation. (My first exploration script hung on effGen's timeout defect; I killed it and its test `sleep`s.)
+- **Decisions:** `BaseTool` over `SubprocessSandbox` (no private attributes); `auto`/`off` can never be selected; pre-flight before the first command; unknown parameters rejected; failing commands return failed results with their output in `error` (effGen shows a model only `error` on failure).
+- **Known limitations of this work:** see plan §4 T4.2 "Not enforced". Windows/WSL2 untested; no config fields for memory limit or max timeout yet; `ulimit -u 256` is per user.
 
 ### Configuration schema (as built)
 
@@ -111,20 +113,21 @@ hf placement rules: `device: cuda` → any quantization; `dtype` `bf16` / `fp16`
 
 ## 5. Current task and next steps
 
-### Next task: **T4.2, sandboxed `shell` tool** (status: Not started; awaiting approval)
+### Next task: **T5.0, assemble a harness from `HarnessConfig`** (status: Not started; awaiting approval)
 
-- **Objective:** replace `_shell` in `src/smol_harness/tools.py` (it currently raises `ToolBuildError` naming T4.2) with a thin `CodeExecutor` subclass that exposes only `command` (and a capped `timeout`), pins `language="bash"`, `network_enabled=False` and a configured memory limit, requires the subprocess (`unshare`) backend, and fails closed if the sandbox does not initialize. Never `BashTool`.
-- **Dependencies:** T4.1 (done): reuse `build_tools` / `resolve_workspace`; update `test_shell_fails_closed_until_t42` in `tests/test_tools.py`.
-- **Expected files:** `src/smol_harness/tools.py`, `tests/test_tools.py` (Linux-only marker for sandbox tests). No effGen change, no `build_harness` wiring.
-- **Read only these:** plan §2 T4.2; audit §1.9 (`code_executor` row: model-facing `network_enabled` / `memory_limit` must be pinned, Docker does not mount the workspace, force `EFFGEN_SANDBOX_BACKEND=subprocess`, 256m default `ulimit -v`); architecture §9; installed effGen `effgen/tools/builtin/code_executor.py` and `effgen/security/sandbox.py`.
-- **Acceptance criteria:** see plan §2 T4.2 (`echo` works; writes outside the workspace fail; network fails; an over-long sleep is killed; `filesystem_confined=True` reported; `pytest` in the workspace runs under the memory limit). Note the shell's reads are **not** confined (audit §1.9).
-- **Verify with:** `uv run pytest tests/test_tools.py -q`, then `uv run pytest -q` (baseline 531 passed, 3 skipped).
-- **Process:** mark T4.2 `In progress` in the plan before starting; update plan, audit (Part 2/3) and this file when done.
-- **Do not repeat:** the effGen architecture audit, the Liquid AI experiments, or the T4.1 `FileOperations` checks (plan §4 T4.1, audit Part 3).
+- **Objective:** `build_harness_from_config(config, *, cache=None, tool_calling_mode="react") -> Harness` in `src/smol_harness/harness.py`, plus `Harness.close()` and a context manager, so a validated config yields a runnable harness that owns and cleans up its models. Full specification (design, failure behaviour, acceptance, tests): `docs/implementation-plan.md` §2, M5, T5.0.
+- **Gap it closes:** `HarnessConfig`, `ModelCache`, `build_model`, `build_tools` and `build_harness` each exist and are tested, but nothing connects them; `build_harness` takes ready `AgentConfig`s and `Harness` has no `close()`.
+- **Minimum wiring:** (1) build every agent's tools first (fail before loading any model); (2) load models through one `ModelCache`; (3) map `AgentSpec` to `AgentConfig` (name, model, tools, `max_iterations`, `system_prompt`, `tool_calling_mode`, fixed test-proven flags, Ollama `max_context_length`); (4) register workers and pass `Limits`; (5) the harness closes a cache it owns, not an injected one. Config parsing, model ownership, tool building and orchestration stay in their current modules.
+- **Expected files:** modify `src/smol_harness/harness.py`; create `tests/test_harness_config.py`. Nothing else unless a test proves a defect.
+- **Read only these:** plan T5.0; `src/smol_harness/harness.py`, `models.py` (`ModelCache`), `config.py` (`HarnessConfig`, `AgentSpec`, `Limits`), `tools.py` (`build_tools`); `tests/test_e2e_delegation.py` for the `AgentConfig` flags and `tests/conftest.py` for `ScriptedModel`; audit §1.1, §1.4.
+- **Verify with:** `uv run pytest tests/test_harness_config.py -q`, then `uv run pytest -q` (baseline 601 passed, 3 skipped), `uv lock --check`.
+- **Open questions (defaults in the plan):** `tool_calling_mode` as a parameter defaulting to `"react"`; HF context window unset.
+- **Do not repeat:** the effGen architecture audit, the Liquid AI experiments, the file-tool checks or the sandbox investigation.
+- **Not part of it:** the CLI (T5.1), any sandbox change, real models.
 
 ### Afterwards / open
 
-- After T4.2 (sandboxed `shell`; the Linux user/mount/net namespace check passed on this host, effGen's own probe has not been run), then the unplanned wiring step (`HarnessConfig` to `build_harness`, including tools, `ModelCache` and `max_context_length`), T5.1, T5.2.
+- Unplanned wiring step (`HarnessConfig` to `build_harness`, including tools, `ModelCache` and `max_context_length`), T5.1, T5.2.
 - **Blocked:** T3.3 (no Ollama), T3.4 (`bitsandbytes` not installed), T3.5 (needs both).
 - **Decisions for the user (nothing started):** approve or reject a parser adapter for LFM's Pythonic call format or an engine change to send a system-role instruction (native mode); run the opt-in tests on the fanless edge device.
 
@@ -132,7 +135,7 @@ hf placement rules: `device: cuda` → any quantization; `dtype` `bf16` / `fp16`
 
 ### Known bugs or broken tests
 
-None known. The default suite is green (531 passed, 3 skipped).
+None known. The default suite is green (601 passed, 3 skipped).
 
 ### Unverified assumptions
 
@@ -145,7 +148,9 @@ None known. The default suite is green (531 passed, 3 skipped).
 | U5 | Tool calling through Ollama `/v1` for the chosen tags; Ollama's `num_ctx` must match the configured `context_length` | T3.3 |
 | U6 | `bitsandbytes` installs and works with `torch 2.14.1+cu130` on this GPU (it is not installed) | T3.4 |
 | U7 | Orchestrator and worker fit in 8 GB VRAM together | T3.4 / T3.5 |
-| U8 | effGen's `SubprocessSandbox` initializes here and its default 256m memory limit is enough for `pytest` | T4.2 |
+| U8 | ~~effGen's `SubprocessSandbox` initializes here and 256m is enough for `pytest`~~ **Verified in T4.2** on this host: it works, and a trivial `pytest` fits 256m; default raised to 1g; larger toolchains untested | done / open for big suites |
+| U15 | The shell sandbox works on Windows 11 via WSL2 (user namespaces, `unshare`, `timeout`, repo on the WSL filesystem) | when the Windows machine is available |
+| U16 | What a hostile command could do through the residual Unix sockets (R1) and unconfined reads | not planned: out of scope, the shell is for trusted use only |
 | U9 | ~~`effgen==1.3.0` installable~~ **Verified in T0.1** | done |
 | U10 | Kaggle dataset contents (repo snapshots, tests, patches) are **not** assumed | T6.1 |
 | U11 | ~~Invalid `delegate` arguments end the parent as `tool_failed`~~ **Answered in T1.3: they do not** | done |
@@ -162,6 +167,8 @@ None known. The default suite is green (531 passed, 3 skipped).
 - effGen stops a run whose tool returns the same text twice (`repeated_tool_result`); `delegation_id` in every report prevents this for delegation.
 - effGen's `BashTool` is not a sandbox; `ddgs` / `duckduckgo-search` are installed through effGen and must never be registered as tools.
 - effGen's `FileOperations` silently confines to the cwd (or `EFFGEN_WORKSPACE`) when its allowed directory is missing. Always build it through `tools.build_tools`, never directly. Its confinement is path validation only (check-then-use race; hard links undetected).
+- **R1 (unresolved, accepted for trusted local development only; do NOT run untrusted repositories or adversarial agents with the shell, use a dedicated isolated container or VM instead):** pathname Unix sockets outside `/run` (under `$HOME`; host `/tmp` if the workspace is under `/tmp`) are reachable from the shell; reads are unconfined; the shell reads files `file_operations` refuses (`.env`).
+- effGen's `SubprocessSandbox` silently runs plain `bash` off Linux or without user namespaces, and its timeout path hangs on surviving children; both are worked around in `ShellTool` (plan §4 T4.2). Never call it directly.
 - `file_operations` refuses extensionless files (`Makefile`, `README`, `.gitignore`); a coding worker cannot edit them with it.
 - Disk: `/home` had about 7.8 GB free after the 714 MB model download.
 - `AgentResponse.tokens_used` for a run (32) differed from the engine's count for the same prompt (2); not investigated.
@@ -175,9 +182,9 @@ All commands below were run during this project (Linux, uv 0.11.29, 2026-10-16).
 cd /home/ch_kartik/Projects/Active/smol-harness
 uv sync --locked                 # .venv with Python 3.12 + effgen 1.3.0 (about 2 min cold: torch/CUDA wheels)
 uv run python -c "import effgen; print(effgen.__version__)"   # -> 1.3.0
-uv run pytest -q                 # default suite -> 531 passed, 3 skipped (the real-model tests)
+uv run pytest -q                 # default suite -> 601 passed, 3 skipped (the real-model tests)
 uv run pytest tests/test_limits.py -q                       # a single file works the same way
-uv run pytest tests/test_tools.py -q                        # T4.1 tool factory + file_operations -> 51 passed
+uv run pytest tests/test_tools.py -q                        # tool factory, file_operations, sandboxed shell -> 121 passed (about 40 s)
 uv lock --check                  # -> Resolved 157 packages (lockfile consistent)
 
 # Opt-in real-model tests (CPU; network is blocked during load and inference)

@@ -200,12 +200,12 @@ The harness's provider vocabulary is deliberately tiny. It maps 1:1 to effGen ca
 | Tool name (ours) | Backing effGen tool | Boundary |
 |---|---|---|
 | `file_operations` | `FileOperations(allowed_directories=[workspace])`, built by `tools.build_tools` (T4.1) | Path containment and credential deny-list (effGen). The factory validates the workspace and checks effGen kept it as the root, since effGen silently falls back to the cwd for a missing directory. Path validation only, not a sandbox (check-then-use race, hard links). |
-| `shell` | Thin subclass of `CodeExecutor(workdir=workspace)`. Exposes only `command` (+ optional `timeout` ≤ cap). Pins `language="bash"` and `network_enabled=False`, plus a configured memory limit. Process env sets `EFFGEN_SANDBOX_BACKEND=subprocess`. | Linux user + mount + net (+ pid) namespaces: writes only inside the workspace, private `/tmp`, no network, timeout. **Reads are not confined.** This is not a VM or container boundary. |
+| `shell` | `tools.ShellTool` (T4.2): a `BaseTool` that runs `bash -c <command>` in effGen's `SubprocessSandbox` (pinned, never `auto`/`off`; not a `CodeExecutor` subclass). Exposes only `command` and `timeout` (≤ 300 s). Memory limit `ulimit -v` (default 1g). | Linux user + mount + net + PID namespaces: writes only inside the workspace, private `/tmp` (when the workspace is not under `/tmp`), no network, `/run` hidden (host sockets), the deadline and process cleanup enforced inside the namespace. Fails closed unless a pre-flight shows the guarantees. **Reads are not confined; Unix sockets outside `/run` stay reachable (open risk R1, plan §4 T4.2).** Linux only; not a VM or container boundary. |
 | `delegate` | ours | Orchestrator only |
 
 - Repository search is a filename glob via `file_operations`, plus content search via `shell` (`grep -rn`).
 - An exact-replace `edit_file` tool is a contingent task (T4.3).
-- `BashTool` is **not** used: effGen documents it as not a sandbox. If the subprocess sandbox is unavailable on a host, the harness fails closed (no shell tool) rather than silently falling back.
+- `BashTool` is **not** used: effGen documents it as not a sandbox. If the subprocess sandbox is unavailable on a host, the shell tool refuses to build or to run (fail closed) rather than silently falling back. Windows needs WSL2 (untested).
 - **Web tools are never constructed.** `config.py` rejects any tool name not in the harness registry, and a test asserts that no agent holds a web or network tool.
 
 ## 10. Execution limits
