@@ -107,6 +107,26 @@ class ScriptedModel(BaseModel):
         return 8192
 
 
+@pytest.fixture(scope="session", autouse=True)
+def effgen_loop_compat():
+    """Install the effGen loop patch once, explicitly, as an application would (Harness.run refuses to run without it)."""
+    from smol_harness.harness import install_effgen_loop_compat
+
+    install_effgen_loop_compat()
+
+
+@pytest.fixture
+def compat_uninstalled():
+    """Run a test with effGen's own, unpatched loop; the patch is put back afterwards (no agent may be running)."""
+    from smol_harness.harness import install_effgen_loop_compat, uninstall_effgen_loop_compat_for_tests
+
+    uninstall_effgen_loop_compat_for_tests()
+    try:
+        yield
+    finally:
+        install_effgen_loop_compat()
+
+
 @pytest.fixture
 def scripted_model():
     """Factory: ``scripted_model(["turn 1", "turn 2"], name="orch")``."""

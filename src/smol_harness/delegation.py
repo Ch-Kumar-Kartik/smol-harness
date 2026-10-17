@@ -28,6 +28,10 @@ from effgen.tools.base_tool import (
 
 DELEGATE_TOOL_NAME = "delegate"
 
+# Class attribute on every tool whose repeated identical call must reach the tool (it changes the world: a command, a
+# write, a worker run). `harness.install_effgen_loop_compat` keys on it; unmarked tools keep effGen's behaviour.
+STATEFUL_TOOL_MARKER = "executes_every_call"
+
 # smolagents-style envelope (architecture §1, §5): tells the worker who asked and
 # what shape of report is useful. Kept short for small models.
 TASK_TEMPLATE = """You are the worker agent '{worker}'. Your manager delegated this task to you.
@@ -280,6 +284,8 @@ class DelegateTool(BaseTool):
     failures are therefore successful tool calls whose payload says
     `status: "failed"`.
     """
+
+    executes_every_call = True  # a delegation runs a worker; see STATEFUL_TOOL_MARKER
 
     def __init__(
         self,

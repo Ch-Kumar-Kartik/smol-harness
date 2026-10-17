@@ -465,15 +465,28 @@ def test_delegation_ids_restart_per_run_and_cover_successes():
 
 
 def test_retrying_the_identical_failing_delegation_forever_ends_stuck_not_tool_failed():
-    # effGen's repeat guard, same as U11: the parent's own repetition ends the run.
+    # U11 still holds: the parent's own repetition ends the run as `stuck`, never as `tool_failed`, and never raises.
+    # What changed with the F1 patch (review 001): effGen no longer replays/declines the identical `delegate` call, so
+    # each retry really runs a fresh worker; the orchestrator's iteration cap is what ends the loop (it used to end
+    # after one worker run, because the repeat was answered from effGen's record).
     om = ScriptedModel([delegate_turn()], name="orch", on_exhausted="repeat_last")
     h = build_harness(cfg(om, "orch"), {"w": failing_worker_cfg("backend_unreachable", True)})
     result = h.run("USER TASK")
     assert result.success is False
     assert result.termination == "stuck" and result.termination != "tool_failed"
-    assert result.response.stop_reason == "loop_detected"
-    assert len(result.workers) == 1  # effGen does not re-dispatch the repeated identical call
-    assert len(om.calls) == 4
+    assert result.response.stop_reason == "max_iterations_partial"
+    assert len(om.calls) == 6  # cfg()'s max_iterations: bounded by the cap, not by a replay
+    assert len(result.workers) == 5  # one real worker run per delegate call that fit before the cap
+    assert [w.result.delegation_id for w in result.workers] == ["d1", "d2", "d3", "d4", "d5"]
+
+
+def test_the_delegation_limit_caps_identical_failing_retries_before_the_iteration_cap():
+    om = ScriptedModel([delegate_turn()], name="orch", on_exhausted="repeat_last")
+    h = build_harness(cfg(om, "orch"), {"w": failing_worker_cfg("backend_unreachable", True)}, max_delegations=3)
+    result = h.run("USER TASK")
+    kinds = [w.result.error_type for w in result.workers]
+    assert result.success is False and result.termination != "tool_failed"
+    assert kinds.count("delegation_limit_reached") == 2 and len(kinds) - 2 == 3  # 3 real runs, then refusals
 
 
 # =====================================================================================

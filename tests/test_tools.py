@@ -7,6 +7,7 @@ agent loop with scripted models) on temporary workspaces. CPU only, no network.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import platform
@@ -83,8 +84,8 @@ def test_reads_a_workspace_file(fo, layout):
 
 
 def test_writes_a_workspace_file(fo, layout):
-    written = data(run(fo, operation="write", path="b.py", content="x = 1\n"))
-    assert Path(written) == layout[0] / "b.py"
+    summary = data(run(fo, operation="write", path="b.py", content="x = 1\n"))
+    assert summary == f"wrote b.py (6 bytes, 1 line, sha256 {hashlib.sha256(b'x = 1' + b'\n').hexdigest()[:8]})"
     assert (layout[0] / "b.py").read_text() == "x = 1\n"
     data(run(fo, operation="write", path="a.txt", content="replaced"))
     assert (layout[0] / "a.txt").read_text() == "replaced"
@@ -955,3 +956,105 @@ def test_root_detection_follows_windows_drive_semantics():
     assert _is_filesystem_root(PureWindowsPath("C:\\")) and _is_filesystem_root(PureWindowsPath("D:/"))
     assert _is_filesystem_root(PureWindowsPath("\\\\server\\share\\"))
     assert not _is_filesystem_root(PureWindowsPath("C:\\work\\repo")) and not _is_filesystem_root(PureWindowsPath("C:\\work"))
+
+
+# ======================================================================================================
+# Review F2 (phase A): results that say what was done. Each claim is checked against the real disk / process.
+# ======================================================================================================
+def sha8(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:8]
+
+
+def test_write_summary_is_read_back_from_the_file_on_disk(fo, layout):
+    ws = layout[0]
+    for name, content in (("f.py", "x = 1\n"), ("sub/g.py", "a\nb\nc"), ("empty.txt", ""), ("é.md", "héllo\n")):
+        summary = data(run(fo, operation="write", path=name, content=content))
+        on_disk = ws / name
+        body = on_disk.read_bytes()
+        assert body == content.encode()  # the side effect really happened
+        lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+        assert summary == f"wrote {name} ({len(body)} bytes, {lines} line{'s' if lines != 1 else ''}, sha256 {sha8(on_disk)})"
+
+
+def test_write_summary_changes_with_the_content_not_with_the_call(fo, layout):
+    first = data(run(fo, operation="write", path="f.py", content="x = 1\n"))
+    other = data(run(fo, operation="write", path="f.py", content="x = 2\n"))  # same path, same size
+    again = data(run(fo, operation="write", path="f.py", content="x = 2\n"))
+    assert first != other  # different content reads differently (what effGen's bare path could not do)
+    assert other == again  # an identical rewrite IS the same result: no counter hides a real repeat
+    assert "x = 2" not in other  # a summary, not the content
+
+
+def test_write_summary_reflects_the_formatted_file_for_json(fo, layout):
+    summary = data(run(fo, operation="write", path="d.json", content='{"a":1}', format="json"))
+    assert (layout[0] / "d.json").read_text() == '{\n  "a": 1\n}'  # effGen re-indents; the summary describes this file
+    size = len((layout[0] / "d.json").read_bytes())
+    assert summary == f"wrote d.json ({size} bytes, 3 lines, sha256 {sha8(layout[0] / 'd.json')})"
+
+
+def test_write_summary_does_not_touch_failures_or_other_operations(fo, layout):
+    ws, outside = layout
+    refused(run(fo, operation="write", path="../outside/x.txt", content="pwned"))  # same wording as before
+    r = run(fo, operation="write", path="Makefile", content="all:")
+    assert not r.success and "not allowed for write" in r.error
+    outside_unchanged(outside)
+    assert data(run(fo, operation="read", path="a.txt")) == "inside\n"  # reads are still the raw content
+    assert any(e["name"] == "a.txt" for e in data(run(fo, operation="list", path=".")))
+    assert data(run(fo, operation="write", path="a.json", content='{"k": 1}', format="json")).startswith("wrote a.json")
+    converted = data(run(fo, operation="convert", path="a.json", format="json", target_format="xml"))
+    assert converted == "a.xml" and (ws / "a.xml").exists()  # convert keeps effGen's own result (its path)
+
+
+def test_the_built_tool_is_effgens_file_operations_with_the_same_identity(fo, layout):
+    assert isinstance(fo, FileOperations) and fo.name == "file_operations"
+    assert [p.name for p in fo.metadata.parameters] == [p.name for p in FileOperations(allowed_directories=[str(layout[0])]).metadata.parameters]
+
+
+@linux_only
+def test_shell_report_names_the_command_and_keeps_every_field(shell):
+    r = sh(shell, "echo out; echo err >&2; exit 4")
+    o = out(r)
+    assert not r.success and (o["exit_code"], o["stdout"], o["stderr"], o["timed_out"]) == (4, "out\n", "err\n", False)  # raw, unprefixed
+    assert r.error == "$ echo out; echo err >&2; exit 4\nexit code: 4\nstdout:\nout\nstderr:\nerr"  # failure semantics intact
+    ok = sh(shell, "echo fine")
+    assert ok.success and out(ok)["result"] == "$ echo fine\nexit code: 0\nstdout:\nfine" and out(ok)["success"] is True
+
+
+@linux_only
+def test_two_different_silent_commands_read_differently_and_both_really_ran(shell, layout):
+    a, b = sh(shell, "mkdir -p one"), sh(shell, "touch two.txt")
+    assert a.success and b.success and out(a)["result"] != out(b)["result"]
+    assert (layout[0] / "one").is_dir() and (layout[0] / "two.txt").exists()  # the effects, not the text, are the proof
+
+
+@linux_only
+def test_an_identical_command_with_identical_output_reads_identically(shell):
+    # No call counter on purpose: effGen's repeat guards must still be able to see a genuinely repeated command.
+    assert out(sh(shell, "echo same"))["result"] == out(sh(shell, "echo same"))["result"]
+
+
+@linux_only
+def test_long_commands_keep_their_start_their_size_and_a_hash_of_the_whole(shell, layout):
+    head = "cat > " + "x" * 10 + ".txt <<'EOF'\n" + "y" * 400
+    one, two = head + "\none\nEOF", head + "\ntwo\nEOF"
+    ra, rb = sh(shell, one), sh(shell, two)
+    assert ra.success and rb.success and out(ra)["result"] != out(rb)["result"]  # identical first 200 chars, different commands
+    first_line = out(ra)["result"].splitlines()[0]
+    assert first_line.startswith("$ cat > xxxxxxxxxx.txt <<'EOF' yyyy") and "more chars, sha256" in first_line
+    assert len(first_line) < 300
+    assert (layout[0] / "xxxxxxxxxx.txt").read_text().endswith("two\n")  # both ran; the second replaced the first
+
+
+@linux_only
+def test_timeout_report_still_says_timed_out_with_the_command(shell):
+    r = sh(shell, "sleep 30", timeout=1)
+    assert not r.success and out(r)["timed_out"] and r.error.startswith("$ sleep 30\ntimed out after 1s")
+    assert "exit code:" in r.error
+
+
+@linux_only
+def test_command_echo_cannot_pass_for_an_effgen_failure_or_hide_one(shell):
+    from effgen.core.agent_tool_loop import is_error_result
+    failing = sh(shell, "echo Error executing tool; exit 2")  # output that imitates effGen's own error prefix
+    assert not failing.success and "exit code: 2" in failing.error
+    assert not is_error_result(out(sh(shell, "echo hi"))["result"])  # a success never reads as an error to effGen

@@ -149,3 +149,215 @@ The architecture is viable and appropriately minimal, the module boundaries are 
 2. **F3.** Under effGen's default settings, an orchestrator that does not finish raises out of `Harness.run` and loses its worker records, which breaks the CLI's structured-output contract.
 
 Neither needs an architectural change. F2 and F3 are small changes in `tools.py` and `harness.py`. F1 needs your decision because every complete fix changes effGen behaviour. After those, together with committing T4.2, configuration wiring (T5.0) and the CLI (T5.1) can proceed on solid ground.
+
+---
+
+# Follow-up 001-A: F1/F2 reproduced, root cause, remediation recommendation (2026-10-17, Sonnet 5.5)
+
+Status: **investigation only. No runtime behaviour was changed.** The only repository change is the new test file `tests/test_loop_guards.py`. Everything below needs your approval before it is implemented, because CLAUDE.md forbids effGen patches and private-API workarounds without it.
+
+## 1. Reproduction (real effGen loop, scripted models, real tools)
+
+`tests/test_loop_guards.py` has 12 tests: 6 reproductions marked `xfail(strict=True)` (they fail today, and will turn into hard failures the day a fix lands, so the marker must then be removed), and 6 pins/controls that pass today. I ran every reproduction with `--runxfail` and confirmed each fails on its **intended assertion** (two of my first drafts failed for the wrong reason: a helper typo and an F1/F2 mix-up. Both were corrected).
+
+| Test | What happens today |
+|---|---|
+| `f1_rerunning_a_passing_check_after_breaking_the_code…` | 2 of 3 calls executed. The model is shown the stale `PASSED` for code that is now broken |
+| `f1_rerunning_a_failed_check_after_the_fix…` | 2 of 3 executed. The identical rerun after the fix is **declined, never executed** |
+| `f1_rereading_a_file_after_editing_it…` (`file_operations`) | 2 of 3 executed. The model is shown the old content |
+| `f1_identical_redelegation_runs_the_worker_again` | 1 worker run, 1 record; the orchestrator is told "the same result as the identical call above" |
+| `f2_silent_shell_commands_do_not_end_the_run` | `true`, `mkdir -p d`, `touch marker.txt`: `d` is created, `marker.txt` never is; `termination="stuck"`, `stop_reason="repeated_tool_result"` |
+| `f2_writing_several_files_does_not_end_the_run` | writing `f.py` twice (result text is the path both times) stops the run before `g.py` is written |
+
+Pins (pass today; document effGen behaviour that stays): `pin_a_custom_tool_repeat_is_replayed_from_the_record` (the F1 mechanism with a plain Python tool), `pin_a_tool_that_returns_constant_text_still_ends_the_run`, `pin_result_key_ignores_the_arguments_and_replay_ignores_state` (model-free, on `NativeToolLoop`). Controls (must pass before and after any fix): distinct calls with distinct results all run; a stuck idempotent loop is still stopped; **a stuck harness-tool loop (same shell command, same output, eight times) is still stopped** (`1 <= executed <= 3`, and the cap of 10 iterations is not reached).
+
+## 2. Exact root cause
+
+All three mechanisms live in `NativeToolLoop` (`effgen/core/agent_tool_loop.py`) and its caller in `effgen/core/agent_loop.py`. They assume **every tool is a pure function**. I instrumented them with a spy (throwaway script, not committed):
+
+1. **F1, replay (and decline), before the tool is dispatched.**
+   - `check_action` (`agent_tool_loop.py:529-548`) computes `pair = (tool name, normalized input)`. `is_exact_loop = exact_count >= 1 and known and not retry`. The key contains only what the **model** typed, never the state of the world.
+   - `agent_loop.py:3000-3030`: `if check.is_exact_loop and not check.is_fuzzy_loop: replay = guards.cached_result(check)`. A recorded result (`record_pair_result`, `agent_loop.py:3176`, only for results that do not start with `"Error executing tool"`) is returned **without running the tool**, up to `MAX_REPLAYS_PER_PAIR = 2` times (`agent_tool_loop.py:555`, `:581-593`; the source comment says "a pure computation is idempotent").
+   - If there is nothing recorded (the earlier call failed), `check.is_loop` is true and the call goes to the decline path (`agent_loop.py:3033-3077`): tools withdrawn, answer requested. Spy output for the stale case: `check_action … exact=True` then `cached_result … REPLAYED (tool NOT run)`; for the failed case: `exact=True` then `cached_result … None`.
+2. **F2, result repeat, after dispatch.** `result_is_repeat` (`agent_tool_loop.py:648-658`, called at `agent_loop.py:3229`) uses `_result_key = (tool name, whitespace-normalized first 500 chars of the RESULT)` (`:644-646`). **The arguments are not in the key.** The second call that returns the same text is executed, then the run is told to answer from what it has (`ask_for_answer(ASK_AFTER_REPEATED_RESULT)`, tools withdrawn), and the next tool call ends it as `stuck`. Spy output: `result_is_repeat shell key='exit code: 0' -> True` on the second distinct command. A silent shell command renders as `exit code: 0`, and an effGen file write returns only the path.
+3. **Not one guard, several.** Neutralising only `result_is_repeat` is **not enough**: with it disabled the same scripted run still stopped after 3 of 7 calls (`stop_reason="loop_detected"`, from the other result-text heuristics: the progress/stall accounting in `observe_result` and/or the drift check; I did not trace which one). With a **different result text per call** the same run completed 7 of 7. All of them test "was this result text already shown?", so what matters is that results reflect what happened.
+4. **No supported switch exists.** `AgentConfig` has no option for the replay or result-repeat guards (`max_turns_without_progress=None` affects only the stall logic); `ToolMetadata`/`ToolCategory` are not consulted by `check_action`; a `before_tool_call` middleware runs inside `_execute_tool`, i.e. after the replay decision, so it cannot prevent it. The guards object is built at one site, `agent_loop.py:3387` (`NativeToolLoop(...)`), from the module-level name.
+
+## 3. Options evaluated
+
+| | A. Harness-side tool wrapper / config | B. Minimal effGen patch in a documented fork | C. Scoped compatibility adapter |
+|---|---|---|---|
+| What | Make our tools' results describe what happened (shell echoes the command; file writes report path, size and a short content hash) | Teach `check_action` to skip exact-loop for tools that declare themselves non-idempotent; put the call's input into the result key | A `NativeToolLoop` subclass whose `check_action` clears `is_exact_loop` for the harness's own tools, installed only while the harness runs |
+| Files / functions | `tools.py`: `ShellTool._execute` (+3 lines); a small `FileOperations` subclass overriding `_execute` for `write` (~15 lines) | effGen `agent_tool_loop.py` (`check_action`, `result_is_repeat`/`_result_key`), `agent_loop.py:3229` (pass the input), a tool attribute; fork hosted somewhere; `pyproject.toml` git URL; `uv.lock` | `harness.py`: `HarnessToolLoop` (~10 lines) + a context manager that rebinds `effgen.core.agent_loop.NativeToolLoop` around `Harness.run` (~15 lines) |
+| Private effGen API | None (`FileOperations._execute` is the documented override point of a public class; the result dict shape is covered by our T4.1 tests) | n/a (source patch) | Yes: module global `agent_loop.NativeToolLoop`, `NativeToolLoop.check_action`, `LoopCheck.is_exact_loop` |
+| Safety protections changed | None removed. Result-keyed guards become state-sensitive: identical call + identical output is still a repeat | Exact-loop guard off for declared tools; result key gains the input: same net effect as A+C but at the source | Pre-dispatch exact-repeat guard off **for our tools only**; everything else inherited (result repeat, stall, drift, `max_iterations`, deadlines) |
+| Fixes shell / file_operations / delegate | F2: shell and file_operations yes; `delegate` already has `delegation_id`. **F1: no** (replay happens before dispatch, keyed on the model's input) | Both F1 and F2, all three | F1: all three (by tool name). F2 only together with A |
+| Upgrade risk | Low | Highest: rebase on two large, fast-moving files; a fork to host; breaks the `effgen==1.3.0` pin rule | Moderate: three private names; the pin tests in `test_loop_guards.py` fail loudly if effGen changes them |
+| Complexity | ~25 lines + tests | ~20 lines of patch + packaging/process overhead | ~25 lines + tests |
+
+Option A alone leaves F1. Option C alone leaves F2 (silent commands still collide). **A + C** fixes both inside our code, with no fork.
+
+## 4. Recommendation
+
+**Implement A + C (both in our code), and file the root cause upstream.** Keep B in reserve if you prefer a fork to a private-API adapter.
+
+1. **A (fixes F2, no private API).**
+   - `ShellTool` prefixes its report with `$ <command>` (truncated to 200 characters).
+   - A `FileOperations` subclass makes a `write` report `wrote <path> (<n> chars, sha256 <8 hex>)`. A repeat of an identical write is then genuinely the same result, and a changed file is a new one.
+   - `delegate` is unchanged (`delegation_id`).
+2. **C (fixes F1).**
+   - `HarnessToolLoop.check_action` returns the inherited result with `is_exact_loop=False` **only for** `shell`, `file_operations` and `delegate`. Custom tools keep effGen's behaviour (pinned).
+   - `Harness.run` installs it for the run and restores the original in a `finally` (workers run inside the same run, so they are covered; the MVP is sequential, so the process-wide rebinding is not racy; document that it is not thread-safe).
+3. **Why this is not "disabling loop detection".** After the change, the stuck-loop protections that remain are all active: an identical command with identical output is a repeat on its second execution (control test: ≤ 3 executions, not 8); the drift guard, the stall logic, `max_iterations`, the delegation limit and the worker deadline are untouched; idempotent custom tools keep the replay guard.
+4. **Safety delta, honestly.**
+   - A repeat of a side-effecting call now **executes** (the point), so a looping model costs one extra real execution before the result-repeat guard fires, instead of a free replay.
+   - A residual false positive remains: the *same command with the same output after a different edit* (for example the same failing test trace) is still read as "no progress" and the model is asked to answer. That is effGen's existing behaviour and its price for keeping stuck-loop protection; measure it in T5.2 before adding anything like a workspace fingerprint to the result text.
+5. **Decisions I need from you.** (a) Approve a private-API adapter (C), or choose the fork (B). (b) Approve the result-format change in A (it changes what a small model reads; it only adds a short command echo and a write summary).
+
+## 5. Proposed acceptance tests
+
+1. In `tests/test_loop_guards.py`, delete the `F1`/`F2` markers: all six reproductions pass (stale rerun, failed-check rerun, file reread, re-delegation, silent shell commands, repeated file writes).
+2. Controls still pass unchanged (distinct calls; stuck idempotent custom tool stopped; **stuck shell loop stopped in ≤ 3 executions**).
+3. Pins still pass (custom tools keep replay and constant-text behaviour), proving the adapter is scoped.
+4. The adapter is restored after `Harness.run` returns **and** when it raises, so a later plain `Agent` run in the same process sees effGen's own guard (assert `agent_loop.NativeToolLoop is the original`).
+5. A worker's nested run is covered: an orchestrator delegates twice to the same worker and the worker re-runs the same command after a change (one harness test).
+6. Result-format tests: the echo is truncated at 200 characters; a write result changes with the content and not with the call number; `ShellTool`'s existing 121 tests and T4.1's `file_operations` tests still pass.
+7. Full default suite green (today: 607 passed, 3 skipped, 6 xfailed), `uv lock --check` unchanged (no dependency change under A + C).
+
+F3 (orchestrator `RunStoppedError` escaping `Harness.run`) was not investigated in this follow-up; it is independent and unchanged.
+
+---
+
+# Follow-up 001-B: F2 fixed; F1 blocked on a process-global change awaiting approval (2026-10-17, Sonnet 5.5)
+
+**Outcome:** Phase A (result differentiation, which fixes F2) is implemented and verified. Phase B (the `NativeToolLoop` adapter for F1) is **not implemented**: the only way to reach effGen's guard object is rebinding a module-level name, which is a process-global runtime mutation. Per the instruction for that case, I stopped and am reporting the mechanism below. F3, T5.0 and the CLI were not touched. No effGen source was modified.
+
+## 1. Phase A: what changed (`src/smol_harness/tools.py`)
+
+| Tool | Before | After |
+|---|---|---|
+| `shell` success / failure report | `exit code: 0` / `exit code: 1\nstdout:…` | `$ <command as one line>\nexit code: …\nstdout:…\nstderr:…`. A command over 200 characters keeps its first 200, the count of the rest and `sha256` (first 8 hex digits) of the whole command, so two long heredoc writes that start alike still read differently. The structured fields (`stdout`, `stderr`, `exit_code`, `timed_out`) stay raw and unprefixed |
+| `file_operations` `write` result | the bare absolute path | `wrote <path relative to the workspace> (<bytes> bytes, <n> line(s), sha256 <8 hex>)`, **read back from the file on disk** after the write (`WorkspaceFileOperations`, a 15-line subclass of effGen's `FileOperations`) |
+| Failures, other operations (`read`, `list`, `search`, `metadata`, `convert`) | unchanged | unchanged (`convert` still returns effGen's own relative path) |
+
+- **Failure semantics are intact.** A non-zero exit or a timeout is still a failed `ToolResult` whose `error` holds the report (the only text effGen shows a model for a failure). A command that prints effGen's own error prefix cannot make a success read as an error or the reverse (tested with `is_error_result`).
+- **Deviation, for your decision: no execution counter.** You asked for identifiers that distinguish legitimately separate invocations. I used *content* instead of a counter: the command echo and the write summary. Reason: a per-call counter makes every result unique, which switches off every result-text guard for these tools (repeat, stall, drift), so a model repeating the same command with the same output would be bounded only by `max_iterations`. With the echo and the hash, an identical command with identical output still reads identically and is still caught (control test `test_control_a_stuck_harness_tool_loop_is_still_stopped`), while different commands and changed files read differently. `delegate` keeps its existing `delegation_id`. If you still want a counter for traceability, it can live in the structured fields (not in the text effGen compares).
+- **Verified side effects, not text.** Every Phase A test checks the real disk (the directory exists, the file bytes and hash equal the summary, the symlink exists); mutation check below.
+
+### Phase A results
+
+| Check | Result |
+|---|---|
+| F2 reproductions (`silent_shell_commands…`, `writing_several_files…`), strict xfail removed | pass (they were XPASS(strict) before the markers were removed, i.e. genuinely fixed) |
+| New: 7 distinct silent shell commands in a row; 7 distinct file writes | pass (these exercise the repeat, stall and drift heuristics together) |
+| Mutation: command echo and write summary disabled | the three F2 tests that depend on them fail; the file-writes-in-a-row test passes (the paths already differ), so it is now named `test_control_…` and is no longer counted as a reproduction |
+| 11 new unit tests in `tests/test_tools.py` (121 → 132) | summaries match the files on disk (empty, nested, non-ASCII, JSON re-indented); content changes the text, a call does not; failures and other operations unchanged; long-command hash; timeout and error semantics |
+| `uv run pytest tests/test_loop_guards.py -q` | **10 passed, 4 xfailed** (the 4 F1 reproductions) |
+| tools + delegation + e2e + limits | **254 passed** |
+| `uv run pytest -q` | **622 passed, 3 skipped, 4 xfailed** (66.7 s) |
+| `uv lock --check` | Resolved 157 packages (no dependency change) |
+
+## 2. Phase B: investigation
+
+**Private effGen APIs the adapter needs** (all verified present in 1.3.0):
+
+1. `effgen.core.agent_loop.NativeToolLoop`: the **module attribute** that `drive()` looks up when it builds the guards (imported at `agent_loop.py:113`, used at `:3387`). Replaced by name.
+2. `effgen.core.agent_tool_loop.NativeToolLoop.check_action(self, action, action_input) -> LoopCheck`: overridden in a subclass.
+3. `LoopCheck.is_exact_loop` (a field of a plain dataclass): cleared with `dataclasses.replace`.
+4. `self.tools` (the agent's tool mapping, passed in by `drive`): read to decide, per tool instance, whether the repeat is a real call.
+
+**Is per-instance integration possible?** No for the *binding*, yes for the *behaviour*.
+- `NativeToolLoop` is constructed at one site, `drive()` (`agent_loop.py:3387`; the comment there: "one construction site for every path"). I searched all of effGen: no other construction, no factory, no `AgentConfig` or tool-metadata option, no `Agent` method that supplies the guards, and no middleware seam (middleware runs after the decision). Agent subclasses cannot intercept, because `drive` is a module function that reads the name from the module.
+- So the only lever is `agent_loop.NativeToolLoop = <subclass>`. **Module-level patching is required.**
+- *Behaviour* can still be scoped per tool: a throwaway prototype (outside the repo) whose subclass changes `check_action` only for tool instances carrying a marker attribute (`ShellTool`, `WorkspaceFileOperations`, `DelegateTool`) made **all 14 loop tests pass with the xfail markers ignored**, including the pin showing that a plain custom tool is still replayed exactly as upstream does and the stuck-shell-loop control. In that design the subclass is inert for every unmarked tool, whichever agent or library in the process runs it.
+
+**Limitations and risks of any rebinding**
+- **Process-global and visible to all threads.** Workers run in executor threads (`DelegateTool._delegate`) inside the orchestrator's run, so they would see it (wanted); any other effGen user in the process would too (inert unless its tools carry the marker, but still a mutation).
+- **Install and restore around each run is not re-entrant.** Two overlapping `Harness.run` calls (different threads) would each capture "the original", and the second restore could leave the patch installed or restore the wrong class, unless a lock and a reference count are added. An exception or interrupt between install and restore also needs a `finally`.
+- **A permanent, idempotent install** (done once, never undone) removes the race and the leak-between-runs problem (there is nothing to leak: the subclass is stateless and inert unless marked), at the price of a mutation that lives for the whole process.
+- **Upgrade risk:** effGen is pinned `==1.3.0`, which shields us. A new version can rename `drive`, `NativeToolLoop`, `check_action` or `LoopCheck`, or move the construction site; the failure mode is loud (the adapter's install would raise on a missing name, and the F1 tests and pins would fail), not silent.
+- **Safety effect (unchanged from Follow-up 001-A):** only the pre-dispatch exact-repeat check is disabled, only for the marked tools. The result-repeat, stall, drift, `max_iterations`, delegation-limit and deadline protections remain; with Phase A the result-repeat guard now catches "same command, same output".
+
+**Options for your approval** (nothing is installed):
+
+| | What | Mutation | My view |
+|---|---|---|---|
+| **P (recommended)** | A marker-keyed subclass installed **once**, explicitly and idempotently (guarded by a lock) when the first `Harness` is built, with `install()` / `uninstall()` functions so tests can verify and reverse it. Marker: a class attribute on our three tool classes | Permanent for the process, inert for unmarked tools | Smallest and race-free; the mutation is explicit, documented and testable |
+| Q | The same subclass, installed and restored around each `Harness.run` with a lock and a reference count | Process-global while any run is active | Matches "installation and cleanup" literally but adds concurrency machinery for no extra protection |
+| R | A maintained effGen fork (option B of 001-A) | Source patch | Heaviest; breaks the `effgen==1.3.0` pin rule |
+| S | Leave F1 open; tell the worker in its prompt to vary repeated commands | None | Not a fix: stale replays are silent, so the model cannot know to vary |
+
+## 3. What is fixed, what is open
+
+- **F2: fixed** (Phase A, verified).
+- **F1: open.** Four strict-xfail reproductions remain (`test_f1_rerunning_a_passing_check…`, `…a_failed_check…`, `…rereading_a_file…`, `…identical_redelegation…`). They should be converted to ordinary tests only when the adapter exists and passes them; I did not weaken any of them.
+- Phase C items 1 to 4 (F1 behaviours), 8 (unrelated tools keep upstream behaviour) and 10 (installation and cleanup leave no leak) depend on the adapter. Items 5, 6, 7 and 9 are covered now (7: `test_control_a_stuck_harness_tool_loop_is_still_stopped` and the idempotent-tool control; 8 is pinned for the replay today by `test_pin_a_custom_tool_repeat_is_replayed_from_the_record`).
+
+## 4. Decision needed
+
+Approve option P (or Q or R) to unblock F1, and tell me whether you still want an execution counter in the structured fields. Until then F1 remains: an identical repeated `shell`, `file_operations` or `delegate` call is replayed from effGen's record instead of running.
+
+---
+
+# Follow-up 001-C: F1 fixed by an explicit, process-wide compatibility patch (2026-10-17, Sonnet 5.5)
+
+**Outcome: F1 and F2 are both fixed and verified. F3, T5.0 and the CLI were not touched. No effGen source was modified.** Approved design implemented as option P of Follow-up 001-B, with the contract below.
+
+## 1. What was built
+
+| Piece | Where | Behaviour |
+|---|---|---|
+| `install_effgen_loop_compat()` | `harness.py` | Explicit, idempotent. Rebinds `effgen.core.agent_loop.NativeToolLoop` to a subclass whose `check_action` clears `is_exact_loop` **only** when the tool in question carries `STATEFUL_TOOL_MARKER`. Every other guard is inherited |
+| `STATEFUL_TOOL_MARKER = "executes_every_call"` | `delegation.py` | A class attribute set on `ShellTool`, `WorkspaceFileOperations` (the `file_operations` tool) and `DelegateTool`. A test fails if any tool the factory can build lacks it, so a future tool (e.g. `edit_file`) cannot be forgotten |
+| `effgen_loop_compat_installed()` | `harness.py` | True only while effGen's loop currently uses the patched class |
+| `Harness.run` guard | `harness.py` | Because `delegate` is always marked, `Harness.run` raises `EffgenCompatError` (naming `install_effgen_loop_compat()`) **before any agent or model call** if the patch is not installed. There is no way to run silently with stale replay |
+| `uninstall_effgen_loop_compat_for_tests()` | `harness.py` | Restores effGen's own class. Tests only; refuses to overwrite a class it did not install. **Nothing in the harness calls it** (not `run`, and the future `close()` must not) |
+| `EffgenCompatError` | `harness.py` | Raised with an actionable message, patching nothing |
+
+**Install-time verification (all must hold or nothing is patched):** `effgen.__version__ == "1.3.0"`; `effgen.core.agent_tool_loop.NativeToolLoop` is a class whose `check_action` has exactly the parameters `(self, action, action_input)`; `LoopCheck` is a dataclass with an `is_exact_loop` field; `agent_loop` has the module-level `NativeToolLoop` name; `agent_loop.drive` still builds the guards with `NativeToolLoop(`; and the current binding is effGen's own class (it refuses to wrap an unknown replacement).
+
+**Installation is separate from construction.** Importing the harness or building one patches nothing (tested in a fresh interpreter). An application, the future CLI, or a test fixture must call the function once before any agent runs; `tests/conftest.py` does so in a session fixture.
+
+## 2. The process-global nature, stated plainly
+
+- It changes effGen for **every agent in the process**; it is inert for any tool without the marker, whichever code runs it.
+- **Unsupported:** installing or restoring while any agent is running, or from several threads at once. A lock protects only the module's two bookkeeping variables, not running agents.
+- **Private-API dependencies:** `effgen.core.agent_loop.NativeToolLoop` (module attribute, construction site `agent_loop.py:3387`), `effgen.core.agent_tool_loop.NativeToolLoop.check_action`, `LoopCheck.is_exact_loop`, `NativeToolLoop.tools`.
+- **Upgrade risk:** effGen is pinned `==1.3.0` and the patch refuses any other version. Any rename or move raises `EffgenCompatError` at install, and the F1 tests and pins in `tests/test_loop_guards.py` fail loudly. Re-verification on an upgrade means re-reading `agent_loop.drive` and `NativeToolLoop.check_action`.
+
+## 3. What changed for the loop protections
+
+Disabled, for marked tools only: effGen's pre-dispatch exact-repeat replay/decline. Kept and tested: the repeated-result guard, stall and drift accounting, `max_iterations`, `max_delegations`, the worker deadline. Measured bounds with the patch (scripted, deterministic):
+
+| Runaway behaviour | Outcome |
+|---|---|
+| Same shell command, same output, ×8 | stopped after ≤ 3 executions (repeated result) |
+| Same failing shell command ×12 | 3 executions, 4 model calls, `stuck` / `loop_detected` (the stall guard: the same error is not progress) |
+| Same file read ×12 | 2 executions, 3 model calls, `stuck` / `repeated_tool_result` |
+| Same `delegate` call ×20, `max_delegations=3` | 3 real worker runs, then refusals; ≤ 10 orchestrator calls |
+| Same failing `delegate` call, no limit | 5 real worker runs, then the orchestrator's iteration cap (`stuck`, never `tool_failed`) |
+
+**One existing expectation changed, deliberately, and you should know.** `tests/test_limits.py::test_retrying_the_identical_failing_delegation_forever_ends_stuck_not_tool_failed` asserted `len(result.workers) == 1` and `stop_reason == "loop_detected"`, i.e. that effGen does not re-dispatch the identical delegation. That is exactly the F1 behaviour, so it could not survive the fix. It now asserts what the approved design implies (5 real worker runs bounded by the orchestrator's iteration cap, `stuck`, never `tool_failed`, no exception), with exact numbers, and a new test covers the delegation limit. The practical cost: an orchestrator that retries the identical failing delegation now spends up to `max_delegations` (default 4) real worker runs instead of one. A `delegate` report is unique per call (`delegation_id`), so no result-text guard can catch that loop; `max_delegations` and `max_iterations` are its bounds.
+
+## 4. Verification (exact)
+
+| Command | Result |
+|---|---|
+| `uv run pytest tests/test_loop_guards.py -q` | **35 passed** (14 before; the four former xfails are ordinary tests) |
+| `uv run pytest tests/test_tools.py tests/test_delegation.py tests/test_e2e_delegation.py tests/test_limits.py -q` | **255 passed** |
+| `uv run pytest -q` | **648 passed, 3 skipped, 0 xfailed** (72 s) |
+| `uv lock --check` | Resolved 157 packages, unchanged |
+| Leak check | no stray processes |
+
+Mutation checks: (1) if the patch is never installed, the four F1 tests fail; (2) if the marker check is widened to every object, 4 tests fail (the unmarked-tool pin, the idempotent stuck-loop control, the model-free scope test, and the upstream-replay test), so the scoping is enforced. An early draft of my "import does not install" test used `importlib.reload`, which poisoned later tests by resetting the module's bookkeeping while effGen still held the patched class; it now runs in a fresh subprocess. That also shows the module-level state is the patch's one fragile point: do not reload `smol_harness.harness` in a process that installed it.
+
+## 5. Contract for the next tasks (added to T5.0 / T5.1)
+
+- The CLI and any application **must call `install_effgen_loop_compat()` before building or running a harness**; `Harness.run` refuses otherwise.
+- `Harness.close()` (T5.0) **must not** uninstall; add a test for it.
+- Never reload `smol_harness.harness` after install; never run two installs/restores concurrently or during a run.
+
+## 6. Status of the review's P1 findings
+
+- **F1: fixed** (this follow-up). **F2: fixed** (Follow-up 001-B).
+- **F3: open** (`Harness.run` lets `RunStoppedError` escape under effGen's default `raise_on_error=True`; the run's worker records are lost). Not touched, as instructed.

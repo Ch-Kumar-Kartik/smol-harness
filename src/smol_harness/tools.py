@@ -10,6 +10,7 @@ be enforced (audit Part 3, T4.2). Neither is a VM or container boundary.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import platform
 import re
@@ -24,7 +25,7 @@ from effgen.security.sandbox import SandboxConfig, SandboxResult, SubprocessSand
 from effgen.tools.base_tool import BaseTool, ParameterSpec, ParameterType, ToolCategory, ToolMetadata
 from effgen.tools.builtin.file_ops import FileOperations
 
-from smol_harness.delegation import DELEGATE_TOOL_NAME
+from smol_harness.delegation import DELEGATE_TOOL_NAME, STATEFUL_TOOL_MARKER
 
 
 class ToolBuildError(ValueError):
@@ -62,8 +63,33 @@ def resolve_workspace(workspace: Path | str) -> Path:
     return path
 
 
+class WorkspaceFileOperations(FileOperations):
+    """effGen's `FileOperations`, except that a successful `write` says what it wrote.
+
+    effGen answers a write with the bare path, so rewriting a file (or writing two files) yields the same text
+    each time. effGen's loop guards read "the same result text again" as a repeat and end the run (review F2,
+    audit Part 3). The summary is read back from the file that is now on disk (path, size, lines, short hash),
+    so it changes exactly when the content does; a failed write, and every other operation, are untouched.
+    """
+
+    executes_every_call = True  # a repeated read/write must reach the disk; see STATEFUL_TOOL_MARKER
+
+    async def _execute(self, **kwargs: Any) -> dict[str, Any]:
+        out = await super()._execute(**kwargs)
+        if kwargs.get("operation") == "write" and out.get("success") and isinstance(out.get("data"), str):
+            try:
+                written = Path(out["data"])
+                body = written.read_bytes()
+            except OSError:
+                return out  # the write succeeded; a summary that cannot be read back is not worth failing it
+            shown = written.relative_to(self._allowed_directories[0]) if written.is_relative_to(self._allowed_directories[0]) else written
+            lines = body.count(b"\n") + (1 if body and not body.endswith(b"\n") else 0)
+            out = {**out, "data": f"wrote {shown} ({len(body)} bytes, {lines} line{"" if lines == 1 else "s"}, sha256 {hashlib.sha256(body).hexdigest()[:8]})"}
+        return out
+
+
 def _file_operations(workspace: Path) -> BaseTool:
-    tool = FileOperations(allowed_directories=[str(workspace)])
+    tool = WorkspaceFileOperations(allowed_directories=[str(workspace)])
     # effGen silently replaces a missing allowed directory with EFFGEN_WORKSPACE or the
     # current directory (audit §1.9, T4.1). Read back the root it kept so a workspace that
     # vanished after validation fails closed instead of widening confinement. The attribute
@@ -110,6 +136,8 @@ class ShellTool(BaseTool):
     readable, credential stores are masked by a deny-list), CPU/disk/output quotas beyond the
     address-space limit and a process-count `ulimit` that is per user, not per sandbox.
     """
+
+    executes_every_call = True  # a repeated command must run again; see STATEFUL_TOOL_MARKER
 
     DEFAULT_TIMEOUT_S = 30
     MAX_TIMEOUT_S = 300
@@ -216,7 +244,7 @@ class ShellTool(BaseTool):
         ok = result.exit_code == 0 and not timed_out
         stdout, out_cut = _tail(result.stdout, self.MAX_OUTPUT_CHARS)
         stderr, err_cut = _tail(result.stderr, self.MAX_OUTPUT_CHARS)
-        report = _report(result.exit_code, timed_out, timeout_s, stdout, stderr)
+        report = _report(_echo(command), result.exit_code, timed_out, timeout_s, stdout, stderr)
         out: dict[str, Any] = {
             "success": ok, "exit_code": result.exit_code, "timed_out": timed_out, "stdout": stdout, "stderr": stderr,
             "truncated": out_cut or err_cut, "filesystem_confined": True, "network_isolated": True,
@@ -234,8 +262,28 @@ def _tail(text: str, limit: int) -> tuple[str, bool]:
     return f"[... {len(text) - limit} earlier characters omitted]\n{text[-limit:]}", True
 
 
-def _report(exit_code: int, timed_out: bool, timeout_s: int, stdout: str, stderr: str) -> str:
-    lines = [f"timed out after {timeout_s}s: the command and every process it started were killed"] if timed_out else []
+ECHO_CHARS = 200
+
+
+def _echo(command: str) -> str:
+    """The command as one line, for the report. A long one keeps its start, its size and a hash of the whole.
+
+    Without the hash two long commands that share their first lines (for example two heredoc file writes) would
+    read the same when they print nothing.
+    """
+    line = " ".join(command.split())
+    if len(line) <= ECHO_CHARS:
+        return line
+    digest = hashlib.sha256(command.encode()).hexdigest()[:8]
+    return f"{line[:ECHO_CHARS]}... [{len(line) - ECHO_CHARS} more chars, sha256 {digest}]"
+
+
+def _report(echo: str, exit_code: int, timed_out: bool, timeout_s: int, stdout: str, stderr: str) -> str:
+    # The echo makes two different silent commands (`exit code: 0` each) read differently: effGen ends a run in
+    # which different calls return the same result text (review F2). The structured fields stay unprefixed.
+    lines = [f"$ {echo}"]
+    if timed_out:
+        lines.append(f"timed out after {timeout_s}s: the command and every process it started were killed")
     lines.append(f"exit code: {exit_code}")
     for label, text in (("stdout", stdout), ("stderr", stderr)):
         if text.strip():
