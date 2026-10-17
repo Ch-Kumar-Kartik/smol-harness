@@ -600,9 +600,17 @@ Convention since T3.2b: tests that load a real checkpoint carry the `real_model`
 - **Verification:** `uv run pytest tests/test_loop_guards.py -q` → 35 passed; tools + delegation + e2e + limits → 255 passed; `uv run pytest -q` → 648 passed, 3 skipped, 0 xfailed; `uv lock --check` → 157 packages, unchanged. Mutation checks: patch not installed → the four F1 tests fail; marker widened to all objects → four scoping tests fail.
 - **Requirements added to later tasks:** T5.0 and T5.1 must call `install_effgen_loop_compat()` explicitly before any agent runs; `Harness.close()` must not uninstall (test it).
 
+### Review 001, F3 fix: stopped orchestrators return results (2026-10-17)
+
+- **Files:** modified `src/smol_harness/harness.py` (`Harness.run`, `_stopped_response`, `_keep_records`); created `tests/test_orchestrator_failure.py` (28 tests). No effGen change; the F1 patch and its installation requirement, delegation, tools and model loading are untouched.
+- **Behaviour:** effGen raises `RunStoppedError` only for `outcome == "stopped"` and it carries the same `AgentResponse` that `raise_on_error=False` returns; `Harness.run` now builds the normal failed `HarnessResult` from it (real `termination`, `stop_reason`, this run's worker records) in both modes. The response is validated (`success is False`, has `output`); a malformed error propagates, nothing is invented. Every other exception propagates unchanged with `exc.worker_records` (and a note) so the work already done is not lost.
+- **Limitation (effGen's, documented):** under `raise_on_error=True` a non-stopped orchestrator failure (provider error, guardrail block, a model that raises) raises with no response; under `False` it is a failed result. T5.1 must treat both.
+- **Verification:** `uv run pytest tests/test_orchestrator_failure.py -q` → 28 passed; delegation, e2e, limits, loop guards, tools → 290 passed; `uv run pytest -q` → 676 passed, 3 skipped; `uv lock --check` → 157 packages, unchanged. Mutation checks: handling disabled → 7 failures, validation removed → 4, records not attached → 13.
+- **New finding F13 (P3, not fixed):** `DelegateTool._delegate` fails inside its own `except RunStoppedError` branch when a worker's error has no usable response, and no `WorkerRecord` is created.
+
 ## 5. Upcoming work
 
-0. **Before T5.0 (from `docs/reviews/opus-review-001.md`, 2026-10-17):** F1 and F2 are **fixed** (§4). **Remaining: F3** (`Harness.run` exception path), then commit the T4.2 / F1 / F2 work. T5.0 should also absorb F5/F8 from the review (explicit effGen flags, shell timeout capped at the worker deadline) and must call `install_effgen_loop_compat()` (and keep `Harness.close()` from uninstalling it).
+0. **Before T5.0 (from `docs/reviews/opus-review-001.md`, 2026-10-17):** all three P1 findings are **fixed** (F1, F2, F3; §4). **Commit the F3 work.** T5.0 should absorb F5 and F8 from the review (explicit effGen flags, shell timeout capped at the worker deadline), call `install_effgen_loop_compat()` (and keep `Harness.close()` from uninstalling it), and T5.1 must handle both a failed `HarnessResult` and a propagated orchestrator exception (with `worker_records`). P3 findings F10 to F13 can be taken in the relevant milestone.
 1. **T5.0** (next after the above, §2 M5), then **T5.1** (CLI), **T5.2** (toy-repo smoke test, trusted repository only); T4.3 only if T5.2 needs it.
 2. ~~Unplanned wiring step~~ now scheduled as T5.0.
 3. **Blocked or hardware-dependent:** T3.3 (needs Ollama), T3.4 (needs `bitsandbytes` and a real quantized GPU load), T3.5 (needs T3.3 and T3.4).

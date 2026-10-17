@@ -488,6 +488,14 @@ Status values: Not started, In progress, Implemented (unverified), Tested, Block
 - Limitations: the patch removes effGen's protection against an identical repeat of a marked call; the remaining bounds are the repeated-result/stall guards (not applicable to `delegate`, whose reports are unique), `max_delegations`, `max_iterations` and the worker deadline.
 - Decisions: option P (install once, explicit, marker-keyed) over an install/restore-per-run (race-prone) or a fork; installation kept out of `Harness.__init__`/`run`/`close`; fail loudly instead of falling back to stale replay.
 
+### 2026-10-17 – `RunStoppedError` and `raise_on_error` (verified; review F3)
+- Files: `src/smol_harness/harness.py` (`Harness.run`), `tests/test_orchestrator_failure.py` (28 tests). No effGen change.
+- **Verified in source and at runtime (effGen 1.3.0):**
+  - `Agent.run` raises `RunStoppedError` (`errors.py:373`) only when `raise_on_error=True` **and** the response's `outcome == "stopped"`; the sole construction site is `_reconstruct_error` in `core/agent_generation.py`. The error carries the full `AgentResponse` (`success=False`, `termination`, `stop_reason`, `output`, `partial`) and copies `output`, `stop_reason`, `partial` from it. It is the same response `raise_on_error=False` returns: identical `success`, `termination` (`"stuck"`), `stop_reason` (`max_iterations_partial`, `loop_detected` measured), `output`, in four scenarios.
+  - Every other failure under `True` is a **different exception with no response**: plain `RuntimeError` (guardrail block, some iteration/model failures, e.g. `'RuntimeError: model exploded'`) or typed provider errors (`BackendUnreachableError`, `ModelAuthError`, … via `_reconstruct_error`). With `False` the same failures are failed responses (`termination="error"`, `stop_reason="generation_failed"` for a raising model). The two modes are therefore **not equivalent** for non-stopped failures.
+- Harness behaviour: stopped runs are normalised to `HarnessResult` using the (validated) carried response; other exceptions propagate with `exc.worker_records`. No response is ever fabricated.
+- Related, `DelegateTool` (not changed): its `except RunStoppedError` branch unwraps `exc.response` without validation; a response-less error leaves no `WorkerRecord` (review F13).
+
 (Further entries follow this format.)
 
 _Format for later entries:_ Add one entry per completed task in `docs/implementation-plan.md`, using this format:

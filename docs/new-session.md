@@ -26,7 +26,7 @@ Source modules, tests and configuration exist; there is **no CLI yet**.
 | `docs/effgen-api-audit.md` | effGen facts (Part 1, incl. §1.12 on local-model tool calling and context budget), harness integration status (Part 2), per-task history (Part 3) |
 | `pyproject.toml`, `uv.lock`, `.python-version` | uv project: Python 3.12, `effgen==1.3.0`, `pyyaml`; dev group: `pytest`; markers `ollama`, `gpu`, `real_model` |
 | `src/smol_harness/delegation.py` | `WorkerResult`, `WorkerRecord`, `WorkerRegistry`, `DelegateTool`, `DeadlineMiddleware`, `WorkerTimeout`, `bounded`, `validate_limits`. Worker timeout, `max_delegations`, `max_report_chars`; every report has a unique `delegation_id` |
-| `src/smol_harness/harness.py` | `build_harness(...)`, `Harness.run(task) -> HarnessResult` (fresh orchestrator and record list per run; **raises `EffgenCompatError` if the effGen loop patch is not installed**). Also the effGen loop patch (F1): `install_effgen_loop_compat()` (explicit, idempotent, **process-wide**; call it once before any agent runs), `effgen_loop_compat_installed()`, `uninstall_effgen_loop_compat_for_tests()`, `EffgenCompatError`. **Takes `AgentConfig`s, not a `HarnessConfig`** |
+| `src/smol_harness/harness.py` | `build_harness(...)`, `Harness.run(task) -> HarnessResult` (fresh orchestrator and record list per run; **raises `EffgenCompatError` if the effGen loop patch is not installed**). **F3:** an orchestrator that effGen stops (`RunStoppedError`, i.e. outcome "stopped") comes back as a failed `HarnessResult` under both `raise_on_error` settings; any other exception propagates unchanged with this run's records on `exc.worker_records`. Also the effGen loop patch (F1): `install_effgen_loop_compat()` (explicit, idempotent, **process-wide**; call it once before any agent runs), `effgen_loop_compat_installed()`, `uninstall_effgen_loop_compat_for_tests()`, `EffgenCompatError`. **Takes `AgentConfig`s, not a `HarnessConfig`** |
 | `src/smol_harness/config.py` | YAML to frozen dataclasses with validation: `load_config`, `loads_config`, `parse_config`, `ConfigError`, `ModelSpec`, `AgentSpec`, `Limits`, `HarnessConfig`, `hf_placement_problem`, `KNOWN_TOOLS` |
 | `src/smol_harness/models.py` | `build_model(ModelSpec)`, `loader_args`, `ModelCache`, `ModelLoadError` (CPU/CUDA placement, quantization mapping, post-load checks) |
 | `src/smol_harness/tools.py` | `build_tools(names, workspace)`, `resolve_workspace` (rejects missing/non-directory/inaccessible workspaces, filesystem roots, `$HOME` and its ancestors), `ToolBuildError`, `TOOL_NAMES`, `ShellTool`, `ShellSandboxError`, `require_shell_host`. `file_operations` = effGen `FileOperations` with the kept root read back; `shell` = `ShellTool` (see plan §4 T4.2). Not yet called by `build_harness` |
@@ -36,6 +36,7 @@ Source modules, tests and configuration exist; there is **no CLI yet**.
 | `tests/test_scripted_model.py` (15), `test_delegation.py` (22), `test_e2e_delegation.py` (23), `test_limits.py` (77) | M1/M2: fake model, delegation layer, end-to-end orchestrator-worker flow, limits and failure propagation |
 | `tests/test_config.py` (201), `test_models.py` (110), `test_hf_device.py` (8) | M3: configuration, model factory and cache, CPU/CUDA placement against effGen's real engine with a locally generated tiny model |
 | `tests/tool_probe.py`, `test_tool_probe.py` (7), `test_lfm_parser_compat.py` (13) | Tool-calling measurement helper and its scripted validation; model-free pins of how effGen 1.3.0 reads LFM tool-call formats |
+| `tests/test_orchestrator_failure.py` (28) | Review F3: stopped orchestrators return results in both `raise_on_error` modes with the same content, worker records survive (good and failed delegations, none), no leaks between runs, unrelated exceptions propagate with `worker_records`, malformed `RunStoppedError`s propagate, compat requirement unchanged |
 | `tests/test_loop_guards.py` (35) | Review F1/F2 with the real effGen loop and real tools (all pass now), plus the patch contract: scope (marked tools only), idempotent install, loud failure on an incompatible effGen (6 breakages + unknown replacement), `Harness.run` refusing without the patch, no automatic restoration, test-only restoration, no leak between runs, runaway loops still bounded. `conftest.py` installs the patch in a session fixture |
 | `tests/test_tools.py` (121) | M4: tool factory, workspace validation and dangerous roots, `file_operations` confinement, the real `SubprocessSandbox` shell (writes, reads, network, sockets, timeout, children, memory, fail-closed, allowlists), scripted harness runs with real tools, effGen regression pins. Sandbox tests are `linux_only`; they fail rather than skip on a Linux host without user namespaces |
 | `tests/test_integration_optin.py` (2), `test_import.py` (2) | Guard that real-model tests cannot run without the flag; effGen version/import check |
@@ -45,7 +46,7 @@ Not created yet: `src/smol_harness/__main__.py` (T5.1), `tests/integration/test_
 
 ## 3. Current project state
 
-Default suite: **648 passed, 3 skipped, 0 xfailed** (the 3 opt-in real-model tests; about 72 s); `uv lock --check` passes.
+Default suite: **676 passed, 3 skipped, 0 xfailed** (the 3 opt-in real-model tests; about 73 s); `uv lock --check` passes.
 
 **Implemented and verified (with the tests above):**
 
@@ -69,7 +70,7 @@ Default suite: **648 passed, 3 skipped, 0 xfailed** (the 3 opt-in real-model tes
 
 ## 4. Most recent session
 
-- **Latest (2026-10-17, F1 fixed):** **F1 and F2 are fixed.** F2 (earlier): shell reports start with `$ <command>`, file writes report `wrote <path> (<bytes> bytes, <n> lines, sha256 <8>)` read back from disk; no per-call counter. **F1 (now): `install_effgen_loop_compat()` in `harness.py`**: an explicit, idempotent, **process-wide** rebinding of `effgen.core.agent_loop.NativeToolLoop` to a marker-keyed subclass so identical repeat calls of `shell`, `file_operations` and `delegate` (class attribute `executes_every_call`) actually run; unmarked tools and every other guard (repeated result, stall, drift, iteration cap, delegation limit, deadline) are untouched. It verifies effGen `==1.3.0`, the private names and the construction site, and raises `EffgenCompatError` (patching nothing) otherwise; `Harness.run` refuses to run, before any model call, without it; nothing in the harness uninstalls it. **Your application / CLI / test fixture must call it once before any agent runs** (`tests/conftest.py` does). Behaviour change: an orchestrator retrying the identical failing delegation now runs a real worker each time (bounded by `max_delegations`, default 4, and the iteration cap), so one test in `tests/test_limits.py` was updated (it had encoded F1). Tests: loop guards 35 passed; tools/delegation/e2e/limits 255 passed; full **648 passed, 3 skipped, 0 xfailed**; `uv lock --check` OK. Details: review Follow-up 001-C. Earlier today: F1/F2 diagnosed (001-A), F2 fixed (001-B).
+- **Latest (2026-10-17, F3 fixed): all three P1 review findings (F1, F2, F3) are closed.** `Harness.run` now returns a failed `HarnessResult` (real `termination`, `response.stop_reason`, this run's worker records) when effGen stops the orchestrator, whatever `raise_on_error` says; effGen raises `RunStoppedError` only for `outcome == "stopped"`, carrying the same response `raise_on_error=False` would return. Failures that have **no response** (provider errors, guardrail blocks, a model that raises) are *different* exceptions under `True`: they propagate unchanged, with this run's records attached as `exc.worker_records` (plus a note), and under `False` they are failed results (an effGen asymmetry; the CLI must handle both). The response is validated (`success is False`, has `output`); a malformed `RunStoppedError` propagates instead of producing a made-up result. 28 new tests in `tests/test_orchestrator_failure.py`. Tests: full **676 passed, 3 skipped**; `uv lock --check` OK. New P3 finding F13 (a worker's response-less `RunStoppedError` leaves no `WorkerRecord`). Details: review Follow-up 001-D. **Earlier today:** F1 fixed by the explicit process-wide `install_effgen_loop_compat()` (001-C), F2 by self-describing tool results (001-B).
 - **Previous session (T4.2), summarized below:**
 
 - **Goal:** T4.2 only: a sandboxed `shell` tool on effGen's sandbox, verified empirically, plus the T4.1 correction (dangerous workspace roots). No models, no Ollama, no CLI, no effGen change.
@@ -117,9 +118,9 @@ hf placement rules: `device: cuda` → any quantization; `dtype` `bf16` / `fp16`
 
 ## 5. Current task and next steps
 
-### Remaining before T5.0: **F3, then commit** (F1/F2 are fixed)
+### Remaining before T5.0: **commit the F3 work** (F1/F2/F3 are fixed; the earlier work is committed as `1d7d2d3`)
 
-- **F3:** `Harness.run` lets `RunStoppedError` escape under effGen's default `raise_on_error=True` and loses the run's worker records; fix = unwrap `exc.response` (as `DelegateTool` does) or force `raise_on_error=False`, plus a test with an orchestrator at the default setting. Then commit T4.2 + F1/F2 (nothing from these sessions is committed).
+- **Nothing from F3 is committed yet** (`src/smol_harness/harness.py`, `tests/test_orchestrator_failure.py`, four docs). Then T5.0, which must also absorb review F5 and F8.
 - **T5.0 / T5.1 must** call `install_effgen_loop_compat()` explicitly before any agent runs, and `Harness.close()` must not uninstall it (see plan T5.0 acceptance).
 
 ### Next task after those: **T5.0, assemble a harness from `HarnessConfig`** (status: Not started; awaiting approval)
@@ -144,7 +145,7 @@ hf placement rules: `device: cuda` → any quantization; `dtype` `bf16` / `fp16`
 
 ### Known bugs or broken tests
 
-**Open:** F3 (`Harness.run` lets `RunStoppedError` escape under effGen's default `raise_on_error=True` and loses that run's worker records; reproduced in the review, no test yet). F1 and F2 are fixed. **Process-wide effGen patch (F1):** call `install_effgen_loop_compat()` once before any agent runs; never reload `smol_harness.harness` after installing; never install or restore during a run or from several threads; it is pinned to effGen 1.3.0 and fails loudly otherwise. Other review findings F4 to F12 are in `docs/reviews/opus-review-001.md`. The suite is green (648 passed, 3 skipped).
+**Open:** none of the P1s. F13 (P3: a worker's response-less `RunStoppedError` leaves no `WorkerRecord`, `DelegateTool._delegate`), and review findings F4 to F12 (see `docs/reviews/opus-review-001.md`). **Process-wide effGen patch (F1):** call `install_effgen_loop_compat()` once before any agent runs; never reload `smol_harness.harness` after installing; never install or restore during a run or from several threads; it is pinned to effGen 1.3.0 and fails loudly otherwise. **`Harness.run` contract (F3):** a stopped orchestrator is a failed result; other orchestrator exceptions propagate with `exc.worker_records`. The suite is green (676 passed, 3 skipped).
 
 ### Unverified assumptions
 
@@ -191,7 +192,7 @@ All commands below were run during this project (Linux, uv 0.11.29, 2026-10-16).
 cd /home/ch_kartik/Projects/Active/smol-harness
 uv sync --locked                 # .venv with Python 3.12 + effgen 1.3.0 (about 2 min cold: torch/CUDA wheels)
 uv run python -c "import effgen; print(effgen.__version__)"   # -> 1.3.0
-uv run pytest -q                 # default suite -> 648 passed, 3 skipped (real-model tests skipped)
+uv run pytest -q                 # default suite -> 676 passed, 3 skipped (real-model tests skipped)
 uv run pytest tests/test_limits.py -q                       # a single file works the same way
 uv run pytest tests/test_tools.py -q                        # tool factory, file_operations, sandboxed shell -> 121 passed (about 40 s)
 uv lock --check                  # -> Resolved 157 packages (lockfile consistent)

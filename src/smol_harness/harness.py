@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
-from effgen import Agent, AgentConfig
+from effgen import Agent, AgentConfig, RunStoppedError
 
 from smol_harness.delegation import (
     DELEGATE_TOOL_NAME,
@@ -185,6 +185,13 @@ class Harness:
 
         A reused effGen `Agent` keeps conversation memory between `run()` calls
         (audit §1.4), so independent runs must not share one.
+
+        An orchestrator that effGen stops without an answer (iteration cap, repeat guards, a tool failing on its own
+        side) comes back as a normal failed `HarnessResult` whatever `raise_on_error` says: under the default `True`
+        effGen raises `RunStoppedError` carrying the very response `False` would have returned, and that response is
+        used (review F3, audit §1.2). Any other exception has no response to build a result from (a provider error, a
+        guardrail block, a bug), so it propagates unchanged, with this run's worker records on its `worker_records`
+        attribute so that the work already done is not lost.
         """
         records: list[WorkerRecord] = []
         delegate = DelegateTool(
@@ -200,7 +207,16 @@ class Harness:
                 "smol_harness.harness.install_effgen_loop_compat() once, before any agent runs (it is process-wide and "
                 "explicit by design). Refusing to run, because identical repeat calls would return stale recorded results.")
         with Agent(config) as agent:
-            response = agent.run(task)
+            try:
+                response = agent.run(task)
+            except RunStoppedError as exc:
+                response = _stopped_response(exc)
+                if response is None:  # a RunStoppedError without a usable response: say so, do not invent a result
+                    _keep_records(exc, records)
+                    raise
+            except Exception as exc:
+                _keep_records(exc, records)
+                raise
         return HarnessResult(
             output=str(response.output),
             success=bool(response.success),
@@ -208,6 +224,28 @@ class Harness:
             response=response,
             workers=records,
         )
+
+
+def _stopped_response(exc: RunStoppedError) -> Any | None:
+    """The failed `AgentResponse` a `RunStoppedError` carries, or None when it is missing or not that.
+
+    effGen builds the error from the response (`errors.py:RunStoppedError.__init__`), so a normal one always has it;
+    the checks guard a hand-made or subclassed error. A stopped run's response has `success=False` and an `output`.
+    """
+    response = getattr(exc, "response", None)
+    if response is None or not hasattr(response, "output") or getattr(response, "success", True) is not False:
+        return None
+    return response
+
+
+def _keep_records(exc: BaseException, records: list[WorkerRecord]) -> None:
+    """Hang this run's worker records on an exception that is about to propagate (it carries no result to put them in)."""
+    try:
+        exc.worker_records = list(records)  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):  # an exception type that refuses attributes: the note below still says it
+        pass
+    if records:
+        exc.add_note(f"smol-harness: {len(records)} worker delegation(s) ran before this error (exception.worker_records)")
 
 
 def build_harness(

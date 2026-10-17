@@ -361,3 +361,64 @@ Mutation checks: (1) if the patch is never installed, the four F1 tests fail; (2
 
 - **F1: fixed** (this follow-up). **F2: fixed** (Follow-up 001-B).
 - **F3: open** (`Harness.run` lets `RunStoppedError` escape under effGen's default `raise_on_error=True`; the run's worker records are lost). Not touched, as instructed.
+
+---
+
+# Follow-up 001-D: F3 closed; one new P3 finding (2026-10-17, Sonnet 5.5)
+
+**Outcome: F3 is fixed and verified. All three P1 findings (F1, F2, F3) are now closed.** No effGen source was modified; the F1 compatibility patch and its installation requirement are unchanged; no worker, delegation or model-loading code was touched.
+
+## 1. What effGen actually does (verified in source and by running it)
+
+| Question | Answer |
+|---|---|
+| When does `Agent.run` raise `RunStoppedError`? | Only under `raise_on_error=True`, and only when the run's `outcome == "stopped"` (iteration cap, repeat guards, a tool failing on its own side, an empty answer after tools): `core/agent_generation.py:_reconstruct_error`, the sole construction site |
+| What does it carry? | The full `AgentResponse` of the stopped run (`success=False`, `termination`, `stop_reason`, `output`, `partial`); `RunStoppedError.__init__` (`errors.py:373`) copies `output`, `stop_reason` and `partial` from it |
+| Is it the same response `raise_on_error=False` returns? | Yes. Measured on four scenarios: identical `success`, `termination`, `stop_reason`, `output` and worker records in both modes |
+| What else does `True` raise? | **Different exceptions with no response**: a plain `RuntimeError` for guardrail blocks and some iteration/model failures, and typed provider errors (`BackendUnreachableError`, `ModelAuthError`, …). With `False` the same failures come back as a failed response, so these are **not** equivalent across modes and cannot be normalised without inventing a response |
+
+## 2. The fix (`src/smol_harness/harness.py`, `Harness.run`)
+
+- `except RunStoppedError`: if `exc.response` is usable, it becomes the run's response and the normal `HarnessResult` is built from it (`success=False`, the real `termination`, `response.stop_reason`, this run's worker records).
+- "Usable" is checked, not assumed (`_stopped_response`): the response exists, has an `output`, and has `success is False`. Otherwise the exception propagates (nothing invented).
+- Any other `Exception` propagates unchanged. Before it does, `_keep_records` attaches this run's worker records as `exc.worker_records` (a list, possibly empty) and, if there are any, a note (`exc.add_note`) saying how many delegations ran. This is the only addition beyond the requested normalisation: without it the records of a run that raised would still be lost. `BaseException`s such as `KeyboardInterrupt` pass through untouched.
+- `EffgenCompatError` is still raised first, before any agent exists; the `Harness.run` docstring now states the contract.
+
+**Documented limitation (unchanged by design):** under `raise_on_error=True`, a non-`RunStoppedError` failure of the orchestrator (a provider error, a guardrail block, a model that raises) **raises**, whereas under `False` it returns a failed result (`termination="error"`, `stop_reason="generation_failed"`). A caller that wants results in both cases must use `raise_on_error=False` for the orchestrator, or catch the exception and read `worker_records`. The CLI (T5.1) must handle both: non-zero exit for a failed result, and for a propagated exception.
+
+## 3. Tests (`tests/test_orchestrator_failure.py`, 28 tests, real effGen execution with scripted models)
+
+| Requirement | Test(s) |
+|---|---|
+| 1, 2, 6: failure under `True` and `False`, same result, real stop reasons | `test_a_stopped_orchestrator_returns_the_same_result_whatever_raise_on_error_says` ×2 scenarios (`max_iterations_partial`, `loop_detected`; `termination="stuck"`); a premise test proves effGen really raises for the same run |
+| 3, 4: records after a successful delegation | `test_failure_after_a_successful_delegation_keeps_the_worker_record` ×2 modes |
+| 5: records after a failed delegation | `test_failure_after_an_unsuccessful_delegation_keeps_the_failed_record` ×2 (the worker's own `error_type` legitimately differs by mode: existing `DelegateTool` behaviour) |
+| Failure with no delegation | `test_failure_with_no_delegation_gives_an_empty_record_list` ×2 |
+| 7: no leaks between runs | `test_records_do_not_leak_between_separate_runs` ×2 |
+| 8: unrelated exceptions not swallowed | model exception under `True` propagates as `RuntimeError` (not `RunStoppedError`, no `response`) carrying `worker_records` and the note; the same failure under `False` is a failed result (the documented asymmetry); `ZeroDivisionError`, `KeyError`, `ValueError` ×2 modes propagate; `KeyboardInterrupt` untouched |
+| 9: missing or malformed response information | a well-formed stub still yields a result; `response` removed → propagates; four malformed responses (no `output`, no `success`, `success=True`, `success=None`) → propagate; records reach a propagating stopped error |
+| Compat requirement preserved | `Harness.run` still raises `EffgenCompatError` before any model call |
+
+Mutation checks: handling disabled (the F3 bug) → 7 failures; validation removed → 4 failures (the malformed responses); records not attached → 13 failures.
+
+## 4. Verification (exact)
+
+| Command | Result |
+|---|---|
+| `uv run pytest tests/test_orchestrator_failure.py -q` | **28 passed** |
+| delegation, e2e, limits, loop guards and tools tests | **290 passed** |
+| `uv run pytest -q` | **676 passed, 3 skipped** (73 s) |
+| `uv lock --check` | Resolved 157 packages, unchanged |
+
+Two mistakes in my first draft of the tests were caught and fixed before the results above: the "records reach a propagating error" test patched `Agent.run` for the worker as well as the orchestrator, and one assertion assumed the worker's `error_type` was the same in both modes.
+
+## 5. New finding
+
+| ID | Severity | Type | Component | Issue | Evidence | Recommended action |
+|---|---|---|---|---|---|---|
+| F13 | P3 | Verified defect (synthetic trigger; effGen never builds such an error) | `delegation.DelegateTool._delegate` (the `except RunStoppedError` branch) | A worker whose `Agent.run` raises a `RunStoppedError` whose `response` is missing or malformed makes `_from_response(worker, exc.response)` fail inside the handler (`AttributeError`); the delegate tool call fails and **no `WorkerRecord` is created**, so the failure disappears from the run's records | Throwaway script: the worker's `Agent.run` raised `RunStoppedError` with `response=None`; the harness result had `records: []` and the orchestrator carried on to `done` | During the delegation-hardening work: validate the response as `Harness.run` now does and fall back to a failed report built from `str(exc)`. Not fixed here (outside F3's scope; delegation logic was not to be touched) |
+
+## 6. State of the review's findings
+
+- **P1: F1, F2, F3 closed.**
+- Open: F4 (Ollama server context vs `context_length`, T3.3), F5 (T5.0 must set effGen flags explicitly), F6 (unload a model `build_model` rejects), F7 (generation settings in config), F8 (shell timeout vs worker deadline, T5.0), F9 (Windows/WSL2 platform), F10 (test-quality nits), F11 (size target in the architecture doc), F12 (commit hygiene: the T4.2/F1/F2 work is now committed as `1d7d2d3`; F3 is not), F13 (new, above).
