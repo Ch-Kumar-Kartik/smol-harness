@@ -422,3 +422,13 @@ Two mistakes in my first draft of the tests were caught and fixed before the res
 
 - **P1: F1, F2, F3 closed.**
 - Open: F4 (Ollama server context vs `context_length`, T3.3), F5 (T5.0 must set effGen flags explicitly), F6 (unload a model `build_model` rejects), F7 (generation settings in config), F8 (shell timeout vs worker deadline, T5.0), F9 (Windows/WSL2 platform), F10 (test-quality nits), F11 (size target in the architecture doc), F12 (commit hygiene: the T4.2/F1/F2 work is now committed as `1d7d2d3`; F3 is not), F13 (new, above).
+
+---
+
+# Follow-up 001-E: F5 and F8 addressed in T5.0 (2026-10-17, Sonnet 5.5)
+
+No P1 finding was reopened. Status of the two findings T5.0 absorbed:
+
+- **F5 (explicit effGen settings): addressed.** `build_harness_from_config` states, for every agent, the settings that matter instead of inheriting effGen defaults: `tool_calling_mode` (builder parameter, default `"react"`), `raise_on_error=False` (effGen's default is `True`), `enable_memory=False` (default `True`), `capability_probe=False` (default `True`: an extra probe generation), `enable_sub_agents=False` (default `True`), `max_iterations`, `system_prompt` (only when configured), and for Ollama the agent-side `max_context_length`. Tested through the `Agent`s the harness actually constructs. Still not configurable, deliberately (F7): `temperature` (effGen 0.7), `seed`, `max_tokens`, sampling parameters.
+- **F8 (shell timeout vs worker deadline): mitigated, not eliminated.** Verified first: a worker with a 2 s deadline that started `sleep 6` with `timeout=30` ran for 6.4 s (the command ran to its end; the cooperative check only fires before the next call), and with the default cap the overrun could reach 300 s. Now `DelegateTool` publishes the active worker's `DeadlineMiddleware` through a `ContextVar` (set inside the executor thread's own context copy, so it cannot leak) and `ShellTool` bounds its *effective* timeout by the whole seconds the worker has left (never below 1 s); the model's argument is not modified, and the report says "(all the time the worker had left)". Same scenario now: 2.4 s. **Remaining limits, documented and tested:** the deadline is still cooperative, so a single model generation in flight is never interrupted and, if no further call follows, the worker is reported `completed` although it overran; the effective shell timeout is rounded up to whole seconds with a 1 s floor plus the 2 s `timeout -k` grace; the orchestrator has no deadline and its shell keeps the model's own timeout; other future tools do not read the deadline.
+- F4 and F7 remain open for T3.3 and a later config task; the new `max_context_length` is agent-side only and cannot change Ollama's server context.

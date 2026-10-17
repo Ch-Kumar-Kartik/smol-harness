@@ -16,6 +16,8 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from effgen import Agent, AgentConfig, RunStoppedError
+from effgen.models.base import BaseModel
+from effgen.tools.base_tool import BaseTool
 
 from smol_harness.delegation import (
     DELEGATE_TOOL_NAME,
@@ -25,6 +27,9 @@ from smol_harness.delegation import (
     WorkerRegistry,
     validate_limits,
 )
+from smol_harness.config import AgentSpec, HarnessConfig
+from smol_harness.models import ModelCache
+from smol_harness.tools import build_tools
 
 # ---- effGen loop compatibility (docs/reviews/opus-review-001.md F1; audit Part 3, "F1 compatibility patch") ----------
 #
@@ -151,6 +156,34 @@ def uninstall_effgen_loop_compat_for_tests() -> None:
         _compat_class = _compat_original = None
 
 
+def initialize_runtime() -> None:
+    """The one call an application makes, once, before it builds or runs any harness.
+
+    Today that is installing the effGen loop compatibility patch (`install_effgen_loop_compat`, see its docstring: it is
+    explicit, idempotent and PROCESS-WIDE). The CLI calls this function first; so must any other entry point:
+
+        initialize_runtime()
+        config = load_config("harness.yaml")
+        with build_harness_from_config(config) as harness:
+            result = harness.run(task)
+
+    Nothing else installs the patch: not `Harness.__init__`, `Harness.run`, `build_harness_from_config` or `Harness.close`,
+    which also never uninstalls it. Raises `EffgenCompatError` (patching nothing) if this effGen is not the verified one.
+    """
+    install_effgen_loop_compat()
+
+
+def _require_loop_compat() -> None:
+    if not effgen_loop_compat_installed():
+        # Without the patch effGen would silently replay a recorded result instead of re-running an identical
+        # delegate/shell/file call (review F1); `delegate` is always marked, so every harness needs it.
+        raise EffgenCompatError(
+            "effGen's loop guards have not been patched for stateful tools: call "
+            "smol_harness.harness.initialize_runtime() (or install_effgen_loop_compat()) once, before any agent runs "
+            "(it is process-wide and explicit by design). Refusing to run, because identical repeat calls would return "
+            "stale recorded results.")
+
+
 @dataclass
 class HarnessResult:
     """Outcome of one `Harness.run`: the parent's answer plus this run's delegations."""
@@ -162,7 +195,18 @@ class HarnessResult:
     workers: list[WorkerRecord]
 
 
+class HarnessClosedError(RuntimeError):
+    """`Harness.run` was called after `Harness.close`."""
+
+
 class Harness:
+    """Runs tasks on one orchestrator and its registered workers.
+
+    `owned_cache` is a `ModelCache` this harness created and therefore closes (unloading its models, each once);
+    `build_harness_from_config` sets it when it made the cache itself. A harness never closes a cache it was merely
+    given, and `close()` never touches the effGen loop patch.
+    """
+
     def __init__(
         self,
         orchestrator: AgentConfig,
@@ -170,8 +214,11 @@ class Harness:
         worker_timeout_s: float | None = None,
         max_delegations: int | None = None,
         max_report_chars: int | None = None,
+        owned_cache: ModelCache | None = None,
     ) -> None:
         validate_limits(max_delegations, max_report_chars)  # fail at build time, not mid-run
+        self._owned_cache = owned_cache
+        self._closed = False
         self.max_delegations = max_delegations
         self.max_report_chars = max_report_chars
         if any(t.name == DELEGATE_TOOL_NAME for t in orchestrator.tools):
@@ -179,6 +226,29 @@ class Harness:
         self._orchestrator = orchestrator
         self.registry = registry
         self.worker_timeout_s = worker_timeout_s  # cooperative; see DeadlineMiddleware
+
+    def close(self) -> None:
+        """Release what this harness owns: the models of a cache it created. Idempotent; safe to call twice.
+
+        An injected cache is the caller's and is left open. The harness is marked closed first, so a failing unload
+        (`ExceptionGroup`, raised here once) cannot leave it half-open or make a second `close()` retry.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if self._owned_cache is not None:
+            self._owned_cache.close()
+
+    def __enter__(self) -> Harness:
+        return self
+
+    def __exit__(self, exc_type: object, exc: BaseException | None, tb: object) -> None:
+        try:
+            self.close()
+        except Exception as cleanup:
+            if exc is None:
+                raise
+            exc.add_note(f"smol-harness: closing the harness also failed: {cleanup!r}")  # the original stays the visible error
 
     def run(self, task: str) -> HarnessResult:
         """Run one task. Builds a fresh orchestrator `Agent` and record list per call.
@@ -193,19 +263,17 @@ class Harness:
         guardrail block, a bug), so it propagates unchanged, with this run's worker records on its `worker_records`
         attribute so that the work already done is not lost.
         """
+        if self._closed:
+            raise HarnessClosedError("this Harness is closed: its models may be unloaded. Build a new one (or keep this "
+                                     "one open for as long as it is needed, e.g. inside its `with` block).")
         records: list[WorkerRecord] = []
         delegate = DelegateTool(
             self.registry, records, self.worker_timeout_s,
             max_delegations=self.max_delegations, max_report_chars=self.max_report_chars,
         )
         config = replace(self._orchestrator, tools=[*self._orchestrator.tools, delegate], enable_sub_agents=False)
-        if any(getattr(tool, STATEFUL_TOOL_MARKER, False) for tool in config.tools) and not effgen_loop_compat_installed():
-            # `delegate` is always marked, so this always applies: without the patch effGen would silently replay a
-            # recorded result instead of re-running an identical delegate/shell/file call (review F1).
-            raise EffgenCompatError(
-                "effGen's loop guards have not been patched for stateful tools: call "
-                "smol_harness.harness.install_effgen_loop_compat() once, before any agent runs (it is process-wide and "
-                "explicit by design). Refusing to run, because identical repeat calls would return stale recorded results.")
+        if any(getattr(tool, STATEFUL_TOOL_MARKER, False) for tool in config.tools):
+            _require_loop_compat()  # `delegate` is always marked, so this always applies
         with Agent(config) as agent:
             try:
                 response = agent.run(task)
@@ -255,14 +323,87 @@ def build_harness(
     worker_timeout_s: float | None = None,
     max_delegations: int | None = None,
     max_report_chars: int | None = None,
+    owned_cache: ModelCache | None = None,
 ) -> Harness:
     """Register `workers` (name -> config) and return a `Harness` for `orchestrator`.
 
     `worker_timeout_s` is a cooperative per-delegation deadline; `max_delegations` caps
     delegation attempts per `run`; `max_report_chars` caps each report's serialized size.
-    None = no limit for all three.
+    None = no limit for all three. `owned_cache`: a cache the returned harness will close.
     """
     registry = WorkerRegistry()
     for name, config in workers.items():
         registry.register(name, config, (descriptions or {}).get(name, ""))
-    return Harness(orchestrator, registry, worker_timeout_s, max_delegations, max_report_chars)
+    return Harness(orchestrator, registry, worker_timeout_s, max_delegations, max_report_chars, owned_cache)
+
+
+TOOL_CALLING_MODES = ("auto", "native", "react", "hybrid")  # AgentConfig.tool_calling_mode (effGen core/agent_config.py)
+
+
+def _agent_config(spec: AgentSpec, model: BaseModel, tools: list[BaseTool], tool_calling_mode: str) -> AgentConfig:
+    """One `AgentConfig` with every setting that matters stated, so no effGen default decides it silently (review F5).
+
+    Set from our config: name, model (the shared instance), tools (this agent's own instances), `max_iterations`, the
+    system prompt (only when configured; otherwise effGen's own "You are a helpful AI assistant."), and for Ollama the
+    agent-side `max_context_length`. Fixed by the harness: `tool_calling_mode`; `raise_on_error=False` (an effGen run
+    failure becomes a failed response, which `Harness.run` and `DelegateTool` turn into structured results; effGen's
+    default `True` raises instead); `enable_memory=False` (workers must not share state; no long-term store);
+    `capability_probe=False` (no extra generation to probe the model); `enable_sub_agents=False` (delegation is only the
+    orchestrator's `delegate` tool, depth 1). Not set, because our config has no field for them (review F7): `temperature`
+    (effGen 0.7), `seed`, `max_tokens`, sampling parameters.
+
+    `max_context_length` limits the *agent's* prompt budget. It cannot change the Ollama server's own context window
+    (`num_ctx`), which the server or its Modelfile fixes (review F4); Hugging Face specs have no such field yet.
+    """
+    extra: dict[str, Any] = {}
+    if spec.system_prompt is not None:
+        extra["system_prompt"] = spec.system_prompt
+    if spec.model.provider == "ollama":
+        extra["max_context_length"] = spec.model.context_length
+    return AgentConfig(
+        name=spec.name, model=model, tools=tools, max_iterations=spec.max_iterations, tool_calling_mode=tool_calling_mode,
+        raise_on_error=False, enable_memory=False, capability_probe=False, enable_sub_agents=False, **extra,
+    )
+
+
+def build_harness_from_config(
+    config: HarnessConfig, *, cache: ModelCache | None = None, tool_calling_mode: str = "react",
+) -> Harness:
+    """A runnable `Harness` for a validated `HarnessConfig`.
+
+    Call `initialize_runtime()` first. Order matters: (1) the effGen patch must be installed; (2) every agent's tools are
+    built, orchestrator first, so a bad workspace, a dangerous root or an unavailable shell (`ToolBuildError`) fails
+    before any model is loaded; (3) models come from one `ModelCache`, so agents with equal `ModelSpec`s share one
+    instance (their contexts stay independent: each delegation is a fresh `Agent`); (4) the agents are configured
+    (`_agent_config`) and the workers registered with the configured limits.
+
+    `tool_calling_mode` applies to every agent assembled here (it is not a YAML field); ReAct is the only mode verified
+    with the small local model (audit §1.12).
+
+    Ownership: with no `cache`, the harness creates one and owns it (`Harness.close()` unloads its models, each once).
+    A `cache` you pass stays yours; the harness never closes it, and models already loaded into it stay loaded if
+    assembly fails. If assembly fails, a cache this call created is closed before the original exception propagates.
+    """
+    if tool_calling_mode not in TOOL_CALLING_MODES:
+        raise ValueError(f"tool_calling_mode must be one of {TOOL_CALLING_MODES}, got {tool_calling_mode!r}")
+    _require_loop_compat()
+    specs = [config.orchestrator, *config.workers]
+    tools = [build_tools(spec.tools, config.workspace) for spec in specs]  # before any model is loaded
+    owned = ModelCache() if cache is None else None
+    models = owned if owned is not None else cache
+    try:
+        configs = [_agent_config(spec, models.get(spec.model), agent_tools, tool_calling_mode)
+                   for spec, agent_tools in zip(specs, tools, strict=True)]
+        return build_harness(
+            configs[0], {spec.name: agent for spec, agent in zip(config.workers, configs[1:], strict=True)},
+            {spec.name: spec.description for spec in config.workers},
+            worker_timeout_s=config.limits.worker_timeout_s, max_delegations=config.limits.max_delegations,
+            max_report_chars=config.limits.max_report_chars, owned_cache=owned,
+        )
+    except BaseException as exc:
+        if owned is not None:
+            try:
+                owned.close()
+            except Exception as cleanup:  # the assembly error stays the one that is raised
+                exc.add_note(f"smol-harness: releasing the models loaded so far also failed: {cleanup!r}")
+        raise

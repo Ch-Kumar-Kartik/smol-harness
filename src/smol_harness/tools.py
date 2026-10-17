@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import os
 import platform
 import re
@@ -25,7 +26,7 @@ from effgen.security.sandbox import SandboxConfig, SandboxResult, SubprocessSand
 from effgen.tools.base_tool import BaseTool, ParameterSpec, ParameterType, ToolCategory, ToolMetadata
 from effgen.tools.builtin.file_ops import FileOperations
 
-from smol_harness.delegation import DELEGATE_TOOL_NAME, STATEFUL_TOOL_MARKER
+from smol_harness.delegation import DELEGATE_TOOL_NAME, STATEFUL_TOOL_MARKER, remaining_worker_seconds
 
 
 class ToolBuildError(ValueError):
@@ -225,6 +226,13 @@ class ShellTool(BaseTool):
     async def _execute(self, command: str, timeout: int | None = None) -> dict[str, Any]:
         timeout_s = self.DEFAULT_TIMEOUT_S if timeout is None else timeout
         timeout_s = min(timeout_s, self._max_timeout_s)
+        # A worker's deadline is only checked between calls (DeadlineMiddleware), so a command started with a longer
+        # timeout would outlive it by up to that timeout (review F8). Bound the effective timeout by the time the
+        # worker has left; the model's own argument is not touched, and the report says when this applied.
+        left = remaining_worker_seconds()
+        limited = left is not None and max(1, math.ceil(left)) < timeout_s
+        if limited:
+            timeout_s = max(1, math.ceil(left))
         if not self._verified:
             # Before the first real command, prove the sandbox is enforced by running a fixed no-op through
             # the same path. A degraded effGen sandbox would run *that* unconfined, never a model command.
@@ -244,7 +252,7 @@ class ShellTool(BaseTool):
         ok = result.exit_code == 0 and not timed_out
         stdout, out_cut = _tail(result.stdout, self.MAX_OUTPUT_CHARS)
         stderr, err_cut = _tail(result.stderr, self.MAX_OUTPUT_CHARS)
-        report = _report(_echo(command), result.exit_code, timed_out, timeout_s, stdout, stderr)
+        report = _report(_echo(command), result.exit_code, timed_out, timeout_s, stdout, stderr, limited)
         out: dict[str, Any] = {
             "success": ok, "exit_code": result.exit_code, "timed_out": timed_out, "stdout": stdout, "stderr": stderr,
             "truncated": out_cut or err_cut, "filesystem_confined": True, "network_isolated": True,
@@ -278,12 +286,13 @@ def _echo(command: str) -> str:
     return f"{line[:ECHO_CHARS]}... [{len(line) - ECHO_CHARS} more chars, sha256 {digest}]"
 
 
-def _report(echo: str, exit_code: int, timed_out: bool, timeout_s: int, stdout: str, stderr: str) -> str:
+def _report(echo: str, exit_code: int, timed_out: bool, timeout_s: int, stdout: str, stderr: str, limited: bool = False) -> str:
     # The echo makes two different silent commands (`exit code: 0` each) read differently: effGen ends a run in
     # which different calls return the same result text (review F2). The structured fields stay unprefixed.
     lines = [f"$ {echo}"]
     if timed_out:
-        lines.append(f"timed out after {timeout_s}s: the command and every process it started were killed")
+        why = " (all the time the worker had left)" if limited else ""
+        lines.append(f"timed out after {timeout_s}s{why}: the command and every process it started were killed")
     lines.append(f"exit code: {exit_code}")
     for label, text in (("stdout", stdout), ("stderr", stderr)):
         if text.strip():

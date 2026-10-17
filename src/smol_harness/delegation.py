@@ -77,6 +77,10 @@ class DeadlineMiddleware(AgentMiddleware):
         self._deadline = clock() + timeout_s  # monotonic: immune to wall-clock changes
         self.expired = False
 
+    def remaining(self) -> float:
+        """Seconds left before the deadline (negative once it has passed)."""
+        return self._deadline - self._clock()
+
     def _check(self, before: str) -> None:
         if self._clock() >= self._deadline:
             self.expired = True
@@ -87,6 +91,18 @@ class DeadlineMiddleware(AgentMiddleware):
 
     def before_tool_call(self, ctx: Any) -> None:
         self._check(f"tool {ctx.tool_name!r}")
+
+
+# The deadline of the worker run in progress, for tools that can bound themselves by it (ShellTool, review F8). Set by
+# `DelegateTool._run_worker` inside the executor thread's own copy of the context, so it neither leaks to the caller nor
+# to another delegation. effGen's tool execution sees it (verified: audit Part 3, T5.0).
+_active_deadline: contextvars.ContextVar[DeadlineMiddleware | None] = contextvars.ContextVar("smol_active_deadline", default=None)
+
+
+def remaining_worker_seconds() -> float | None:
+    """Seconds left on the current worker's deadline, or None outside a deadline-bound worker run."""
+    deadline = _active_deadline.get()
+    return None if deadline is None else deadline.remaining()
 
 
 @dataclass
@@ -412,5 +428,9 @@ class DelegateTool(BaseTool):
 
     @staticmethod
     def _run_worker(agent: Agent, prompt: str, deadline: DeadlineMiddleware | None):
-        with agent:  # close() after the run; the shared model is not unloaded (audit §1.4)
-            return agent.run(prompt, middleware=[deadline]) if deadline else agent.run(prompt)
+        token = _active_deadline.set(deadline)
+        try:
+            with agent:  # close() after the run; the shared model is not unloaded (audit §1.4)
+                return agent.run(prompt, middleware=[deadline]) if deadline else agent.run(prompt)
+        finally:
+            _active_deadline.reset(token)
