@@ -1058,3 +1058,48 @@ def test_command_echo_cannot_pass_for_an_effgen_failure_or_hide_one(shell):
     failing = sh(shell, "echo Error executing tool; exit 2")  # output that imitates effGen's own error prefix
     assert not failing.success and "exit code: 2" in failing.error
     assert not is_error_result(out(sh(shell, "echo hi"))["result"])  # a success never reads as an error to effGen
+
+
+# ======================================================================================================
+# T5.2a defect: effGen's sandbox prologue leaves one empty `tmp.XXXXXXXXXX` directory per command (mktemp -d for its
+# credential masking). With a workspace under the system temp dir, TMPDIR is the workspace, so the litter lands where the
+# agent can list it. The shell removes what a run created there and leaves everything else alone.
+# ======================================================================================================
+def litter(ws: Path) -> list[str]:
+    import re
+    return sorted(p.name for p in ws.iterdir() if re.fullmatch(r"tmp\.[A-Za-z0-9]{10}", p.name))
+
+
+@linux_only
+def test_commands_leave_no_sandbox_litter_in_a_workspace_under_the_temp_dir(shell, layout):
+    ws = layout[0]
+    for command in ("true", "echo hi", "exit 3", "mkdir sub && touch sub/x", "sleep 20"):
+        sh(shell, command, **({"timeout": 1} if command.startswith("sleep") else {}))  # successes, a failure and a timeout
+    assert litter(ws) == [] and sorted(p.name for p in ws.iterdir()) == ["a.txt", "sub"]
+    assert shell._clean_litter is True
+
+
+@linux_only
+def test_litter_cleanup_only_removes_new_empty_directories_with_effgens_name(shell, layout):
+    ws = layout[0]
+    (ws / "tmp.preexisting").mkdir()  # wrong shape of name
+    (ws / "tmp.AbCdEfGhIj").mkdir()  # effGen's shape, but it was here before the run
+    sh(shell, "mkdir tmp.KeepMe.d && mkdir tmp.0123456789 && touch tmp.0123456789/file && mkdir not-litter")
+    assert (ws / "tmp.preexisting").is_dir() and (ws / "tmp.AbCdEfGhIj").is_dir()  # older directories are never touched
+    assert (ws / "tmp.0123456789" / "file").exists()  # a new directory with content is not litter (rmdir refuses it)
+    assert (ws / "tmp.KeepMe.d").is_dir() and (ws / "not-litter").is_dir()  # other names are not litter
+    assert litter(ws) == ["tmp.0123456789", "tmp.AbCdEfGhIj"]  # exactly the two that must survive
+
+
+@linux_only
+def test_a_workspace_outside_the_temp_dir_is_not_scanned_or_cleaned(layout, tmp_path):
+    # The litter then lands in the host /tmp, shared with other programs: removing "new empty tmp.* directories" there could
+    # delete somebody else's. It is left alone (audit Part 3, T5.2a) and the workspace is not touched either.
+    elsewhere = Path(tempfile.mkdtemp(prefix=".t52-ws-", dir=Path(__file__).resolve().parents[1]))
+    try:
+        tool = ShellTool(elsewhere)
+        assert tool._clean_litter is False
+        sh(tool, "echo hi")
+        assert list(elsewhere.iterdir()) == []  # and nothing was created in the workspace either
+    finally:
+        shutil.rmtree(elsewhere, ignore_errors=True)

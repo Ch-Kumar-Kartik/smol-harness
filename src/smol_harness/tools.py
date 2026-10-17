@@ -17,6 +17,7 @@ import platform
 import re
 import shlex
 import shutil
+import tempfile
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path, PurePath
@@ -164,6 +165,8 @@ class ShellTool(BaseTool):
         self._max_timeout_s = max_timeout_s
         self._sandbox = SubprocessSandbox()  # the backend is pinned: never `auto`, never `off`
         self._verified = False
+        temp = Path(tempfile.gettempdir()).resolve()  # the same test effGen applies when it points TMPDIR at the workspace
+        self._clean_litter = self._workspace == temp or temp in self._workspace.parents
         super().__init__(metadata=ToolMetadata(
             name="shell",
             description=(
@@ -198,7 +201,28 @@ class ShellTool(BaseTool):
             return False, "Parameter 'command' must contain a command and no NUL characters"
         return super().validate_parameters(**kwargs)
 
+    def _litter(self) -> set[str]:
+        try:
+            return {name for name in os.listdir(self._workspace) if SANDBOX_LITTER.fullmatch(name)}
+        except OSError:
+            return set()
+
+    def _remove_new_litter(self, before: set[str]) -> None:
+        for name in self._litter() - before:  # only what this very run created, only if empty (rmdir refuses anything else)
+            try:
+                os.rmdir(self._workspace / name)
+            except OSError:
+                pass
+
     async def _run_in_sandbox(self, script: str, timeout_s: int) -> SandboxResult:
+        before = self._litter() if self._clean_litter else None
+        try:
+            return await self._run_in_sandbox_unchecked(script, timeout_s)
+        finally:
+            if before is not None:
+                self._remove_new_litter(before)
+
+    async def _run_in_sandbox_unchecked(self, script: str, timeout_s: int) -> SandboxResult:
         config = SandboxConfig(
             backend="subprocess", timeout=timeout_s + self.SANDBOX_SLACK_S, memory_limit=self._memory_limit,
             docker_image="unused", network_enabled=False, workdir=str(self._workspace),
@@ -271,6 +295,12 @@ def _tail(text: str, limit: int) -> tuple[str, bool]:
 
 
 ECHO_CHARS = 200
+
+# effGen's sandbox prologue runs `mktemp -d` (to mask credential stores) and never removes the directory, so every command
+# leaves one empty `tmp.XXXXXXXXXX` behind (audit Part 3, T5.2a). Without a workspace under the system temp directory it lands
+# in the host /tmp, which is shared with other programs and therefore left alone; with one, TMPDIR is the workspace itself
+# and the litter lands where the agent can list it.
+SANDBOX_LITTER = re.compile(r"tmp\.[A-Za-z0-9]{10}")
 
 
 def _echo(command: str) -> str:

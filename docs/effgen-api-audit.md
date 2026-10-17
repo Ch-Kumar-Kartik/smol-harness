@@ -505,6 +505,13 @@ Status values: Not started, In progress, Implemented (unverified), Tested, Block
 - **Deadline behaviour measured:** worker deadline 2 s + shell `sleep 6` with requested timeout 30: 6.4 s before the bound, 2.4 s after. A single model generation in flight is never interrupted, and a worker whose last call overran is reported `completed` (no later check runs).
 - Closing a worker/orchestrator `Agent` does not unload its model (audit §1.4), so `ModelCache` is the only owner and unloads each distinct model once (tested with a model shared by two workers).
 
+### 2026-10-17 – T5.2a: the sandbox leaves an empty `tmp.XXXXXXXXXX` directory per command (verified defect)
+- Files: `src/smol_harness/tools.py` (`ShellTool._run_in_sandbox`, `SANDBOX_LITTER`), `tests/test_tools.py` (+3), `tests/test_e2e_coding.py`.
+- **Behaviour (effGen 1.3.0, `security/sandbox.py` `_deny_reads_script`, line ~264):** the sandbox prologue starts with `__deny=$(mktemp -d)` and mounts a tmpfs on it (inside its private mount namespace) to mask credential stores. Nothing removes the directory afterwards. Every command therefore leaves one empty `tmp.XXXXXXXXXX` (10 alphanumerics, mode 700) on the host. Where it lands depends on the workspace: if it is under the system temp directory, effGen points `TMPDIR` at the workspace (`tmpdir_override`, ~line 829) and the directory appears **in the workspace**; otherwise it appears in the host `/tmp` (180 had accumulated on this host).
+- **Why it matters:** in the workspace it is visible to the agent (`file_operations list`) and to `ls`; `git status` does not show empty directories, so only a listing reveals it. It was found because T5.2a asserts the exact directory listing of the repository.
+- **Harness handling:** after each run `ShellTool` removes only directories that run created in the workspace root, whose name matches `tmp\.[A-Za-z0-9]{10}`, with `os.rmdir` (which refuses a non-empty directory); disabled when the workspace is outside the temp directory. **Not handled:** the host `/tmp` case, because deleting new empty `tmp.*` directories in the shared `/tmp` could remove another program's; they are empty and safe to delete by hand. No effGen change.
+- Verified in the same scenario (no defect): `git status`, `git add`, and `python -m pytest` work inside the sandbox on a repository owned by the invoking user (`--map-root-user` makes ownership match, so git's safe-directory check does not trigger); `PYTHONDONTWRITEBYTECODE=1` (set by the sandbox environment) keeps `__pycache__` out of the repository; `-p no:cacheprovider` keeps `.pytest_cache` out.
+
 (Further entries follow this format.)
 
 _Format for later entries:_ Add one entry per completed task in `docs/implementation-plan.md`, using this format:
