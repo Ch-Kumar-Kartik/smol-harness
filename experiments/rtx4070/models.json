@@ -1,0 +1,91 @@
+{
+  "schema": 1,
+  "note": "Single source of truth for the RTX 4070 package. Sizes and digests were read from the Ollama registry and the Hugging Face API on 2026-10-17 (metadata only, nothing downloaded). VRAM figures are ESTIMATES: nothing here was run on the target GPU.",
+  "locked_stack": {
+    "effgen": "1.3.0",
+    "torch": "2.14.1 (CUDA 13.0 runtime installed as pip packages; no CUDA toolkit needed)",
+    "transformers": "5.20.0",
+    "min_driver_cuda_version": "13.0",
+    "min_driver_hint": "NVIDIA driver 580 or newer on Windows (it provides CUDA 13.0 to WSL2)"
+  },
+  "bitsandbytes": {
+    "pin": "0.50.2",
+    "wheel_bytes": 43000000,
+    "note": "NOT in uv.lock. Installed by `rtx4070.py install-deps` with an exact pin. Whether this release has working CUDA 13 kernels for the RTX 4070 is UNVERIFIED until stage C runs."
+  },
+  "min_requirements": {
+    "gpu_name_contains": "4070",
+    "disk_free_gib_fail_below": 25,
+    "disk_free_gib_warn_below": 35,
+    "ram_gib_fail_below": 6,
+    "ram_gib_warn_below": 10,
+    "vram_free_mib_fail_below": 6000,
+    "vram_free_mib_warn_below": 10000
+  },
+  "profiles": {
+    "primary": {
+      "description": "7B Q4_K_M orchestrator on Ollama + 1.5B coder worker on Hugging Face quantized to NF4 with bitsandbytes.",
+      "min_total_vram_mib": 11000,
+      "ollama": {
+        "base_model": "qwen2.5:7b-instruct-q4_K_M",
+        "manifest_digest": "845dbda0ea48ed749caafd9e6037047aa19acfcfd82e704d7ca97d631a0b697e",
+        "download_bytes": 4683073952,
+        "derived_tag": "smol-orch:8k",
+        "num_ctx": 8192,
+        "num_predict": 1024
+      },
+      "hf": {
+        "repo": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+        "revision": "2e1fd397ee46e1388853d2af2c993145b0f1098a",
+        "allow_patterns": ["config.json", "generation_config.json", "merges.txt", "model.safetensors", "tokenizer.json", "tokenizer_config.json", "vocab.json", "LICENSE"],
+        "safetensors_bytes": 3087467144,
+        "download_bytes": 3098973788,
+        "quantization": "bnb-4bit-nf4",
+        "dtype": "bf16"
+      },
+      "estimated_vram_gib": {
+        "ollama_7b_q4_weights": 4.4,
+        "ollama_kv_cache_8k_ctx": 0.5,
+        "ollama_runtime_overhead": 0.6,
+        "hf_1p5b_nf4_weights": 1.2,
+        "hf_kv_and_activations": 0.4,
+        "cuda_contexts": 0.8,
+        "windows_desktop_share": 1.0,
+        "total": 8.9,
+        "of": 12.0
+      }
+    },
+    "fallback": {
+      "description": "Conservative: 3B Q4_K_M orchestrator on Ollama + the same 1.5B worker in plain fp16 (no bitsandbytes needed).",
+      "min_total_vram_mib": 9000,
+      "ollama": {
+        "base_model": "qwen2.5:3b-instruct-q4_K_M",
+        "manifest_digest": "357c53fb659c5076de1d65ccb0b397446227b71a42be9d1603d46168015c9e4b",
+        "download_bytes": 1929903008,
+        "derived_tag": "smol-orch-small:8k",
+        "num_ctx": 8192,
+        "num_predict": 1024
+      },
+      "hf": {
+        "repo": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+        "revision": "2e1fd397ee46e1388853d2af2c993145b0f1098a",
+        "allow_patterns": ["config.json", "generation_config.json", "merges.txt", "model.safetensors", "tokenizer.json", "tokenizer_config.json", "vocab.json", "LICENSE"],
+        "safetensors_bytes": 3087467144,
+        "download_bytes": 3098973788,
+        "quantization": "none",
+        "dtype": "fp16"
+      },
+      "estimated_vram_gib": {
+        "ollama_3b_q4_weights": 1.8,
+        "ollama_kv_cache_8k_ctx": 0.3,
+        "ollama_runtime_overhead": 0.5,
+        "hf_1p5b_fp16_weights": 3.1,
+        "hf_kv_and_activations": 0.4,
+        "cuda_contexts": 0.8,
+        "windows_desktop_share": 1.0,
+        "total": 7.9,
+        "of": 12.0
+      }
+    }
+  }
+}

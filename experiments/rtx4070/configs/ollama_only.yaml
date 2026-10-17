@@ -1,0 +1,33 @@
+# Stage B: ONE Ollama model plays both roles (orchestrator and worker). Tests the Ollama path of the harness on its own.
+# Names wrapped in double underscores are placeholders filled in by rtx4070.py; never edit the rendered copies by hand.
+workspace: "__WORKSPACE__"
+
+limits:
+  max_delegations: 2
+  max_report_chars: 3000
+  worker_timeout_s: 300
+
+orchestrator:
+  model:
+    provider: ollama
+    model: "__OLLAMA_MODEL__"          # the derived tag created by `prepare` (server-side context fixed in its Modelfile)
+    quantization: server
+    context_length: __OLLAMA_CTX__     # MUST equal the derived model's num_ctx; checked by the preflight
+    base_url: "__OLLAMA_BASE_URL__"
+  tools: []
+  max_iterations: 6
+  system_prompt: >-
+    You coordinate worker agents. Split the user's task into self-contained pieces, delegate them
+    with the delegate tool, and answer from the workers' reports.
+
+workers:
+  - name: "__WORKER_NAME__"
+    description: "__WORKER_DESCRIPTION__"
+    model:
+      provider: ollama
+      model: "__OLLAMA_MODEL__"
+      quantization: server
+      context_length: __OLLAMA_CTX__
+      base_url: "__OLLAMA_BASE_URL__"
+    tools: __WORKER_TOOLS__
+    max_iterations: 8

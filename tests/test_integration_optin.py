@@ -17,13 +17,22 @@ def _pytest(*args: str, extra_env: dict[str, str] | None = None) -> subprocess.C
                           cwd=ROOT, env=env, capture_output=True, text=True, timeout=300)
 
 
+def _real_model_test_count() -> int:
+    """How many real-model tests exist, from collection itself, so that adding one never needs this guard edited."""
+    run = _pytest("tests/integration", "--collect-only")
+    assert run.returncode == 0, run.stdout + run.stderr
+    count = sum(1 for line in run.stdout.splitlines() if "::" in line)
+    assert count >= 3, run.stdout  # the three tests that existed when this guard was written
+    return count
+
+
 def test_real_model_tests_are_skipped_without_the_flag():
     run = _pytest("tests/integration", "-rs")  # every real-model test, including future ones
     assert run.returncode == 0, run.stdout + run.stderr
-    assert "3 skipped" in run.stdout and "--run-real-models" in run.stdout
+    assert f"{_real_model_test_count()} skipped" in run.stdout and "--run-real-models" in run.stdout  # ALL of them
     assert "passed" not in run.stdout and "failed" not in run.stdout
 
 
 def test_the_marker_alone_does_not_opt_in():
     run = _pytest("tests/integration", "-m", "real_model")
-    assert run.returncode == 0 and "3 skipped" in run.stdout
+    assert run.returncode == 0 and f"{_real_model_test_count()} skipped" in run.stdout

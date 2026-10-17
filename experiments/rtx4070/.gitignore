@@ -1,0 +1,4 @@
+# Everything a run produces stays out of Git: results (and their archives), rendered configs, generated Modelfiles.
+results/
+generated/
+__pycache__/
