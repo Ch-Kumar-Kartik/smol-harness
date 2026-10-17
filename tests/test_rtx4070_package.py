@@ -16,10 +16,12 @@ import json
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
 import threading
+import time
 from collections import namedtuple
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -134,7 +136,8 @@ def host(tmp_path, monkeypatch):
     monkeypatch.setattr(rtx, "DEV_DXG", tmp_path / "dxg")
     monkeypatch.setattr(rtx, "MEMINFO", tmp_path / "meminfo")
     monkeypatch.setattr(rtx, "PROC_MOUNTS", tmp_path / "mounts")
-    monkeypatch.setattr(rtx, "BINFMT_WSL_INTEROP", tmp_path / "no-such-binfmt")  # interop off: the handler file is absent
+    (tmp_path / "binfmt_misc").mkdir()  # interop off: no WSLInterop* registration in the directory
+    monkeypatch.setattr(rtx, "BINFMT_DIR", tmp_path / "binfmt_misc")
     monkeypatch.delenv("WSL_INTEROP", raising=False)
     real_which = shutil.which
     monkeypatch.setattr(rtx.shutil, "which", lambda name, *a, **k: None if name.endswith(".exe") else real_which(name, *a, **k))
@@ -460,6 +463,15 @@ import json, os, pathlib, signal, subprocess, sys, time
 stage, run_dir = sys.argv[1], pathlib.Path(sys.argv[sys.argv.index("--run-dir") + 1])
 behaviour = json.loads((run_dir.parent / "behaviour.json").read_text()).get(stage, "pass")
 (run_dir / "ran_stages.log").open("a").write(stage + "\\n")
+(run_dir / ("stage_" + stage + ".pid")).write_text(str(os.getpid()))
+
+def spawn_child_and_wait():
+    # a helper process in the stage's group, like a model server or a shell command, and a marker that says "I am running"
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+    (run_dir / "child.pid").write_text(str(child.pid))
+    (run_dir / "ready.flag").write_text("1")
+    time.sleep(600)
+
 if behaviour == "pass":
     out = run_dir / ("stage_" + stage); out.mkdir(exist_ok=True)
     (out / "result.json").write_text(json.dumps({"stage": stage, "status": "pass", "summary": "stub ok", "unverified": ["stub: not measurable"]}))
@@ -469,13 +481,12 @@ elif behaviour == "task_fail":
 elif behaviour == "crash":
     sys.stderr.write("Traceback ... hf_abcdefghijklmnopqrstuvwxyz0123 CUDA out of memory\\n"); sys.exit(3)
 elif behaviour == "hang":
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
-    (run_dir / "child.pid").write_text(str(child.pid)); time.sleep(600)
+    spawn_child_and_wait()
 elif behaviour in ("load", "load_then_hang", "load_then_crash"):
     # a stage that leaves OUR Ollama model on the GPU, like stage B does: the driver must unload it whatever happens next
     (run_dir.parent / "ollama_loaded.flag").write_text("1")
     if behaviour == "load_then_hang":
-        time.sleep(600)
+        spawn_child_and_wait()
     if behaviour == "load_then_crash":
         sys.exit(4)
     out = run_dir / ("stage_" + stage); out.mkdir(exist_ok=True)
@@ -483,7 +494,14 @@ elif behaviour in ("load", "load_then_hang", "load_then_crash"):
 elif behaviour == "attempts_then_hang":
     out = run_dir / ("stage_" + stage); out.mkdir(exist_ok=True)
     (out / "attempts.jsonl").write_text(json.dumps({"kind": "t", "attempt": 1, "token": "hf_abcdefghijklmnopqrstuvwxyz0123"}) + "\\n" + json.dumps({"kind": "t", "attempt": 2}) + "\\n")
-    time.sleep(600)
+    spawn_child_and_wait()
+elif behaviour == "load_attempts_ignore_term":
+    # worst case for an interrupt: model left loaded, attempts written, and a stage AND a child that both ignore SIGTERM
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    (run_dir.parent / "ollama_loaded.flag").write_text("1")
+    out = run_dir / ("stage_" + stage); out.mkdir(exist_ok=True)
+    (out / "attempts.jsonl").write_text(json.dumps({"kind": "t", "attempt": 1}) + "\\n")
+    spawn_child_and_wait()
 '''
 
 
@@ -1292,11 +1310,14 @@ def mounts_with(host, line: str) -> None:
 @pytest.mark.parametrize("arrange,expected", [
     (lambda h, m: mounts_with(h, "C:\\134 /mnt/c 9p rw,noatime,aname=drvfs 0 0"), "Windows drives or host file systems are mounted"),
     (lambda h, m: mounts_with(h, "drvfs /mnt/d drvfs rw 0 0"), "/mnt/d (drvfs)"),
-    (lambda h, m: ((h.tmp / "binfmt").write_text("enabled\ninterpreter /init\n"), m.setattr(rtx, "BINFMT_WSL_INTEROP", h.tmp / "binfmt")), "interop is enabled"),
+    (lambda h, m: (h.tmp / "binfmt_misc" / "WSLInterop").write_text("enabled\ninterpreter /init\n"), "WSLInterop)"),
+    (lambda h, m: (h.tmp / "binfmt_misc" / "WSLInterop-late").write_text("enabled\ninterpreter /init\nflags: PF\n"), "WSLInterop-late"),
+    (lambda h, m: (h.tmp / "binfmt_misc" / "WSLInterop-generic").mkdir(), "WSLInterop-generic"),  # exists but cannot be read as a file: fail closed
     (lambda h, m: m.setenv("WSL_INTEROP", "/run/WSL/12_interop"), "interop is enabled"),
     (lambda h, m: m.setattr(rtx.shutil, "which", lambda name, *a, **k: "/mnt/c/Windows/System32/cmd.exe" if name == "cmd.exe" else None), "cmd.exe"),
     (lambda h, m: m.setattr(rtx, "PROC_MOUNTS", h.tmp / "unreadable-mounts"), "/proc/mounts is unreadable"),
-], ids=["drive-mount", "second-drive", "binfmt-interop", "interop-env", "windows-exe-on-path", "mounts-unreadable-on-wsl"])
+], ids=["drive-mount", "second-drive", "binfmt-interop", "binfmt-interop-late", "binfmt-unreadable-registration", "interop-env", "windows-exe-on-path",
+        "mounts-unreadable-on-wsl"])
 def test_stage_e_is_refused_while_any_route_to_the_windows_host_exists(host, monkeypatch, arrange, expected):
     arrange(host, monkeypatch)
     state = preflight(phase="pre")["host_isolation"]
@@ -1446,6 +1467,30 @@ def test_the_guide_does_not_promise_more_than_the_redaction_does():
     assert "known credential formats" in text and "tar -tzf" in text
 
 
+# ---- RR-1 / RR-5: the guide must not break the colleague's WSL or push them into stage E early
+def test_the_guide_edits_wsl_conf_and_never_replaces_it_and_keeps_systemd():
+    readme = (PKG / "README.md").read_text()
+    assert "tee /etc/wsl.conf" not in readme and "> /etc/wsl.conf" not in readme  # the old recipe overwrote the whole file (and with it [boot] systemd=true)
+    assert "never replace it" in readme and "systemd=true" in readme and "only the lines you added" in readme
+    assert "systemd=true" in (PKG / "TROUBLESHOOTING.md").read_text()  # and the way back when Ollama stopped starting
+
+
+def test_the_guide_says_stage_e_is_not_part_of_the_first_round_and_does_not_ask_to_fix_its_failure():
+    readme = (PKG / "README.md").read_text()
+    assert "not part of this first round" in readme and "disabled on the default WSL2 setup and is not part of the initial handoff" in readme
+    assert readme.index("## Step 11.") < readme.index("## Stage E (NOT part of the first round)")  # the colleague finishes and sends A to D first
+    title = next(c["title"] for c in rtx.CHECKS if c["id"] == "host_isolation")
+    exception = '"Windows host is unreachable from the shell sandbox"'
+    assert exception.strip('"') in title and exception in readme and "do not change any WSL setting because of it" in readme
+    assert "except the stage-E-only one" in readme
+
+
+def test_the_guide_explains_ctrl_c_and_the_cleanup_after_a_closed_window():
+    readme, trouble = (PKG / "README.md").read_text(), (PKG / "TROUBLESHOOTING.md").read_text()
+    assert "Ctrl-C" in readme and "exits with code 130" in readme and "once" in readme
+    assert "pgrep -af stage_runner.py" in trouble and "ollama stop" in trouble and "130" in trouble
+
+
 # ---- R2-12 / R2-14 / R2-15
 def test_install_deps_stops_when_bitsandbytes_leaves_the_environment_inconsistent(host, monkeypatch, capsys):
     rec = Recorder(fail_at="pip check")
@@ -1486,6 +1531,137 @@ def test_the_runner_accounting_agrees_with_the_tested_evidence_helpers():
     assert sr.trajectories([{"trajectory": "a"}, {"trajectory": "a"}]) == ev.trajectories([{"trajectory": "a"}, {"trajectory": "a"}]) == {"attempts": 2, "distinct": 1}
     entries = [{"visible": "the file text"}]
     assert sr.result_reached_model(entries, ["... the file text ..."]) == ev.result_reached_model(entries, ["... the file text ..."]) is True
+
+
+# ====================================================================================================== RR-2: Ctrl-C must not leave a stage running
+def alive(pid: int) -> bool:
+    """True if the process exists and is not a zombie (a zombie has already exited and only waits to be reaped)."""
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except OSError:
+        return False
+    return state != "Z"
+
+
+def pid_of(run_dir: Path, name: str) -> int:
+    return int((run_dir / name).read_text())
+
+
+def interrupt_when_ready(sig=signal.SIGINT, wait_s: float = 30.0) -> threading.Thread:
+    """After the stub stage says it is running (its marker file), send `sig` to THIS process, exactly as a terminal Ctrl-C (or `kill`) would."""
+    def deliver():
+        deadline = time.time() + wait_s
+        while time.time() < deadline:
+            latest = rtx.RESULTS / "latest.txt"
+            if latest.exists() and (rtx.RESULTS / latest.read_text().strip() / "ready.flag").exists():
+                time.sleep(0.2)
+                os.kill(os.getpid(), sig)
+                return
+            time.sleep(0.05)
+
+    thread = threading.Thread(target=deliver, daemon=True)
+    thread.start()
+    return thread
+
+
+@pytest.fixture
+def real_sigint(monkeypatch):
+    """Python's own SIGINT behaviour (KeyboardInterrupt) whatever the test runner installed, restored afterwards."""
+    previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+    yield
+    signal.signal(signal.SIGINT, previous)
+
+
+@pytest.fixture
+def bystander():
+    """An unrelated process in its OWN session, like any other program on the machine. An interrupt must never touch it."""
+    process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"], start_new_session=True)
+    yield process
+    process.kill()
+    process.wait()
+
+
+def latest_run() -> Path:
+    return rtx.RESULTS / (rtx.RESULTS / "latest.txt").read_text().strip()
+
+
+def test_ctrl_c_stops_the_whole_stage_cleans_up_keeps_the_results_and_exits_130(stub_runner, host, real_sigint, bystander, capsys):
+    stub_runner(B="load_then_hang")
+    thread = interrupt_when_ready()
+    assert rtx.main(["run"]) == 130
+    thread.join(5)
+    run_dir = latest_run()
+    assert not alive(pid_of(run_dir, "stage_B.pid")) and not alive(pid_of(run_dir, "child.pid"))  # the stage AND what it started are gone
+    assert alive(bystander.pid)  # nothing outside the stage's process group was signalled
+    result = rtx.stage_result(run_dir, "B")
+    assert result["status"] == "fail" and result["interrupted"] is True and "interrupted by the user" in result["reason"]
+    assert not host.flag.exists() and [e for e in result["residency"] if e["when"] == "after stage B"][0]["verified"]  # our Ollama model was unloaded too
+    assert ran(run_dir) == ["B"] and rtx.stage_result(run_dir, "C") is None  # nothing after the interrupted stage was started
+    assert (run_dir / "summary.md").exists() and (run_dir / "manifest.json").exists()
+    assert "Interrupted" in capsys.readouterr().out
+    assert rtx.main(["package"]) == 0  # the partial run is packageable
+
+
+def test_an_interrupted_stage_keeps_the_attempts_it_had_finished(stub_runner, host, real_sigint):
+    stub_runner(B="attempts_then_hang")
+    assert rtx.main(["stage", "A"]) == 0
+    thread = interrupt_when_ready()
+    assert rtx.main(["stage", "B"]) == 130
+    thread.join(5)
+    result = rtx.stage_result(latest_run(), "B")
+    assert result["attempts_recorded"] == 2 and "2 finished attempt(s) were kept" in result["reason"]
+    assert "hf_abcdefghijklmnop" not in (latest_run() / "stage_B" / "stdout.log").read_text()
+
+
+def test_a_stage_that_ignores_sigterm_is_killed_after_the_grace_period_together_with_its_children(stub_runner, host, real_sigint, monkeypatch):
+    stub_runner(B="load_attempts_ignore_term")
+    monkeypatch.setattr(rtx, "INTERRUPT_GRACE_S", 1)
+    thread = interrupt_when_ready()
+    started = time.time()
+    assert rtx.main(["run"]) == 130
+    thread.join(5)
+    assert time.time() - started < 15  # bounded: the grace period, then SIGKILL
+    run_dir = latest_run()
+    assert not alive(pid_of(run_dir, "stage_B.pid")) and not alive(pid_of(run_dir, "child.pid"))
+    result = rtx.stage_result(run_dir, "B")
+    assert "stopped by force" in result["reason"] and result["attempts_recorded"] == 1 and not host.flag.exists()
+
+
+def test_sigterm_to_the_driver_is_handled_like_ctrl_c_and_the_handler_is_restored(stub_runner, host):
+    stub_runner(B="hang")
+    assert rtx.main(["stage", "A"]) == 0
+    before = signal.getsignal(signal.SIGTERM)
+    thread = interrupt_when_ready(signal.SIGTERM)
+    assert rtx.main(["stage", "B"]) == 130
+    thread.join(5)
+    assert not alive(pid_of(latest_run(), "stage_B.pid")) and not alive(pid_of(latest_run(), "child.pid"))
+    assert signal.getsignal(signal.SIGTERM) == before  # the driver does not leave its handler behind
+
+
+def test_an_interrupt_outside_a_stage_exits_130_with_a_message_and_no_traceback(host, monkeypatch, capsys):
+    monkeypatch.setattr(rtx, "cmd_status", lambda args: (_ for _ in ()).throw(KeyboardInterrupt()))
+    assert rtx.main(["status"]) == 130
+    out = capsys.readouterr()
+    assert "Interrupted" in out.out and "Traceback" not in out.out + out.err
+
+
+def test_terminate_group_ends_a_disposable_group_and_only_that_group(bystander):
+    leader = subprocess.Popen([sys.executable, "-c", "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)']); time.sleep(600)"],
+                              start_new_session=True)
+    time.sleep(0.5)
+    members = [int(line.split()[0]) for line in subprocess.run(["ps", "-o", "pid=", "-g", str(leader.pid)], capture_output=True, text=True).stdout.splitlines()]
+    assert len(members) == 2
+    assert rtx.terminate_group(leader, grace_s=5) is False  # exited on SIGTERM: no force needed
+    assert not any(alive(pid) for pid in members) and alive(bystander.pid)
+    rtx.terminate_group(leader, grace_s=1)  # a group that is already gone is not an error
+
+
+def test_a_disabled_or_unrelated_binfmt_registration_is_not_a_route(host):
+    (host.tmp / "binfmt_misc" / "WSLInterop").write_text("disabled\n")
+    (host.tmp / "binfmt_misc" / "python3.12").write_text("enabled\ninterpreter /usr/bin/python3.12\n")
+    facts = rtx.windows_bridge_facts()
+    assert facts["interop_registrations"] == [] and not facts["interop_binfmt_enabled"]
+    assert preflight(phase="pre")["host_isolation"]["status"] == rtx.PASS
 
 
 def test_this_test_module_never_loads_weights_or_starts_a_real_model():

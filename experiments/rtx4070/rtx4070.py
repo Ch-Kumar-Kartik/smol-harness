@@ -30,6 +30,7 @@ import signal
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -53,9 +54,11 @@ TIMEOUTS = {"B": 1500, "C": 1500, "D": 3600, "E": 3000}  # seconds: hard limit o
 CLEAN_SLATE_BEFORE = ("C", "D", "E")
 USES_OLLAMA = ("B", "D", "E")
 RELEASE_WAIT_S = 60  # how long to wait for Ollama to report a released model gone; never "wait for the keep-alive to expire"
+INTERRUPT_GRACE_S = 10  # after Ctrl-C / SIGTERM: time a stage gets to exit after SIGTERM before its process group is killed
+EXIT_INTERRUPTED = 130
 # module constants so tests can point them elsewhere
 PROC_VERSION, MEMINFO, DEV_DXG = Path("/proc/version"), Path("/proc/meminfo"), Path("/dev/dxg")
-PROC_MOUNTS, BINFMT_WSL_INTEROP = Path("/proc/mounts"), Path("/proc/sys/fs/binfmt_misc/WSLInterop")
+PROC_MOUNTS, BINFMT_DIR = Path("/proc/mounts"), Path("/proc/sys/fs/binfmt_misc")
 MAX_ARCHIVE_FILE_BYTES = 25 * 1024 * 1024
 WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".bin", ".pt", ".pth", ".ckpt", ".onnx")
 PASS, WARN, FAIL, UNVERIFIED, SKIP = "pass", "warn", "fail", "unverified", "skip"
@@ -258,7 +261,7 @@ def windows_bridge_facts() -> dict:
     A drive letter under /mnt (drvfs/9p) is a writable view of a Windows disk; WSL interop lets a Linux process start Windows programs, which then run
     OUTSIDE every Linux namespace the shell sandbox creates. /usr/lib/wsl (the GPU libraries) and /mnt/wslg are expected and not counted.
     """
-    facts: dict = {"windows_mounts": [], "interop_binfmt_enabled": False, "interop_env": bool(os.environ.get("WSL_INTEROP")), "windows_programs_on_path": [], "mounts_unreadable": False}
+    facts: dict = {"windows_mounts": [], "interop_binfmt_enabled": False, "interop_registrations": [], "interop_env": bool(os.environ.get("WSL_INTEROP")), "windows_programs_on_path": [], "mounts_unreadable": False}
     try:
         for line in PROC_MOUNTS.read_text().splitlines():
             parts = line.split()
@@ -268,10 +271,20 @@ def windows_bridge_facts() -> dict:
                     facts["windows_mounts"].append(f"{mountpoint} ({parts[2]})")
     except OSError:
         facts["mounts_unreadable"] = True
+    # WSL registers its interop handler as `WSLInterop`, and newer versions can add others (`WSLInterop-late`): look at every registration whose name
+    # starts with it. Fail closed: a registration that exists but cannot be read counts as enabled.
     try:
-        facts["interop_binfmt_enabled"] = BINFMT_WSL_INTEROP.read_text().lstrip().startswith("enabled")
+        registrations = sorted(BINFMT_DIR.glob("WSLInterop*"))
     except OSError:
-        pass
+        registrations = []
+    for registration in registrations:
+        try:
+            enabled = registration.read_text().lstrip().startswith("enabled")
+        except OSError:
+            enabled = True
+        if enabled:
+            facts["interop_registrations"].append(registration.name)
+    facts["interop_binfmt_enabled"] = bool(facts["interop_registrations"])
     facts["windows_programs_on_path"] = [name for name in ("cmd.exe", "powershell.exe", "explorer.exe") if shutil.which(name)]
     return facts
 
@@ -281,7 +294,8 @@ def bridges_exposed(facts: dict, wsl: bool) -> list:
     if facts["windows_mounts"]:
         problems.append("Windows drives or host file systems are mounted and writable from Linux: " + ", ".join(facts["windows_mounts"][:5]))
     if facts["interop_binfmt_enabled"] or facts["interop_env"]:
-        problems.append("Windows interop is enabled, so Linux commands can start Windows programs (cmd.exe, powershell.exe, any .exe) outside the sandbox")
+        problems.append("Windows interop is enabled" + (f" ({', '.join(facts['interop_registrations'])})" if facts["interop_registrations"] else "") +
+                        ", so Linux commands can start Windows programs (cmd.exe, powershell.exe, any .exe) outside the sandbox")
     if facts["windows_programs_on_path"]:
         problems.append("Windows programs are on PATH: " + ", ".join(facts["windows_programs_on_path"]))
     if wsl and facts["mounts_unreadable"]:
@@ -924,6 +938,48 @@ def set_stage(run_dir: Path, stage: str, status: str, reason: str = "", **extra)
     return result
 
 
+def terminate_group(process, grace_s: float | None = None) -> bool:
+    """Stop a stage's whole process group: SIGTERM, then SIGKILL if it is still there after the grace period. Returns True if SIGKILL was needed.
+
+    The stage was started with `start_new_session=True`, so its process group id is its pid and the group holds only the stage and what it started;
+    nothing else on the machine is signalled. Never raises: a group that is already gone is the goal.
+    """
+    grace_s = INTERRUPT_GRACE_S if grace_s is None else grace_s
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        process.wait(timeout=grace_s)
+        # the leader may exit while a child that ignores SIGTERM lives on in the group: the kill below is cheap and ends it
+        escalated = False
+    except subprocess.TimeoutExpired:
+        escalated = True
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    process.wait()
+    return escalated
+
+
+def drain(process, wait_s: float = 5.0) -> tuple:
+    """(stdout, stderr) of a stage whose group was just killed. Bounded: a process that left the group (its own session) could still hold the pipes open."""
+    try:
+        return process.communicate(timeout=wait_s)
+    except subprocess.TimeoutExpired:
+        for pipe in (process.stdout, process.stderr):
+            try:
+                pipe.close()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+        return "", "(the output pipes are still held by a process outside the stage's process group; its output was not collected)"
+
+
+def _raise_keyboard_interrupt(signum, frame):  # SIGTERM to the driver is handled like Ctrl-C
+    raise KeyboardInterrupt
+
+
 def partial_attempts(stage_dir: Path) -> dict:
     """What a stage that never reported (timeout, crash) still left behind: the runner appends every finished attempt to attempts.jsonl as it goes."""
     path = stage_dir / "attempts.jsonl"
@@ -973,14 +1029,22 @@ def run_stage(stage: str, ctx: Ctx, attempts: int = 3, production_defaults: bool
     stage_dir = run_dir / f"stage_{stage}"
     stage_dir.mkdir(parents=True, exist_ok=True)
     print(f"[run ] stage {stage}: {TITLES[stage]} (limit {TIMEOUTS[stage] // 60} min) ...")
-    process = subprocess.Popen(command, cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    process = None
+    interrupted = escalated = False
     try:
+        process = subprocess.Popen(command, cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         out, err = process.communicate(timeout=TIMEOUTS[stage])
         timed_out = False
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)  # the whole process group: no stray model or shell process survives
-        out, err = process.communicate()
+        out, err = drain(process)
         timed_out = True
+    except KeyboardInterrupt:
+        # Ctrl-C / SIGTERM reaches only the driver (the stage has its own session), so stop the stage ourselves, keep what it wrote, clean up, exit 130.
+        interrupted, timed_out, out, err = True, False, "", ""
+        if process is not None:
+            escalated = terminate_group(process)
+            out, err = drain(process)
     write_text(stage_dir / "stdout.log", out or "")
     write_text(stage_dir / "stderr.log", err or "")
     if stage in USES_OLLAMA:
@@ -989,6 +1053,9 @@ def run_stage(stage: str, ctx: Ctx, attempts: int = 3, production_defaults: bool
     result_path = stage_dir / "result.json"
     duration = round(time.time() - started, 1)
     kept = partial_attempts(stage_dir)
+    if interrupted:
+        return set_stage(run_dir, stage, FAIL, f"interrupted by the user (Ctrl-C); the stage was stopped{' by force' if escalated else ''} and {kept['attempts_recorded']} finished attempt(s) were kept",
+                         duration_s=duration, stderr_tail=(err or "")[-600:], residency=residency, interrupted=True, **kept)
     if timed_out:
         return set_stage(run_dir, stage, FAIL, f"timed out after {TIMEOUTS[stage]}s and was killed; {kept['attempts_recorded']} finished attempt(s) were kept", duration_s=duration,
                          stderr_tail=(err or "")[-600:], residency=residency, **kept)
@@ -1169,6 +1236,8 @@ def cmd_stage(args) -> int:
     write_summary(run_dir)
     write_manifest(run_dir)
     print(f"stage {args.stage}: {result['status'].upper()}  {result.get('reason') or result.get('summary') or ''}\nresults: {run_dir}")
+    if result.get("interrupted"):
+        return EXIT_INTERRUPTED
     return 0 if result["status"] == PASS else 1
 
 
@@ -1181,6 +1250,10 @@ def cmd_run(args) -> int:
         print(f"== stage {stage} ({TITLES[stage]}): {result['status'].upper()}  {result.get('reason') or result.get('summary') or ''}\n")
         write_summary(run_dir)
         write_manifest(run_dir)
+        if result.get("interrupted"):
+            print(f"Interrupted. The stage was stopped, our Ollama model was unloaded, and what was recorded is kept in {run_dir}.\n"
+                  f"Send it with: python3 experiments/rtx4070/rtx4070.py package")
+            return EXIT_INTERRUPTED
     print((run_dir / "summary.md").read_text())
     print(f"Next: python3 experiments/rtx4070/rtx4070.py package   (then send the .tar.gz it prints)")
     return 0
@@ -1304,7 +1377,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    return args.func(args)
+    in_main_thread = threading.current_thread() is threading.main_thread()
+    previous = signal.signal(signal.SIGTERM, _raise_keyboard_interrupt) if in_main_thread else None
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:  # outside a running stage (a check, a download, the cleanup): there is no stage process to stop
+        print("\nInterrupted. Nothing is running any more. If a stage was running, see TROUBLESHOOTING.md, 'Other'.")
+        return EXIT_INTERRUPTED
+    finally:
+        if in_main_thread:
+            signal.signal(signal.SIGTERM, previous)
 
 
 if __name__ == "__main__":

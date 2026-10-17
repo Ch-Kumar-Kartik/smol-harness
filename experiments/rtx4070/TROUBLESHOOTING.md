@@ -69,9 +69,13 @@ Do not accept a CPU run as a pass.
 
 ## Stage E is refused: "Windows host is unreachable from the shell sandbox"
 
-Intended. Stage E lets a model run shell commands, and on a default WSL2 setup those commands could reach your Windows disks (`/mnt/c`) or start Windows programs (`cmd.exe`, `powershell.exe`) through WSL interop; the Linux sandbox has never been shown to stop either. The message names the route it found. The only fix is to remove the route (README, "Stage E: isolation requirements": `/etc/wsl.conf`, then `wsl --shutdown`) in a dedicated, disposable Ubuntu. Do not try to edit the check or the script to get past it. Stages A to D are not affected. If you do not want stage E, ignore this.
+Intended. Stage E lets a model run shell commands, and on a default WSL2 setup those commands could reach your Windows disks (`/mnt/c`) or start Windows programs (`cmd.exe`, `powershell.exe`) through WSL interop; the Linux sandbox has never been shown to stop either. The message names the route it found. Stage E is not part of the first round, so the normal answer is: do nothing. The only fix is to remove the route (README, "Stage E (NOT part of the first round)": edit `/etc/wsl.conf`, then `wsl --shutdown`) in a dedicated, disposable Ubuntu. **Edit that file, never replace it**: keep `[boot]` / `systemd=true`, or the Ollama service stops starting (next entry). Do not try to edit the check or the script to get past it. Stages A to D are not affected. If you do not want stage E, ignore this.
 
 If the check fails with "the sandbox let a probe through", stop and send the archive to the maintainer at once; do not run stage E.
+
+## Ollama does not start after changing WSL settings
+
+If `sudo systemctl start ollama` fails with "System has not been booted with systemd", `/etc/wsl.conf` lost its `[boot]` section. Put `systemd=true` back under `[boot]` (`sudo nano /etc/wsl.conf`), run `wsl --shutdown` in PowerShell, reopen Ubuntu. Without systemd you can still start Ollama by hand: `nohup ollama serve > ~/ollama.log 2>&1 &`.
 
 ## Sandbox
 
@@ -100,6 +104,7 @@ Preflight needs 25 GB free (35 GB recommended). Check with `df -h ~`. Free space
 ## Other
 
 - A stage stays running forever: it cannot; each has a hard limit and is killed. Wait for it. The attempts it had finished are kept in `stage_X/attempts.jsonl` and go into the archive.
-- Computer sleeps or Ubuntu closes mid-run: re-run the stage that was interrupted (`stage X`). Earlier results are kept.
+- Ctrl-C: press it **once** and wait up to a minute. The script stops the stage and everything it started, unloads the Ollama model, keeps what was recorded and exits with code 130. Run `package` afterwards.
+- Computer sleeps or the Ubuntu window was closed mid-run: look for leftovers first, `pgrep -af stage_runner.py` (the stage; kill it with `pkill -f stage_runner.py`) and `ollama ps` (then `ollama stop <name>`), `nvidia-smi` should show the memory back. Then re-run the stage that was interrupted (`stage X`). Earlier results are kept.
 - Permission errors in the repository: it is probably on `/mnt/c`. Clone under `~`.
 - Anything else: run `package`, send the archive and the exact text of the error.

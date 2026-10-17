@@ -13,7 +13,7 @@ Commands are labelled by where you type them:
 
 It runs five bounded experiments (A to E) with two small language models on your RTX 4070 (12 GB), one served by **Ollama** and one loaded through **Hugging Face Transformers** with 4-bit (NF4) quantization, and records what happened.
 
-**Stage E lets a model run shell commands, so it is refused on a normal WSL2 setup (this is intended).** Stages A to D need nothing special and give most of the answers. Stage E needs the Windows host to be unreachable from Ubuntu; see "Stage E: isolation requirements" below. Do it only if the maintainer asks you to.
+**Stage E (a model running shell commands) is not part of this first round.** It is refused automatically on a normal WSL2 setup, and the run then ends with `E` marked FAIL: refused. That is intended and needs no action. Stages A to D need nothing special and give most of the answers. Ignore the last section about stage E unless the maintainer asks you to do it.
 
 | Need | Amount |
 |---|---|
@@ -123,7 +123,7 @@ cd ~/smol-harness
 python3 experiments/rtx4070/rtx4070.py preflight
 ```
 
-This first **preflight** only reads things; it changes and downloads nothing. It prints `PASS`, `WARN`, `FAIL` or `UNVERIFIED` per check. Fix every `FAIL` (the line tells you what to do) and run it again. A check shown as `UNVERIFIED ... failed first` was not checked because an earlier check failed; fix that earlier one first. A passing preflight is never printed while something it needs is broken.
+This first **preflight** only reads things; it changes and downloads nothing. It prints `PASS`, `WARN`, `FAIL` or `UNVERIFIED` per check. Fix every `FAIL` (the line tells you what to do) and run it again, **with one exception**: a FAIL named "Windows host is unreachable from the shell sandbox" belongs to stage E only. It is expected on a normal WSL2 setup. Leave it alone, do not change any WSL setting because of it, and carry on (the script prints "Stages A to D can run"). A check shown as `UNVERIFIED ... failed first` was not checked because an earlier check failed; fix that earlier one first. A passing preflight is never printed while something it needs is broken.
 
 Then:
 
@@ -185,7 +185,7 @@ Then the second preflight, which checks the downloaded models, that Ollama reall
 python3 experiments/rtx4070/rtx4070.py preflight --phase post
 ```
 
-All `FAIL` items must be fixed before continuing.
+All `FAIL` items must be fixed before continuing, except the stage-E-only one described in step 6.
 
 ## Step 9. Before the experiments
 
@@ -204,6 +204,8 @@ python3 experiments/rtx4070/rtx4070.py run
 Each stage has a hard time limit and is killed (never retried forever) if it exceeds it; the attempts it had finished are kept. A stage whose prerequisite failed is **skipped**, not forced. Between stages the script unloads its own Ollama model from the GPU and checks with Ollama that it is really gone; if it cannot confirm that, the next stage is blocked and says why. Expect 20 to 60 minutes in total.
 
 On a normal WSL2 setup the run ends with `E` marked **FAIL: refused**, with a reason that names the Windows drive or interop route it found. That is the safety gate working, not an error to fix.
+
+**Do not close the window or press Ctrl-C casually while a stage runs.** If you must stop, press Ctrl-C **once** and wait (up to about a minute): the script stops the running stage and everything it started, unloads the Ollama model, keeps what was recorded and exits with code 130. Then run `package` to send what exists. If the window was closed or the computer went to sleep, see `TROUBLESHOOTING.md`, "Other", before starting again.
 
 You can also run stages one at a time, which is the right thing to do after fixing a problem:
 
@@ -230,7 +232,25 @@ python3 experiments/rtx4070/rtx4070.py status
 
 PASS never means the models are good at coding; only that the mechanism worked. A FAIL in E can be a model-quality outcome and is still valuable data. If the two models do not fit in video memory together, stage D fails with a "resource limit" reason and suggests the smaller model set (`--profile fallback`, which needs `prepare --profile fallback` first).
 
-## Stage E: isolation requirements
+## Step 11. Package and send back the results (Ubuntu)
+
+```bash
+python3 experiments/rtx4070/rtx4070.py package
+```
+
+Run this **even if stages failed**; failures are what we most need to see. It prints the path of ONE `.tar.gz` file, its size and checksum. To open its folder in Windows Explorer (with Windows interop on):
+
+```bash
+explorer.exe experiments/rtx4070/results
+```
+
+or, if interop is off, type `\\wsl$\Ubuntu-24.04\home\<your-linux-name>\smol-harness\experiments\rtx4070\results` into the Explorer address bar.
+
+Send that single `.tar.gz` file back (email, cloud drive, chat). It contains logs, versions, GPU readings and a manifest with checksums. It never contains model files. Known credential formats (Hugging Face and GitHub tokens, `sk-` keys, bearer headers, passwords inside URLs, `key=value` secrets, private-key blocks) and your home path are removed automatically, and the finished archive is scanned once more. **That is pattern matching, not a guarantee**: text a model printed from a file (the shell can read anything your Linux user can) could contain a secret in a form no pattern knows. Before sending, look inside with `tar -tzf <file>` and open anything unexpected, or extract it and search it. What is inside is explained in `RESULTS.md`.
+
+## Stage E (NOT part of the first round): isolation requirements
+
+**Stage E is disabled on the default WSL2 setup and is not part of the initial handoff. Skip this whole section unless the maintainer asks you to do it.** Do the steps above first and send the results (step 11).
 
 Stage E runs shell commands written by a language model. They run inside a Linux sandbox, but that sandbox was never checked against two things WSL2 adds, and a probe that fails to escape one route proves nothing about the others:
 
@@ -247,35 +267,33 @@ So stage E is only enabled where **no route to the Windows host exists**, whatev
 
 If you cannot guarantee that, skip stage E. Do not look for a way to switch the check off.
 
-How to meet this on WSL2 (do it after stages A to D, and only if asked):
+How to meet this on WSL2 (only if asked, and only after you have packaged and sent the results of stages A to D):
 
-```bash
-sudo tee /etc/wsl.conf >/dev/null <<'EOF'
-[automount]
-enabled = false
-[interop]
-enabled = false
-appendWindowsPath = false
-EOF
-```
+1. Look at the file first. It may not exist; on Ubuntu 24.04 it usually contains a `[boot]` section with `systemd=true`, which the Ollama service needs:
 
-Then in **PowerShell** run `wsl --shutdown`, reopen Ubuntu, and run `python3 experiments/rtx4070/rtx4070.py preflight` again. Check `nvidia-smi` still works in Ubuntu (these settings are expected to leave the GPU alone, but that is **unverified**; if the GPU disappears, undo the change and tell the maintainer). Effects: `/mnt/c` and `explorer.exe` no longer work in Ubuntu, so open results through `\\wsl$\Ubuntu-24.04\home\<your-linux-name>\smol-harness\experiments\rtx4070\results` in the Windows Explorer address bar. To undo, delete `/etc/wsl.conf` and run `wsl --shutdown`.
+   ```bash
+   cat /etc/wsl.conf
+   ```
 
-## Step 11. Package and send back the results (Ubuntu)
+2. **Edit the file, never replace it.** Keep every line that is already there, above all `[boot]` / `systemd=true`. Open it with `sudo nano /etc/wsl.conf` and add the lines below at the end. If a section with the same name already exists, change or add the keys inside that section instead of creating a second one with the same name. Save with Ctrl-O and Enter, leave with Ctrl-X.
 
-```bash
-python3 experiments/rtx4070/rtx4070.py package
-```
+   ```
+   [automount]
+   enabled = false
 
-Run this **even if stages failed**; failures are what we most need to see. It prints the path of ONE `.tar.gz` file, its size and checksum. To open its folder in Windows Explorer (with Windows interop on):
+   [interop]
+   enabled = false
+   appendWindowsPath = false
+   ```
 
-```bash
-explorer.exe experiments/rtx4070/results
-```
+3. In **PowerShell** run `wsl --shutdown`, then reopen Ubuntu.
+4. Check, in Ubuntu: `cat /etc/wsl.conf` still shows `systemd=true` (if you had it), `nvidia-smi` still works (these settings are expected to leave the GPU alone, but that is **unverified**; if the GPU disappears, undo the change and tell the maintainer), and Ollama is up (`curl -s http://127.0.0.1:11434/api/version`; if not, `sudo systemctl start ollama` or the `nohup ollama serve` line from step 7).
+5. Run `python3 experiments/rtx4070/rtx4070.py preflight`. The check "Windows host is unreachable from the shell sandbox" should now PASS. If it still FAILs, read what it names and stop; do not run stage E.
+6. Run `python3 experiments/rtx4070/rtx4070.py stage E` (add `--profile fallback` before `stage` if you used the fallback profile earlier). It reuses the newest results folder, in which stages A to D must have passed, then run `package` again.
 
-or, if interop is off, type `\\wsl$\Ubuntu-24.04\home\<your-linux-name>\smol-harness\experiments\rtx4070\results` into the Explorer address bar.
+Effects: `/mnt/c` and `explorer.exe` no longer work in Ubuntu, so open results through `\\wsl$\Ubuntu-24.04\home\<your-linux-name>\smol-harness\experiments\rtx4070\results` in the Windows Explorer address bar.
 
-Send that single `.tar.gz` file back (email, cloud drive, chat). It contains logs, versions, GPU readings and a manifest with checksums. It never contains model files. Known credential formats (Hugging Face and GitHub tokens, `sk-` keys, bearer headers, passwords inside URLs, `key=value` secrets, private-key blocks) and your home path are removed automatically, and the finished archive is scanned once more. **That is pattern matching, not a guarantee**: text a model printed from a file (the shell can read anything your Linux user can) could contain a secret in a form no pattern knows. Before sending, look inside with `tar -tzf <file>` and open anything unexpected, or extract it and search it. What is inside is explained in `RESULTS.md`.
+To undo: edit `/etc/wsl.conf` again and remove **only the lines you added** (or set the values back to `true`). Never delete the file if it contains `[boot]`. Then `wsl --shutdown` in PowerShell.
 
 ## What is unverified until this runs on your machine
 
@@ -297,5 +315,5 @@ If a stage fails, do not retry it endlessly: read `TROUBLESHOOTING.md`, fix at m
 1. Commit the package and the code state you want tested, then note the commit id (`git rev-parse HEAD`). The experiment records the commit and whether the tree was dirty.
 2. Give your colleague either the repository address and the commit id, or a bundle: `git bundle create smol-harness.bundle --all`.
 3. Make sure `uv.lock` is committed (the install is `uv sync --locked`).
-4. Stage E is refused by design on a default WSL2 setup. Enable it only for a dedicated, disposable distribution prepared as described above; do not weaken the `host_isolation` check.
+4. Stage E is not part of the initial handoff: it is refused by design on a default WSL2 setup. Enable it only for a dedicated, disposable distribution prepared as described in its section (editing, never replacing, `/etc/wsl.conf`); do not weaken the `host_isolation` check.
 5. When the archive returns, compare `manifest.json` (`git.commit`, `stages`, `excluded_from_archive`, `re_redacted_files`) with what you expected. Only then update `docs/implementation-plan.md` to mark anything as hardware-validated.

@@ -25,7 +25,7 @@ Not collected, ever: model weights (any `.safetensors`, `.gguf`, `.bin` and simi
 
 ## Statuses
 
-`pass` the stage's criterion was met. `fail` it was not, or a required check failed. `skip` a stage it depends on did not pass. `unreadable` / `unknown` the stage died before writing a usable record: its logs are still included. None of these ever counts as a pass.
+`pass` the stage's criterion was met. `fail` it was not, or a required check failed. `skip` a stage it depends on did not pass. `unreadable` / `unknown` the stage died before writing a usable record: its logs are still included. A stage stopped with Ctrl-C is recorded as `fail` with `interrupted: true` and the attempts it had finished. None of these ever counts as a pass.
 
 ## Redaction
 
