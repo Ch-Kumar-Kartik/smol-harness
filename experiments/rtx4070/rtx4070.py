@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""RTX 4070 / WSL2 experiment driver for smol-harness.  Standard library only: it runs before the project environment exists.
+"""RTX 4070 / experiment driver for smol-harness.  Standard library only: it runs before the project environment exists.
+
+Targets: native Windows (this machine, from PowerShell) or Ubuntu inside WSL2. Both are first-class; the checks below
+say which consequences each host kind has (stage E confinement, the /mnt slowness trap under WSL, which extras to install).
+In WSL2 run `python3 ...`; on native Windows run `py ...` or any Python 3.12.
 
     python3 rtx4070.py preflight            checks that need no downloaded models
-    python3 rtx4070.py install-deps         `uv sync --locked` + the one pinned extra (bitsandbytes)
+    python3 rtx4070.py install-deps         the locked stack (uv sync, on Windows + the CUDA torch build) + bitsandbytes
     python3 rtx4070.py prepare              pull the Ollama model, create the fixed-context tag, snapshot the HF model
     python3 rtx4070.py preflight --phase post
     python3 rtx4070.py run                  stages A..E in order, stopping dependents of any failed stage
@@ -17,6 +21,7 @@ model weights never enter the results. Nothing here was run on the target machin
 from __future__ import annotations
 
 import argparse
+import ctypes
 import dataclasses
 import datetime as dt
 import getpass
@@ -42,8 +47,26 @@ RESULTS = HERE / "results"
 GENERATED = HERE / "generated"
 CONFIGS = HERE / "configs"
 MODELS = json.loads((HERE / "models.json").read_text())
-VENV_PY = REPO / ".venv" / "bin" / "python"
+IS_WINDOWS = os.name == "nt"
+_VENV_BIN_NAME, _VENV_PY_NAME = ("Scripts", "python.exe") if IS_WINDOWS else ("bin", "python")
+VENV_BIN = REPO / ".venv" / _VENV_BIN_NAME
+VENV_PY = VENV_BIN / _VENV_PY_NAME
+VENV_SITE = REPO / ".venv" / "Lib" / "site-packages"
 OLLAMA_URL = os.environ.get("SMOL_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+# The locked stack's torch, for native Windows installs: the SAME version as uv.lock with the CUDA runtime wheels from the
+# NVIDIA/PyTorch index (`uv sync --locked` on Windows gives torch 2.14.1+cpu, which stages B..E refuse by design).
+TORCH_PIN = "torch==2.14.1+cu130"
+PYTORCH_INDEX = "https://download.pytorch.org/whl/cu130"
+PYPI_INDEX = "https://pypi.org/simple"
+
+
+def host_kind() -> str:
+    """One of "native-windows", "wsl2", "native-linux". Both native Windows and WSL2 Ubuntu are supported targets; the
+    checks below say which consequences each has (e.g. stage E confinement, the /mnt trap) instead of refusing."""
+    if IS_WINDOWS:
+        return "native-windows"
+    version = PROC_VERSION.read_text().lower() if PROC_VERSION.exists() else ""
+    return "wsl2" if "microsoft" in version else "native-linux"
 
 STAGES = ("A", "B", "C", "D", "E")
 TITLES = {"A": "Environment and GPU validation", "B": "Ollama inference and tool calling", "C": "Hugging Face CUDA load, placement, quantization",
@@ -110,12 +133,12 @@ def redact_obj(obj):
 
 def write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(redact_obj(data), indent=2, sort_keys=False, default=str) + "\n")
+    path.write_text(json.dumps(redact_obj(data), indent=2, sort_keys=False, default=str) + "\n", encoding="utf-8")
 
 
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(redact(text))
+    path.write_text(redact(text), encoding="utf-8")
 
 
 def sha256(path: Path) -> str:
@@ -337,9 +360,12 @@ def sandbox():
     return {"success": bool(result.success), "stdout": (result.output or {}).get("stdout", ""), "error": result.error}
 attempt("sandbox", sandbox)
 def isolation():
-    # Behaviour, not configuration: try the routes out of the sandbox and look at what actually happened. Each probe is harmless by construction (an empty
-    # marker file in the Linux home that we remove, `echo` run by a Windows shell). The Windows-program probes run ONLY when the driver established that no
-    # interop route exists (SMOL_PROBE_EXE=1); a probe never writes to a Windows drive. A probe that cannot escape proves nothing about other routes.
+    # Behaviour, not configuration. On native Windows there IS no sandbox to escape: the shell backend runs commands as the
+    # user with no filesystem or network confinement. That is reported as a FACT, not as a probe result; the host_isolation
+    # check turns it into the honest stage-E statement (and stage E accepts it only as a declared scope, never silently).
+    if sys.platform == "win32":
+        return {"native_no_confinement": {"escaped": True, "what": "native Windows: model-issued shell commands run as your Windows user with "
+                                                                    "no filesystem or network confinement (Job Object kill-tree only)"}}
     import asyncio, pathlib, shutil, uuid
     from smol_harness.tools import ShellTool, resolve_workspace
     ws = resolve_workspace(tempfile.mkdtemp(prefix="smol-probe-"))
@@ -415,15 +441,21 @@ def nvidia_cuda_version() -> tuple[float | None, str]:
     return (float(match.group(1)), match.group(1)) if match else (None, "")
 
 
-@check("os", "Running on Linux (Ubuntu inside WSL2)")
+@check("os", "Running on a supported host (native Windows, or Ubuntu inside WSL2)")
 def chk_os(ctx):
+    kind = host_kind()
+    if kind == "native-windows":
+        return PASS, f"native Windows {platform.release()} ({platform.machine()}); no WSL involvement", ""
     if platform.system() != "Linux":
         return FAIL, f"this is {platform.system()}", "Open the Ubuntu app (WSL2) and run the commands there. Do not use PowerShell for this script."
-    return PASS, f"{platform.system()} {platform.release()}", ""
+    detail = "WSL2 (Ubuntu inside)" if kind == "wsl2" else "native Linux: the package was written for WSL2; native runs are allowed but untested"
+    return PASS, f"{platform.system()} {platform.release()} — {detail}", ""
 
 
 @check("wsl2", "WSL2 (not WSL1)")
 def chk_wsl(ctx):
+    if host_kind() == "native-windows":
+        return SKIP, "not applicable: a native Windows run involves no WSL at all (the WSL-specific checks are skipped)", ""
     version = PROC_VERSION.read_text().lower() if PROC_VERSION.exists() else ""
     if "microsoft" not in version:
         return WARN, "not WSL: native Linux. The package is written for WSL2 and untested elsewhere; continuing is allowed.", ""
@@ -434,7 +466,11 @@ def chk_wsl(ctx):
 
 @check("arch", "x86_64 CPU architecture")
 def chk_arch(ctx):
-    return (PASS, platform.machine(), "") if platform.machine() == "x86_64" else (FAIL, platform.machine(), "The locked environment is for x86_64.")
+    machine = platform.machine().lower()
+    if host_kind() == "native-windows":
+        return (PASS, f"{platform.machine()} native Windows", "") if machine == "amd64" else \
+            (FAIL, f"native Windows on {platform.machine()}", "The locked stack installs x86_64 (AMD64) wheels and CUDA binaries only.")
+    return (PASS, platform.machine(), "") if machine == "x86_64" else (FAIL, platform.machine(), "The locked environment is for x86_64.")
 
 
 @check("gpu_node", "WSL2 GPU device present (/dev/dxg)", needed="ABCDE")
@@ -530,8 +566,10 @@ def chk_repo(ctx):
     return PASS, f"commit {info['commit'][:10]} on {info['branch']}, clean", ""
 
 
-@check("repo_location", "Repository is on the Linux filesystem (not /mnt/c)")
+@check("repo_location", "Repository location (Linux filesystem under WSL, anywhere local on native Windows)")
 def chk_location(ctx):
+    if host_kind() == "native-windows":
+        return PASS, f"native Windows path: {REPO} (the /mnt slowness trap only exists under WSL; the workspaces must still be disposable)", ""
     path = str(REPO)
     if path.startswith("/mnt/"):
         return FAIL, f"{path} is on the Windows drive", "Clone into your Linux home instead: cd ~ && git clone ... (the Windows drive is slow and breaks the sandbox)."
@@ -543,15 +581,45 @@ def chk_disk(ctx):
     req = MODELS["min_requirements"]
     free = shutil.disk_usage(REPO).free / 2**30
     if free < req["disk_free_gib_fail_below"]:
-        return FAIL, f"{free:.0f} GiB free", f"Need about {req['disk_free_gib_warn_below']} GiB free in the WSL disk (which lives on C:). Free space on C: or move the distro."
+        return FAIL, f"{free:.0f} GiB free", f"Need about {req['disk_free_gib_warn_below']} GiB free (the models and the CUDA packages are large). Free up space on this drive."
     if free < req["disk_free_gib_warn_below"]:
         return WARN, f"{free:.0f} GiB free (comfortable is {req['disk_free_gib_warn_below']})", ""
     return PASS, f"{free:.0f} GiB free", ""
 
 
-@check("ram", "Enough memory available to Ubuntu")
+def windows_ram_gib() -> tuple[float, float] | None:
+    """(total, available) GiB via GlobalMemoryStatusEx; None when the API cannot be asked (never raises)."""
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_uint32), ("dwMemoryLoad", ctypes.c_uint32),
+                    ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                    ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                    ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                    ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+
+    stat = MEMORYSTATUSEX()
+    stat.dwLength = ctypes.sizeof(stat)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+        return None
+    return stat.ullTotalPhys / 2**30, stat.ullAvailPhys / 2**30
+
+
+@check("ram", "Enough memory available to the experiment")
 def chk_ram(ctx):
     req = MODELS["min_requirements"]
+    if host_kind() == "native-windows":
+        got = windows_ram_gib()
+        if got is None:
+            return UNVERIFIED, "GlobalMemoryStatusEx could not be queried", ""
+        total, avail = got
+        if total < req["ram_gib_fail_below"]:
+            return FAIL, f"the machine has {total:.1f} GiB of RAM", "Windows cannot run this model set in so little RAM."
+        if total < req["ram_gib_warn_below"]:
+            return WARN, f"the machine has {total:.1f} GiB of RAM ({avail:.1f} available); more is better", ""
+        return PASS, f"{total:.1f} GiB total, {avail:.1f} GiB available", ""
     try:
         fields = {ln.split(":")[0]: int(ln.split()[1]) for ln in MEMINFO.read_text().splitlines() if ln.split(":")[0] in ("MemTotal", "MemAvailable")}
     except (OSError, ValueError, IndexError):
@@ -568,6 +636,13 @@ def chk_ram(ctx):
 def chk_venv(ctx):
     if VENV_PY.exists():
         return PASS, str(VENV_PY), ""
+    other = REPO / ".venv" / ("bin" if IS_WINDOWS else "Scripts") / ("python" if IS_WINDOWS else "python.exe")
+    if other.exists():
+        if IS_WINDOWS:
+            return FAIL, "the .venv exists but it is the WSL/Linux one (bin/python); this copy of the driver runs natively on Windows and needs Scripts/python.exe", \
+                "Run this package's commands inside the WSL2 Ubuntu checkout instead — Windows and WSL should use separate checkouts and venvs."
+        return FAIL, "the .venv exists but it is the WINDOWS one (Scripts/python.exe); running in Ubuntu needs the Linux environment with .venv/bin/python", \
+            "python3 experiments/rtx4070/rtx4070.py install-deps   (from Ubuntu; do not reuse or share a Windows venv)"
     return FAIL, "no .venv in the repository", "python3 experiments/rtx4070/rtx4070.py install-deps"
 
 
@@ -618,7 +693,7 @@ def chk_bnb(ctx):
     return UNVERIFIED, f"version {pin} imports; whether its CUDA 13 kernels work on this GPU is only established by stage C", ""
 
 
-@check("sandbox", "Shell sandbox starts (Linux namespaces)", needed="E", requires=("venv", "deps"))
+@check("sandbox", "Shell tool runs a command through the sandbox backend", needed="E", requires=("venv", "deps"))
 def chk_sandbox(ctx):
     probe = ctx.probe()
     if "error" in probe:
@@ -651,7 +726,14 @@ def chk_workspace(ctx):
 def chk_ollama(ctx):
     status, data, err = http_json("GET", "/api/version", timeout=5)
     if status != 200 or not isinstance(data, dict):
-        return FAIL, f"{OLLAMA_URL}: {err or status}", "Start it: `sudo systemctl start ollama` (or `ollama serve &`). See README step 7."
+        fix = "Start the Ollama Windows app (or `ollama serve` in a PowerShell window)." if host_kind() == "native-windows" \
+            else "Start it: `sudo systemctl start ollama` (or `ollama serve &`). See README step 7."
+        return FAIL, f"{OLLAMA_URL}: {err or status}", fix
+    if host_kind() == "native-windows":
+        rc, listing, _ = run(["tasklist", "/FI", "IMAGENAME eq ollama.exe", "/NH"], timeout=20)
+        running = "ollama.exe" in listing.lower()
+        where = "" if rc == 0 and running else " NOTE: no ollama.exe process is running, yet the server answered — it may be a service or a model host elsewhere; locate it with `Get-Process ollama` before trusting it."
+        return (PASS if rc == 0 and running else WARN), f"Ollama {data.get('version')} at {OLLAMA_URL} (the Windows app is the intended setup on this host).{where}", ""
     rc, _, _ = run(["pgrep", "-x", "ollama"])
     where = "" if rc == 0 else " NOTE: no ollama process is running inside this Ubuntu, so this answer comes from somewhere else (the Windows app?). That setup is not the one this package was written for."
     return (PASS if rc == 0 else WARN), f"Ollama {data.get('version')} at {OLLAMA_URL}.{where}", ""
@@ -749,29 +831,38 @@ def chk_mixed_vram(ctx):
     return PASS, f"{available} MiB available for an estimated {need} MiB; the real co-residency is measured by stage D", ""
 
 
-@check("host_isolation", "Windows host is unreachable from the shell sandbox (stage E only)", needed="E", requires=("sandbox",))
+@check("host_isolation", "Windows host is unreachable from the shell sandbox (stage E only; on native Windows the declared no-confinement scope applies)", needed="E", requires=("sandbox",))
 def chk_host_isolation(ctx):
-    """Stage E lets a model run shell commands. effGen's sandbox confines writes with read-only remounts whose errors it discards, and its own probe tests
-    only the temp directory; neither was ever observed against a Windows drive or WSL interop, which runs Windows programs OUTSIDE every Linux namespace.
-    So stage E is refused while any such route exists, regardless of how a probe behaves. When none exists, behaviour probes run as a second line.
-    Passing means: no known route to the Windows host AND the probes could not escape. It does NOT prove the sandbox secure (reads stay unconfined, R1)."""
-    wsl = "microsoft" in (PROC_VERSION.read_text().lower() if PROC_VERSION.exists() else "")
-    problems = bridges_exposed(windows_bridge_facts(), wsl)
-    fix = ("Stage E is refused here. It needs an environment where the Windows host cannot be reached at all (README, 'Stage E: isolation requirements'). On WSL2 that is "
-           "/etc/wsl.conf with [automount] enabled=false and [interop] enabled=false and appendWindowsPath=false, then `wsl --shutdown` in PowerShell. "
-           "Stages A to D do not need this. Do not look for a way around it.")
+    """Stage E lets a model run shell commands. Under WSL2 the requirement is that no route to the Windows host exists (mounts, interop), plus behavioural
+    probes as a second line; passing proves THIS machine's configuration, never security (reads stay unconfined, R1). On native Windows there is nothing
+    to escape — the shell simply runs as the user — so the honest answer is a WARN that states exactly what stage E would expose, and stage E accepts it
+    ONLY as that declared scope (trusted, disposable repositories only), never as a silent pass."""
+    kind = host_kind()
+    fix_native_or_wsl = ("Stage E is refused here. It needs the environment from which the Windows host cannot be reached (README, 'Stage E: isolation requirements'). "
+                         "Under WSL2 that is /etc/wsl.conf with [automount] enabled=false and [interop] enabled=false and appendWindowsPath=false, then `wsl --shutdown` in PowerShell. "
+                         "Stages A to D do not need this. Do not look for a way around it.")
+    if kind == "native-windows":
+        probe = ctx.probe()
+        result = probe.get("isolation") if isinstance(probe, dict) else None
+        marker = result.get("native_no_confinement") if isinstance(result, dict) else None
+        if not isinstance(marker, dict):
+            return FAIL, "the native-Windows isolation probe did not run, so nothing is established about what stage E would expose", fix_native_or_wsl
+        return WARN, (f"native Windows: the shell backend runs a model's commands as your user ({getpass.getuser()}) with NO filesystem or network confinement "
+                      "(PowerShell + Job Object kill-tree only). Stage E under this scope means: trusted, disposable repositories only; every artifact is "
+                      "redacted; do not point the workspaces at anything with secrets. WSL2 remains the confined option."), ""
+    problems = bridges_exposed(windows_bridge_facts(), kind == "wsl2")
     if problems:
-        return FAIL, "; ".join(problems), fix
+        return FAIL, "; ".join(problems), fix_native_or_wsl
     probe = ctx.probe()
     result = probe.get("isolation") if isinstance(probe, dict) else None
     if not isinstance(result, dict):
-        return FAIL, (probe.get("isolation_error") if isinstance(probe, dict) else None) or "the isolation probes did not run, so nothing is established", fix
+        return FAIL, (probe.get("isolation_error") if isinstance(probe, dict) else None) or "the isolation probes did not run, so nothing is established", fix_native_or_wsl
     escaped = [name for name, r in result.items() if isinstance(r, dict) and r.get("escaped")]
     if escaped:
-        return FAIL, "the sandbox let a probe through: " + ", ".join(escaped), fix
+        return FAIL, "the sandbox let a probe through: " + ", ".join(escaped), fix_native_or_wsl
     not_run = [name for name, r in result.items() if isinstance(r, dict) and r.get("escaped") is None]
     if not_run:
-        return FAIL, "probes not attempted: " + ", ".join(not_run), fix
+        return FAIL, "probes not attempted: " + ", ".join(not_run), fix_native_or_wsl
     return PASS, ("no Windows drive mounts, no interop, and the probes (write outside the workspace, start cmd.exe / powershell.exe) could not escape. "
                   "This is evidence for THIS machine's configuration, not a proof; use disposable repositories and a distro that holds no secrets"), ""
 
@@ -864,14 +955,14 @@ def run_dir_for(profile_name: str, new: bool) -> Path:
     directory = RESULTS / run_id
     directory.mkdir(parents=True)
     write_json(directory / "run.json", {"run_id": run_id, "created_utc": now(), "profile": profile_name, "git": git_info()})
-    latest.write_text(run_id)
+    latest.write_text(run_id, encoding="ascii")
     return directory
 
 
 def read_json(path: Path, default):
     try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError):
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
         return default
 
 
@@ -903,7 +994,7 @@ def capture_environment(ctx: Ctx, run_dir: Path) -> None:
     write_text(env_dir / "gpu_query.csv", gpu_csv)
     os_release = Path("/etc/os-release").read_text() if Path("/etc/os-release").exists() else ""
     kernel = PROC_VERSION.read_text() if PROC_VERSION.exists() else ""
-    write_text(env_dir / "os.txt", f"{os_release}\n{kernel}\n{' '.join(platform.uname())}\nWSL_DISTRO_NAME={os.environ.get('WSL_DISTRO_NAME', '')}\n")
+    write_text(env_dir / "os.txt", f"host_kind={host_kind()}\n{os_release}\n{kernel}\n{' '.join(platform.uname())}\nWSL_DISTRO_NAME={os.environ.get('WSL_DISTRO_NAME', '')}\n")
     _, uv_list, _ = run(["uv", "pip", "list", "--python", VENV_PY], timeout=60) if VENV_PY.exists() else (0, "no environment", "")
     write_text(env_dir / "python_packages.txt", uv_list)
     probe = ctx.probe()
@@ -938,13 +1029,195 @@ def set_stage(run_dir: Path, stage: str, status: str, reason: str = "", **extra)
     return result
 
 
-def terminate_group(process, grace_s: float | None = None) -> bool:
-    """Stop a stage's whole process group: SIGTERM, then SIGKILL if it is still there after the grace period. Returns True if SIGKILL was needed.
+# ---- Windows stage-tree control: a Job Object per stage ---------------------------------------
+# The driver stays standard-library-only, so this is a minimal copy of the harness's validated Windows backend mechanism
+# (src/smol_harness/shell_win.py): spawn CREATE_SUSPENDED, put the process in a KILL_ON_JOB_CLOSE Job before its first
+# instruction runs, then resume. Killing the Job ends the whole tree — torch children, pytest runs, everything — and no
+# straggler can outlive the Job handle. Defined only on Windows; every other host uses POSIX process groups.
+if IS_WINDOWS:
+    _WINDOWS_KILL_ON_CLOSE = 0x00002000
+    _WINDOWS_JOBOBJECT_EXTENDED_LIMIT_INFORMATION = 9
+    _WINDOWS_SUSPENDED = 0x00000004
+    _WINDOWS_PROCESS_SET_QUOTA, _WINDOWS_PROCESS_TERMINATE = 0x00000100, 0x0001
+    _WINDOWS_SNAPTHREAD = 0x00000004
+    _WINDOWS_THREAD_RESUME = 0x0002
+    _WINDOWS_INVALID_HANDLE = ctypes.c_size_t(-1).value
 
-    The stage was started with `start_new_session=True`, so its process group id is its pid and the group holds only the stage and what it started;
-    nothing else on the machine is signalled. Never raises: a group that is already gone is the goal.
+    class _WindowsIOCounter(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint64) for name in
+                    ("ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                     "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class _WindowsBasicLimitInformation(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64), ("LimitFlags", ctypes.c_uint32),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t), ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", ctypes.c_uint32),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", ctypes.c_uint32), ("SchedulingClass", ctypes.c_uint32)]
+
+    class _WindowsExtendedLimitInformation(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", _WindowsBasicLimitInformation), ("IoInfo", _WindowsIOCounter),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    class _WindowsThreadEntry(ctypes.Structure):
+        _fields_ = [("dwSize", ctypes.c_uint32), ("cntUsage", ctypes.c_uint32), ("th32ThreadID", ctypes.c_uint32),
+                    ("th32OwnerProcessID", ctypes.c_uint32), ("tpBasePri", ctypes.c_int32), ("tpDeltaPri", ctypes.c_int32), ("dwFlags", ctypes.c_uint32)]
+
+
+class StageTreeJob:
+    """A Windows Job Object that holds one stage process and everything it ever starts; kill() ends them all at once."""
+
+    def __init__(self) -> None:
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.CreateJobObjectW.restype = ctypes.c_void_p
+        k.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        k.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+        k.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+        k.Thread32First.restype = ctypes.c_int
+        k.Thread32First.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WindowsThreadEntry)]
+        k.Thread32Next.restype = ctypes.c_int
+        k.Thread32Next.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WindowsThreadEntry)]
+        k.OpenProcess.restype = ctypes.c_void_p
+        k.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        k.OpenThread.restype = ctypes.c_void_p
+        k.OpenThread.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        k.ResumeThread.restype = ctypes.c_uint32
+        k.ResumeThread.argtypes = [ctypes.c_void_p]
+        k.AssignProcessToJobObject.restype = ctypes.c_int
+        k.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        k.SetInformationJobObject.restype = ctypes.c_int
+        k.SetInformationJobObject.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        k.TerminateJobObject.restype = ctypes.c_int
+        k.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k.CloseHandle.restype = ctypes.c_int
+        k.CloseHandle.argtypes = [ctypes.c_void_p]
+        self._k = k
+        self._handle = k.CreateJobObjectW(None, None)
+        if not self._handle or self._handle == _WINDOWS_INVALID_HANDLE:
+            raise OSError(f"CreateJobObjectW failed (error {ctypes.get_last_error()})")
+        info = _WindowsExtendedLimitInformation()
+        info.BasicLimitInformation.LimitFlags = _WINDOWS_KILL_ON_CLOSE
+        if not k.SetInformationJobObject(self._handle, _WINDOWS_JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                                         ctypes.byref(info), ctypes.sizeof(info)):
+            code, handle = ctypes.get_last_error(), self._handle
+            self._handle = None
+            k.CloseHandle(handle)
+            raise OSError(f"SetInformationJobObject failed (error {code})")
+
+    def assign(self, pid: int) -> None:
+        k = self._k
+        handle = k.OpenProcess(_WINDOWS_PROCESS_SET_QUOTA | _WINDOWS_PROCESS_TERMINATE, False, pid)
+        if not handle or handle == _WINDOWS_INVALID_HANDLE:
+            raise OSError(f"OpenProcess({pid}) failed (error {ctypes.get_last_error()})")
+        try:
+            if not k.AssignProcessToJobObject(self._handle, handle):
+                raise OSError(f"AssignProcessToJobObject({pid}) failed (error {ctypes.get_last_error()})")
+        finally:
+            k.CloseHandle(handle)
+
+    def resume(self, pid: int) -> None:
+        """Resume a CREATE_SUSPENDED process's threads after it is inside the Job."""
+        k = self._k
+        snapshot = k.CreateToolhelp32Snapshot(_WINDOWS_SNAPTHREAD, 0)
+        if snapshot in (None, _WINDOWS_INVALID_HANDLE):
+            raise OSError(f"CreateToolhelp32Snapshot failed (error {ctypes.get_last_error()})")
+        try:
+            entry = _WindowsThreadEntry()
+            entry.dwSize = ctypes.sizeof(entry)
+            resumed = False
+            if k.Thread32First(snapshot, ctypes.byref(entry)):
+                while True:
+                    if entry.th32OwnerProcessID == pid:
+                        thread = k.OpenThread(_WINDOWS_THREAD_RESUME, False, entry.th32ThreadID)
+                        if thread and thread != _WINDOWS_INVALID_HANDLE:
+                            try:
+                                k.ResumeThread(thread)
+                                resumed = True
+                            finally:
+                                k.CloseHandle(thread)
+                    if not k.Thread32Next(snapshot, ctypes.byref(entry)):
+                        break
+        finally:
+            k.CloseHandle(snapshot)
+        if not resumed:
+            raise OSError(f"no thread of process {pid} could be resumed")
+
+    def kill(self, exit_code: int = 137) -> None:
+        """137: what a POSIX SIGKILL reports, so timeout diagnostics read the same on both hosts."""
+        if self._handle:
+            self._k.TerminateJobObject(self._handle, exit_code)
+
+    @property
+    def alive(self) -> bool:
+        return bool(self._handle)
+
+    def close(self) -> None:
+        if self._handle:
+            self._k.CloseHandle(self._handle)
+            self._handle = None
+
+
+_STAGE_REAL_PY: str | None = None
+
+
+def stage_interpreter() -> str:
+    """The interpreter behind VENV_PY. Windows/uv: .venv/Scripts/python.exe is a trampoline that manages its OWN Job for the
+    real interpreter, and every process the real interpreter later spawns silently breaks away from all Jobs — a stage Job
+    would hold the trampoline while torch/pytest grandchildren escaped. Started from the REAL interpreter (venv site-packages
+    replayed with site.addsitedir, see stage_boot), the whole tree stays in the Job and dies with it. Probed once."""
+    global _STAGE_REAL_PY
+    if _STAGE_REAL_PY is None:
+        interpreter = str(VENV_PY)
+        rc, out, _ = run([interpreter, "-c", "import sys; print(getattr(sys, '_base_executable') or sys.executable)"], timeout=120)
+        real = out.strip().strip('"')
+        if rc == 0 and real and Path(real).exists() and Path(real).resolve() != VENV_PY.resolve():
+            interpreter = real
+        _STAGE_REAL_PY = interpreter
+    return _STAGE_REAL_PY
+
+
+def stage_boot() -> str | None:
+    """The -c bootstrap that replays the venv for the real interpreter (Windows/trampoline only; None where VENV_PY is python)."""
+    if os.name == "nt" and Path(stage_interpreter()).resolve() != VENV_PY.resolve():
+        return (f"import runpy, site, sys; sys.argv = sys.argv[1:]; site.addsitedir({str(VENV_SITE)!r}); "
+                "runpy.run_path(sys.argv[0], run_name='__main__')")
+    return None
+
+
+def _spawn_stage(command, cwd, env):
+    """Start one stage process: POSIX in its own session (killpg kills the tree); Windows suspended, in a fresh
+    kill-on-close Job before its first instruction, then resumed (the tree dies with the Job). Returns (process, job)."""
+    if os.name != "nt":
+        return subprocess.Popen(command, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True), None
+    process = subprocess.Popen(command, cwd=str(cwd), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=_WINDOWS_SUSPENDED)
+    job = StageTreeJob()
+    try:
+        job.assign(process.pid)
+        job.resume(process.pid)
+    except OSError:
+        job.close()
+        process.kill()
+        process.wait()
+        raise
+    return process, job
+
+
+def terminate_group(process, grace_s: float | None = None, job=None) -> bool:
+    """Stop a stage's whole tree. POSIX: SIGTERM to the group, then SIGKILL if it survives the grace period (returns True when SIGKILL
+    was needed). Windows: TerminateJobObject, which is immediate force by nature (returns True); the tree holds only this stage and
+    what it started. Never raises: a tree that is already gone is the goal. The group belongs to the stage alone, so nothing else
+    on the machine is signalled.
     """
     grace_s = INTERRUPT_GRACE_S if grace_s is None else grace_s
+    if os.name == "nt":
+        if job is not None and job.alive:
+            job.kill()
+        else:
+            run(["taskkill", "/PID", process.pid, "/T", "/F"], timeout=30)
+        try:
+            process.wait(timeout=max(grace_s, 5.0))
+        except subprocess.TimeoutExpired:
+            pass
+        return True  # Windows termination is force by design; there is no graceful stage before it
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
@@ -961,6 +1234,19 @@ def terminate_group(process, grace_s: float | None = None) -> bool:
         pass
     process.wait()
     return escalated
+
+
+def _kill_stage_tree(process, job) -> None:
+    """The timeout path: the whole tree dies NOW, without a grace period."""
+    if job is not None and job.alive:
+        job.kill()
+    elif hasattr(os, "killpg"):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    else:
+        run(["taskkill", "/PID", process.pid, "/T", "/F"], timeout=30)
 
 
 def drain(process, wait_s: float = 5.0) -> tuple:
@@ -985,7 +1271,7 @@ def partial_attempts(stage_dir: Path) -> dict:
     path = stage_dir / "attempts.jsonl"
     if not path.exists():
         return {"attempts_recorded": 0}
-    lines = [ln for ln in path.read_text(errors="replace").splitlines() if ln.strip()]
+    lines = [ln for ln in path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
     return {"attempts_recorded": len(lines), "attempts_file": f"{stage_dir.name}/attempts.jsonl"}
 
 
@@ -1024,27 +1310,33 @@ def run_stage(stage: str, ctx: Ctx, attempts: int = 3, production_defaults: bool
     command = [str(VENV_PY), str(HERE / "stage_runner.py"), stage, "--run-dir", str(run_dir), "--profile", ctx.profile_name, "--attempts", str(attempts)]
     if production_defaults:
         command.append("--production-defaults")
-    env = {**os.environ, "PATH": f"{REPO / '.venv' / 'bin'}:{os.environ.get('PATH', '')}", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+    boot = stage_boot()  # Windows/uv: bypass the venv trampoline so the stage's whole tree stays inside the kill Job
+    if boot:
+        command = [stage_interpreter(), "-c", boot, *command[1:]]
+    env = {**os.environ, "PATH": f"{VENV_BIN}{os.pathsep}{os.environ.get('PATH', '')}", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
            "PYTHONUNBUFFERED": "1", "SMOL_OLLAMA_URL": OLLAMA_URL}
     stage_dir = run_dir / f"stage_{stage}"
     stage_dir.mkdir(parents=True, exist_ok=True)
     print(f"[run ] stage {stage}: {TITLES[stage]} (limit {TIMEOUTS[stage] // 60} min) ...")
-    process = None
-    interrupted = escalated = False
+    process = job = None
+    interrupted = escalated = timed_out = False
+    out = err = ""
     try:
-        process = subprocess.Popen(command, cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        process, job = _spawn_stage(command, REPO, env)
         out, err = process.communicate(timeout=TIMEOUTS[stage])
-        timed_out = False
     except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)  # the whole process group: no stray model or shell process survives
+        _kill_stage_tree(process, job)   # the whole tree dies now: no stray model or shell process survives
         out, err = drain(process)
         timed_out = True
     except KeyboardInterrupt:
-        # Ctrl-C / SIGTERM reaches only the driver (the stage has its own session), so stop the stage ourselves, keep what it wrote, clean up, exit 130.
-        interrupted, timed_out, out, err = True, False, "", ""
+        # Ctrl-C / SIGTERM reaches only the driver (the stage has its own tree), so stop the stage ourselves, keep what it wrote, exit 130.
+        interrupted = True
         if process is not None:
-            escalated = terminate_group(process)
+            escalated = terminate_group(process, job=job)
             out, err = drain(process)
+    finally:
+        if job is not None:
+            job.close()  # KILL_ON_JOB_CLOSE: anything the stage left running dies with the Job handle
     write_text(stage_dir / "stdout.log", out or "")
     write_text(stage_dir / "stderr.log", err or "")
     if stage in USES_OLLAMA:
@@ -1174,6 +1466,26 @@ def cmd_preflight(args) -> int:
     return 1 if [r for r in blocking(results) if r["needed_by"] != "E"] else 0
 
 
+def current_torch_build() -> str | None:
+    """The installed torch's full build tag, e.g. "2.14.1+cpu" or "2.14.1+cu130"; None when torch is missing or unusable. Never raises."""
+    if not VENV_PY.exists():
+        return None
+    rc, out, _ = run([str(VENV_PY), "-c", "import torch; print(getattr(torch, '__version__', ''))"], timeout=90)
+    return out.strip() if rc == 0 and out.strip() else None
+
+
+def install_plan(profile: dict) -> tuple:
+    """The steps install-deps performs on this host, in order (pure, so tests pin it): the locked sync, on native Windows the
+    CUDA build of the SAME pinned torch (uv.lock resolves torch 2.14.1+cpu there, which stages B..E refuse), the pinned
+    bitsandbytes when the profile quantizes, then a consistency check. A Linux host gets exactly what it always got."""
+    steps = ["sync"]
+    if host_kind() == "native-windows":
+        steps.append("torch_cu130")
+    if profile["hf"]["quantization"] != "none":
+        steps += ["bitsandbytes", "check"]
+    return tuple(steps)
+
+
 def cmd_install_deps(args) -> int:
     ctx = Ctx(args.profile)
     early = [r for r in run_checks(ctx, phase="pre", stage="A") if r["id"] in ("os", "wsl2", "arch", "nvidia_smi", "driver_cuda", "uv", "git", "repo_location", "disk")]
@@ -1181,11 +1493,32 @@ def cmd_install_deps(args) -> int:
     if blocking(early):
         return 1
     needs_bnb = ctx.profile["hf"]["quantization"] != "none"
-    confirm(f"\nThis downloads about 6 GB (PyTorch and the NVIDIA runtime libraries) into {REPO / '.venv'}" + (f" and installs bitsandbytes=={MODELS['bitsandbytes']['pin']}" if needs_bnb else "") +
-            ". It can take 5 to 20 minutes.", args.yes)
+    windows = host_kind() == "native-windows"
+    note = (" On native Windows this also installs the CUDA 13 build of the SAME pinned torch (2.14.1+cu130) from the PyTorch/NVIDIA index: "
+            "uv.lock resolves torch 2.14.1+cpu on Windows, and stages B..E refuse a CPU build by design.") if windows else ""
+    confirm(f"\nThis downloads about 6 GB (PyTorch and the NVIDIA runtime libraries) into {VENV_BIN}" +
+            (f" and installs bitsandbytes=={MODELS['bitsandbytes']['pin']}" if needs_bnb else "") + (f".{note}" if note else ".") +
+            " It can take 5 to 20 minutes.", args.yes)
     if subprocess.call(["uv", "sync", "--locked"], cwd=REPO) != 0:
         print("uv sync failed. See TROUBLESHOOTING.md, 'Installing the dependencies'.")
         return 1
+    if windows:
+        have = current_torch_build()
+        if have == "2.14.1+cu130":
+            print("torch 2.14.1+cu130 is already installed; the CUDA download is skipped.")
+        else:
+            torch_cmd = ["uv", "pip", "install", "--python", str(VENV_PY), TORCH_PIN, "--index-url", PYTORCH_INDEX,
+                         "--extra-index-url", PYPI_INDEX, "--index-strategy", "unsafe-best-match"]
+            if have is not None and have.startswith("2.14.1"):
+                print(f"replacing torch {have} (the uv.lock resolution for Windows) with the CUDA build of the same version ...")
+            if subprocess.call(torch_cmd, cwd=REPO) != 0:
+                print("the CUDA build of the pinned torch failed to install; every stage that touches the GPU would refuse anyway, so install-deps stops."
+                      " Retry after checking TROUBLESHOOTING.md, 'Installing the dependencies'.")
+                return 1
+            replaced = current_torch_build()
+            if replaced != "2.14.1+cu130":
+                print(f"the CUDA torch wheel reported installed, but the environment now imports {replaced or 'no torch'}; not continuing on a half-swapped stack.")
+                return 1
     # --no-deps: the resolver must not upgrade or downgrade any locked package (torch, numpy, ...) to suit bitsandbytes. `uv pip check` then proves that
     # everything bitsandbytes needs is already there; if not, say so instead of leaving a silently modified environment (review 002, R2-12).
     if needs_bnb and subprocess.call(["uv", "pip", "install", "--no-deps", "--python", str(VENV_PY), f"bitsandbytes=={MODELS['bitsandbytes']['pin']}"], cwd=REPO) != 0:
@@ -1194,7 +1527,11 @@ def cmd_install_deps(args) -> int:
     if needs_bnb and subprocess.call(["uv", "pip", "check", "--python", str(VENV_PY)], cwd=REPO) != 0:
         print("bitsandbytes was installed, but the environment is now inconsistent (see above). Run `uv sync --locked` to restore it and use `--profile fallback`.")
         return 1
-    print("\nDone. NOTE: do not run `uv sync` again; it removes bitsandbytes. If you do, re-run this command.")
+    if windows:
+        print("\nDone. NOTE: do not run `uv sync` OR any `uv run` here again; both revert torch to +cpu and remove bitsandbytes."
+              " Start the driver with the venv's own python (\\.venv\\Scripts\\python.exe experiments\\rtx4070\\...), not `uv run`. If you do sync, re-run this command.")
+    else:
+        print("\nDone. NOTE: do not run `uv sync` again; it removes bitsandbytes. If you do, re-run this command.")
     return 0
 
 

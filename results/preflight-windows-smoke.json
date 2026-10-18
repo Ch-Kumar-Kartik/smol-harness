@@ -1,0 +1,232 @@
+[
+  {
+    "id": "os",
+    "title": "Running on a supported host (native Windows, or Ubuntu inside WSL2)",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "ABCDE",
+    "status": "pass",
+    "detail": "native Windows 11 (AMD64); no WSL involvement",
+    "fix": ""
+  },
+  {
+    "id": "wsl2",
+    "title": "WSL2 (not WSL1)",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "ABCDE",
+    "status": "skip",
+    "detail": "not applicable: a native Windows run involves no WSL at all (the WSL-specific checks are skipped)",
+    "fix": ""
+  },
+  {
+    "id": "arch",
+    "title": "x86_64 CPU architecture",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "ABCDE",
+    "status": "pass",
+    "detail": "AMD64 native Windows",
+    "fix": ""
+  },
+  {
+    "id": "gpu_node",
+    "title": "WSL2 GPU device present (/dev/dxg)",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "ABCDE",
+    "status": "skip",
+    "detail": "not WSL",
+    "fix": ""
+  },
+  {
+    "id": "nvidia_smi",
+    "title": "nvidia-smi works and sees a GPU",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "ABCDE",
+    "status": "pass",
+    "detail": "NVIDIA GeForce RTX 4070, 12282 MiB, driver 610.88",
+    "fix": ""
+  },
+  {
+    "id": "gpu_identity",
+    "title": "GPU is an RTX 4070",
+    "phase": "pre",
+    "critical": false,
+    "needed_by": "ABCDE",
+    "status": "pass",
+    "detail": "NVIDIA GeForce RTX 4070",
+    "fix": ""
+  },
+  {
+    "id": "gpu_vram",
+    "title": "GPU has enough VRAM for this model set",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "ABCDE",
+    "status": "pass",
+    "detail": "12282 MiB total, 10990 MiB free now",
+    "fix": ""
+  },
+  {
+    "id": "driver_cuda",
+    "title": "NVIDIA driver supports CUDA 13.0 (needed by the locked PyTorch)",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "ACDE",
+    "status": "unverified",
+    "detail": "could not read 'CUDA Version' from nvidia-smi",
+    "fix": "Run nvidia-smi and check the CUDA Version in its header."
+  },
+  {
+    "id": "python3",
+    "title": "System Python 3 is recent enough for this driver",
+    "phase": "pre",
+    "critical": false,
+    "needed_by": "A",
+    "status": "pass",
+    "detail": "Python 3.12.10 (the project environment uses its own Python 3.12 from uv)",
+    "fix": ""
+  },
+  {
+    "id": "uv",
+    "title": "uv (Python package manager) is installed",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "A",
+    "status": "pass",
+    "detail": "uv 0.11.21 (5aa65dd7a 2026-06-11 x86_64-pc-windows-msvc)",
+    "fix": ""
+  },
+  {
+    "id": "git",
+    "title": "git is installed",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "ABCDE",
+    "status": "pass",
+    "detail": "git version 2.52.0.windows.1",
+    "fix": ""
+  },
+  {
+    "id": "repo_state",
+    "title": "Repository revision recorded",
+    "phase": "pre",
+    "critical": false,
+    "needed_by": "ABCDE",
+    "status": "warn",
+    "detail": "commit 60ffb1a558 with local changes (15 files): results will say so",
+    "fix": "Run `git status` and undo local edits unless the maintainer asked for them."
+  },
+  {
+    "id": "repo_location",
+    "title": "Repository location (Linux filesystem under WSL, anywhere local on native Windows)",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "ABCDE",
+    "status": "pass",
+    "detail": "native Windows path: E:\\smol-harness (the /mnt slowness trap only exists under WSL; the workspaces must still be disposable)",
+    "fix": ""
+  },
+  {
+    "id": "disk",
+    "title": "Enough free disk space",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "ABCDE",
+    "status": "pass",
+    "detail": "895 GiB free",
+    "fix": ""
+  },
+  {
+    "id": "ram",
+    "title": "Enough memory available to the experiment",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "ABCDE",
+    "status": "pass",
+    "detail": "63.1 GiB total, 46.6 GiB available",
+    "fix": ""
+  },
+  {
+    "id": "venv",
+    "title": "Project environment exists (.venv)",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "ABCDE",
+    "status": "pass",
+    "detail": "E:\\smol-harness\\.venv\\Scripts\\python.exe",
+    "fix": ""
+  },
+  {
+    "id": "deps",
+    "title": "effGen 1.3.0 and the harness import correctly",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "ABCDE",
+    "status": "pass",
+    "detail": "effgen 1.3.0, transformers 5.20.0, python 3.12.10",
+    "fix": ""
+  },
+  {
+    "id": "torch_cuda",
+    "title": "PyTorch sees and can compute on the GPU (no CPU fallback)",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "ACDE",
+    "status": "fail",
+    "detail": "torch 2.14.1+cpu (CUDA build None) reports no CUDA device",
+    "fix": "Check the driver (see the driver_cuda check) and `nvidia-smi`; do not continue on CPU."
+  },
+  {
+    "id": "bitsandbytes",
+    "title": "bitsandbytes pinned version (NF4 quantization)",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "CDE",
+    "status": "fail",
+    "detail": "ModuleNotFoundError: No module named 'bitsandbytes'",
+    "fix": "python3 experiments/rtx4070/rtx4070.py install-deps   (or use --profile fallback, which needs no bitsandbytes)"
+  },
+  {
+    "id": "sandbox",
+    "title": "Shell tool runs a command through the sandbox backend",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "E",
+    "status": "pass",
+    "detail": "echo ran inside the sandbox",
+    "fix": ""
+  },
+  {
+    "id": "workspace",
+    "title": "Experiment workspaces are disposable and safe",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "BDE",
+    "status": "pass",
+    "detail": "E:\\smol-harness\\experiments\\rtx4070\\results\\work (created per run, never reused, deleted after each attempt)",
+    "fix": ""
+  },
+  {
+    "id": "ollama_server",
+    "title": "Ollama server reachable",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "BDE",
+    "status": "pass",
+    "detail": "Ollama 0.40.6 at http://127.0.0.1:11434 (the Windows app is the intended setup on this host).",
+    "fix": ""
+  },
+  {
+    "id": "host_isolation",
+    "title": "Windows host is unreachable from the shell sandbox (stage E only; on native Windows the declared no-confinement scope applies)",
+    "phase": "pre",
+    "critical": true,
+    "needed_by": "E",
+    "status": "warn",
+    "detail": "native Windows: the shell backend runs a model's commands as your user (muj) with NO filesystem or network confinement (PowerShell + Job Object kill-tree only). Stage E under this scope means: trusted, disposable repositories only; every artifact is redacted; do not point the workspaces at anything with secrets. WSL2 remains the confined option.",
+    "fix": ""
+  }
+]

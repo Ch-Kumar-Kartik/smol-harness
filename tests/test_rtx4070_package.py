@@ -29,6 +29,14 @@ from types import SimpleNamespace
 
 import pytest
 
+# The experiment package targets a WSL2/Linux host on purpose (its stages run inside WSL2, and
+# the driver uses POSIX process groups, /proc and Linux paths). Its test pins therefore hold only
+# on POSIX: on Windows some genuinely kill the running pytest process (SIGTERM to a group). The
+# package and this module stay POSIX-only by design; the harness itself runs on Windows too.
+pytestmark = pytest.mark.skipif(platform.system() != "Linux",
+                                reason="the rtx4070 package is a WSL2/Linux experiment by design "
+                                       "( POSIX process groups, /proc, Linux paths); its pins run on POSIX hosts")
+
 PKG = Path(__file__).resolve().parents[1] / "experiments" / "rtx4070"
 sys.path.insert(0, str(PKG))
 import rtx4070 as rtx  # noqa: E402
@@ -279,7 +287,7 @@ def test_a_healthy_machine_has_no_blocking_failures(host):
 
 
 @pytest.mark.parametrize("change,check_id,expected_fix", [
-    (lambda h, m: m.setattr(rtx.platform, "system", lambda: "Windows"), "os", "Ubuntu"),
+    (lambda h, m: m.setattr(rtx, "IS_WINDOWS", True), "arch", "x86_64 (AMD64) wheels"),  # native Windows on a non-x86_64 CPU (mocked here as x86_64, which the Windows branch requires spelled "AMD64")
     (lambda h, m: (setattr(h, "proc_version", "Linux version 4.4.0-19041-Microsoft"), apply_text(h)), "wsl2", "wsl --set-version"),
     (lambda h, m: m.setattr(rtx, "DEV_DXG", h.tmp / "missing-dxg"), "gpu_node", "wsl --update"),
     (lambda h, m: setattr(h, "smi_rc", 127), "nvidia_smi", "Do NOT install a Linux NVIDIA driver"),

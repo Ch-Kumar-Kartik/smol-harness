@@ -11,6 +11,7 @@ import dataclasses
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 import time
@@ -409,8 +410,13 @@ def test_an_unavailable_shell_fails_before_any_model_is_loaded(tmp_path, models,
     config = make_config(tmp_path)
     shelled = dataclasses.replace(config.workers[1], tools=("file_operations", "shell"))
     config = dataclasses.replace(config, workers=(config.workers[0], shelled, config.workers[2]))
-    monkeypatch.setattr(platform, "system", lambda: "Windows")
-    with pytest.raises(ToolBuildError, match="needs Linux"):
+    # Any shell backend needs its host binary (bash on Linux, powershell.exe/pwsh on Windows); make
+    # them all appear missing, whichever platform the test runs on.
+    real = shutil.which
+    monkeypatch.setattr(shutil, "which",
+                        lambda name, *a, **k: None if name in ("bash", "unshare", "timeout", "powershell", "pwsh")
+                        else real(name, *a, **k))
+    with pytest.raises(ToolBuildError, match="tool 'shell' needs"):
         build_harness_from_config(config)
     assert models.loads == []
 

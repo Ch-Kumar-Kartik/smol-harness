@@ -79,7 +79,9 @@ If `sudo systemctl start ollama` fails with "System has not been booted with sys
 
 ## Sandbox
 
-Stage E needs the shell sandbox (Linux namespaces), and it refuses to run an unrestricted shell. If the preflight check "Shell sandbox starts" fails:
+## Sandbox
+
+Stage E needs a shell backend it can hold a real process tree over. Under WSL2 that is the Linux-namespace sandbox: if the preflight check "Shell sandbox starts" fails:
 
 - Make sure you are in WSL2 and Ubuntu is recent (`lsb_release -a`).
 - Namespaces must be allowed. On Ubuntu 24.04 try `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0` and re-run the preflight. This loosens Ubuntu's restriction on user namespaces for the whole distribution until the next restart, so do it only in a dedicated, disposable distribution; tell us if you needed it.

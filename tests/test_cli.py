@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -277,9 +278,13 @@ def test_a_model_that_cannot_load_is_a_startup_failure_and_releases_the_others(t
 def test_an_unavailable_shell_is_a_startup_failure_before_any_model_loads(tmp_path, models, monkeypatch, capsys):
     shelled = {"name": "runner", "description": "runs", "tools": ["shell"], "max_iterations": 2,
                "model": {"provider": "ollama", "model": SMALL, "context_length": 4096}}
-    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    # Any shell backend needs its host binary (bash on Linux, powershell.exe/pwsh on Windows); make
+    # them all appear missing, whichever platform the test runs on.
+    real = shutil.which
+    monkeypatch.setattr(shutil, "which",
+                        lambda name, *a, **k: None if name in ("bash", "powershell", "pwsh") else real(name, *a, **k))
     code, out, err = cli_run(tmp_path, config=write_config(tmp_path, extra_workers=[shelled]), capsys=capsys)
-    assert code == 3 and "needs Linux" in err and models.loads == []
+    assert code == 3 and "tool 'shell' needs" in err and models.loads == []
 
 
 # ---- the compatibility patch is initialised explicitly by the CLI --------------------------------------------------------------------------

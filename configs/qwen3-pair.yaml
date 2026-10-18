@@ -1,0 +1,31 @@
+workspace: ../workspace
+
+limits:
+  max_delegations: 4
+  max_report_chars: 4000
+  worker_timeout_s: 600
+
+orchestrator:
+  model:
+    provider: ollama
+    model: qwen3:14b-q4_K_M
+    quantization: server
+    context_length: 8192
+    base_url: http://127.0.0.1:11434/v1
+  tools: [file_operations]
+  max_iterations: 8
+  system_prompt: >-
+    You coordinate worker agents. Split the user's task into self-contained pieces, delegate them
+    with the delegate tool, and answer from the workers' reports.
+
+workers:
+  - name: coder
+    description: Reads, searches and edits files in the workspace and runs shell commands.
+    model:
+      provider: ollama
+      model: dengcao/Qwen3-4B:Q5_K_M
+      quantization: server
+      context_length: 8192
+      base_url: http://127.0.0.1:11434/v1
+    tools: [file_operations, shell]
+    max_iterations: 8

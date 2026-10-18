@@ -26,6 +26,16 @@ It runs five bounded experiments (A to E) with two small language models on your
 
 Close games, browsers with video, and other GPU-heavy programs before the experiments. They share the 12 GB of video memory. (The experiment unloads its own Ollama model between stages by itself; you never need to do that.)
 
+## Native Windows (alternative to the WSL2 steps below)
+
+The package now runs natively on Windows as well as inside WSL2; `rtx4070.py preflight` works out which host you are on and says what each one means. The steps 1 to 11 below are the WSL2 recipe (validated end to end). To run natively on Windows instead:
+
+- **Python**: use any Python 3.12 (`py -3.12` or a store install) to run the driver; the driver itself needs only the standard library. The project venv will be the `Scripts/python.exe` one (`preflight` reports it and accepts it).
+- **Dependencies**: `py -3.12 experiments/rtx4070/rtx4070.py install-deps` does `uv sync --locked`, then, ON WINDOWS ONLY, installs the CUDA 13 build of the SAME pinned torch (`torch==2.14.1+cu130` from `https://download.pytorch.org/whl/cu130`) because the uv lock resolves `torch 2.14.1+cpu` there, and the pinned `bitsandbytes`. Afterwards do NOT run `uv sync` or `uv run` in this checkout again — both revert torch to `+cpu` and remove bitsandbytes; start the driver with the venv's own interpreter (`\.venv\Scripts\python.exe experiments/rtx4070/rtx4070.py ...`).
+- **Ollama**: the Windows app IS the intended setup for a native run in stage B/D (the `ollama_server` check green-lights it).
+- **Stage E honesty**: on native Windows there is NO sandbox: model-issued shell commands run as your user with no filesystem or network confinement (a Job Object kills the process tree, nothing else). The `host_isolation` check reports exactly that as a WARN, and stage E runs only under this declared scope: trusted disposable repositories only, everything redacted. WSL2 remains the confined option; on a naive WSL2 setup stage E is refused instead.
+- **Windows kill-tree guarantee**: a stage that hangs is killed as a whole — with a Job Object over a start-suspended, resumed process tree (verified to kill even detached grandchildren started with `Start-Process`). One consequence: the stage runner is started with the real interpreter behind the uv venv trampoline, not with `Scripts/python.exe` itself, because the trampoline's own Job would let the stage's grandchildren escape.
+
 ## Step 1. Check the Windows NVIDIA driver (PowerShell)
 
 ```powershell

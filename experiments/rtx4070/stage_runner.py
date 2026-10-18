@@ -1,8 +1,10 @@
 #!/usr/bin/env python
 """Runs ONE experiment stage (B, C, D or E) inside the project environment and writes stage_X/result.json.
 
-Started by rtx4070.py with the project's own interpreter (`.venv/bin/python`), in its own process group, under a hard time limit; it is
-not meant to be run by hand. Everything here uses the harness through its normal interfaces (`smol-harness run` is `smol_harness.__main__.main`).
+Started by rtx4070.py with the project's own interpreter (`.venv/bin/python` on Linux/WSL2; on native Windows the real interpreter
+behind the uv trampoline, see the driver's stage_boot), inside its own POSIX process group or a Windows kill-on-close Job Object, under
+a hard time limit; it is not meant to be run by hand. Everything here uses the harness through its normal interfaces (`smol-harness
+run` is `smol_harness.__main__.main`).
 
 What is recorded is what REALLY happened: tool calls are logged by wrapping the real tools' `execute`, model generations by wrapping the real
 model, GPU memory by polling nvidia-smi, and the coding task is judged by inspecting the repository and running its tests ourselves. A model's
@@ -661,13 +663,27 @@ def stage_d(ctx, args) -> dict:
     return result
 
 
+def stage_e_gate(results: list, native_windows: bool) -> list:
+    """The (sandbox, host_isolation) checks that REFUSE stage E. Pure, so the gate is pinned: a WARN on host_isolation is only
+    accepted on native Windows, where it IS the declared no-confinement scope (never a silent pass); everything else still refuses."""
+    return [r for r in results if r["id"] in ("sandbox", "host_isolation")
+            and (r["status"] != drv.PASS and not (native_windows and r["id"] == "host_isolation" and r["status"] == drv.WARN))]
+
+
 def stage_e(ctx, args) -> dict:
     result: dict = {"stage": "E", "evidence": {}, "unverified": [], "runner_overrides": None if args.production_defaults else SAMPLING}
     # Defence in depth: the driver already refuses to start this stage; the runner re-checks, so running it directly cannot skip the safety gate.
-    blocked = [r for r in drv.run_checks(ctx, stage="E") if r["id"] in ("sandbox", "host_isolation") and r["status"] != drv.PASS]
-    if blocked:
-        return {**result, "status": drv.FAIL, "reason": "refused: model-run shell commands need the sandbox and an environment from which the Windows host is unreachable. "
-                + "; ".join(f"{r['id']}: {r['detail']}" for r in blocked), "refused_for_safety": True}
+    native_windows = drv.host_kind() == "native-windows"
+    refused = stage_e_gate(drv.run_checks(ctx, stage="E"), native_windows)
+    if refused:
+        return {**result, "status": drv.FAIL, "reason": "refused: model-run shell commands need a working sandbox backend and, under WSL2, an environment "
+                "the Windows host is unreachable from (on native Windows the declared no-confinement scope must have been checked). "
+                + "; ".join(f"{r['id']}: {r['detail']}" for r in refused), "refused_for_safety": True}
+    if native_windows:
+        result["declared_scope"] = ("native Windows: shell commands ran as the user with no filesystem or network confinement "
+                                    "(trusted disposable repositories only; the WSL2 route remains the confined option)")
+        result["unverified"].append("on native Windows the shell backend provides NO confinement; safety here is by the trust scope and redaction, "
+                                    "never by an erring sandbox")
     work = ctx.run_dir / "work" / "E"
     with GpuSampler() as gpu, runner_overrides(args.production_defaults):
         attempts = coding_attempts(ctx, work, args.attempts)

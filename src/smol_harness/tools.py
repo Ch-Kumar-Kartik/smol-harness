@@ -2,15 +2,18 @@
 
 The registry is fixed. Web or network tools, `delegate` (the harness adds it to the
 orchestrator only) and unknown names are never built. Path confinement for
-`file_operations` is effGen's own (`FileOperations`, audit §1.9); `shell` runs commands
-in effGen's `SubprocessSandbox` (Linux namespaces) and fails closed when that cannot
-be enforced (audit Part 3, T4.2). Neither is a VM or container boundary.
+`file_operations` is effGen's own (`FileOperations`, audit §1.9). The `shell` backend is
+per platform and never degrades silently: on Linux it is effGen's `SubprocessSandbox`
+(Linux namespaces, fail closed without them, T4.2); on Windows it is the native Job-Object
+backend (`smol_harness.shell_win`), which enforces fewer guarantees and says so. Neither
+is a VM or container boundary.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 import os
 import platform
@@ -66,7 +69,9 @@ def resolve_workspace(workspace: Path | str) -> Path:
 
 
 class WorkspaceFileOperations(FileOperations):
-    """effGen's `FileOperations`, except that a successful `write` says what it wrote.
+    """effGen's `FileOperations`, except that a successful `write` says what it wrote, and on
+    Windows what it wrote is byte-exact (effGen's text-mode write translates \\n to \\r\\n there;
+    `_restore_translated_write` undoes exactly that).
 
     effGen answers a write with the bare path, so rewriting a file (or writing two files) yields the same text
     each time. effGen's loop guards read "the same result text again" as a repeat and end the run (review F2,
@@ -79,15 +84,47 @@ class WorkspaceFileOperations(FileOperations):
     async def _execute(self, **kwargs: Any) -> dict[str, Any]:
         out = await super()._execute(**kwargs)
         if kwargs.get("operation") == "write" and out.get("success") and isinstance(out.get("data"), str):
+            self._restore_translated_write(Path(out["data"]), kwargs)
             try:
                 written = Path(out["data"])
                 body = written.read_bytes()
             except OSError:
                 return out  # the write succeeded; a summary that cannot be read back is not worth failing it
-            shown = written.relative_to(self._allowed_directories[0]) if written.is_relative_to(self._allowed_directories[0]) else written
+            shown = written.relative_to(self._allowed_directories[0]).as_posix() \
+                if written.is_relative_to(self._allowed_directories[0]) else str(written)
             lines = body.count(b"\n") + (1 if body and not body.endswith(b"\n") else 0)
             out = {**out, "data": f"wrote {shown} ({len(body)} bytes, {lines} line{"" if lines == 1 else "s"}, sha256 {hashlib.sha256(body).hexdigest()[:8]})"}
         return out
+
+    @staticmethod
+    def _restore_translated_write(path: Path, kwargs: dict[str, Any]) -> None:
+        """Rewrite a just-written file byte-exactly when Windows text-mode translation changed it.
+
+        effGen writes with `open(path, "w")`, so on Windows the "\\n" the agent sent reaches the
+        disk as "\\r\\n", and an actual "\\r\\n" as "\\r\\r\\n" — neither round-trips, and hashes,
+        tests and git then see different bytes than the agent wrote. The rewrite is exact: the
+        expected bytes are recomputed the way effGen formats the content (plain text, or JSON
+        re-indented with the same `dumps` call). Anything else (csv's own \\r\\n terminators, a
+        non-UTF-8 encoding, an unrecognised shape) is left untouched.
+        """
+        fmt = kwargs.get("format")
+        if os.name != "nt" or fmt == "csv" or kwargs.get("encoding", "utf-8") != "utf-8":
+            return
+        try:
+            if fmt == "json":
+                expected = json.dumps(json.loads(kwargs["content"]), indent=2, ensure_ascii=False).encode("utf-8")
+            else:
+                expected = kwargs["content"].encode("utf-8")
+            body = path.read_bytes()
+        except (KeyError, TypeError, ValueError, OSError):
+            return
+        if body == expected:
+            return
+        if body.replace(b"\r\n", b"\n") == expected:  # only the translation differs
+            try:
+                path.write_bytes(expected)  # the agent's bytes, exactly, on every platform
+            except OSError:
+                pass
 
 
 def _file_operations(workspace: Path) -> BaseTool:
@@ -109,9 +146,11 @@ def require_shell_host() -> None:
     if platform.system() != "Linux":
         # effGen's SubprocessSandbox returns an *unsandboxed* `bash -c` plan off Linux, and
         # DockerSandbox does not mount the workspace, so neither is usable (audit §1.9, T4.2).
-        raise ToolBuildError(f"tool 'shell' needs Linux (found {platform.system()!r}): effGen's subprocess "
-                             "sandbox provides no isolation elsewhere. On Windows, run the harness inside WSL2 "
-                             "(not tested).")
+        # Native Windows does not need this check: there `shell` builds as the Job-Object
+        # backend (smol_harness.shell_win) instead of a WSL2-only arrangement.
+        raise ToolBuildError(f"tool 'shell' needs Linux (found {platform.system()!r}): on non-Linux POSIX and "
+                             "macOS hosts effGen's sandbox provides no isolation (native Windows is served by the "
+                             "Job-Object backend instead; this Linux backend would need WSL2).")
     missing = [b for b in ("bash", "unshare", "timeout") if shutil.which(b) is None]
     if missing:
         raise ToolBuildError(f"tool 'shell' needs {', '.join(missing)} on PATH (bash, util-linux unshare, GNU timeout)")
@@ -129,7 +168,7 @@ _HIDE_HOST_SOCKETS = (
 )
 
 
-class ShellTool(BaseTool):
+class _LinuxShellTool(BaseTool):
     """`bash -c <command>` in the workspace, inside effGen's `SubprocessSandbox`.
 
     Enforced (verified by tests, Linux with unprivileged user namespaces): writes only inside the
@@ -137,6 +176,7 @@ class ShellTool(BaseTool):
     command started, an address-space limit. Not enforced: **reads** (any file the user can read is
     readable, credential stores are masked by a deny-list), CPU/disk/output quotas beyond the
     address-space limit and a process-count `ulimit` that is per user, not per sandbox.
+    On Windows, `_shell_tool_class()` swaps in the native Job-Object backend instead of this class.
     """
 
     executes_every_call = True  # a repeated command must run again; see STATEFUL_TOOL_MARKER
@@ -330,11 +370,37 @@ def _report(echo: str, exit_code: int, timed_out: bool, timeout_s: int, stdout: 
     return "\n".join(lines)
 
 
+def _shell_tool_class() -> type:
+    """The shell tool for this platform, chosen once per process, never guessed.
+
+    `shell` on POSIX is `_LinuxShellTool`: effGen's `SubprocessSandbox` with Linux user
+    namespaces. On Windows there are no unprivileged user namespaces, so the native
+    Job-Object backend (`smol_harness.shell_win.WindowsShellTool`) takes over: same name,
+    same parameters, same result shape, differently enforced guarantees (each reported
+    honestly by the tool itself). Neither degrades silently: each refuses to build off
+    its platform.
+    """
+    if platform.system() == "Windows":
+        from smol_harness.shell_win import WindowsShellTool
+        return WindowsShellTool
+    return _LinuxShellTool
+
+
+def _build_shell(workspace: Path) -> BaseTool:
+    return _shell_tool_class()(workspace)
+
+
 _REGISTRY: dict[str, Callable[[Path], BaseTool]] = {
     "file_operations": _file_operations,
-    "shell": ShellTool,
+    "shell": _build_shell,
 }
 TOOL_NAMES = tuple(_REGISTRY)
+
+
+def __getattr__(name: str):  # PEP 562: `ShellTool` resolves to this platform's shell class.
+    if name == "ShellTool":
+        return _shell_tool_class()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def build_tools(names: Sequence[str], workspace: Path | str) -> list[BaseTool]:
