@@ -16,14 +16,19 @@ import contextlib
 import dataclasses
 import gc
 import hashlib
+import importlib.metadata
 import io
 import json
 import os
+import platform
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import uuid
+from collections import Counter
 from pathlib import Path
 
 import rtx4070 as drv  # the stdlib-only driver next to this file (constants, redaction, Ollama helpers)
@@ -45,11 +50,137 @@ SINK = {"path": None}  # stage_X/attempts.jsonl: every finished attempt is appen
 GPU_FRACTION_MIN = 0.95  # an Ollama model that is less than this on the GPU has spilled to CPU
 
 
+# stage_X/trace.jsonl: one redacted line per event, written the moment it happens (attempts.jsonl only gets an attempt when it has FINISHED). A killed attempt
+# therefore keeps every generation and tool call up to the kill, and the missing `attempt_end` says it did not finish. `role`/`delegation_id` say which agent is
+# running: DelegateTool.execute (wrapped by tool_log) switches them to the worker for the length of the delegation. Module state, not a ContextVar, because
+# effGen may run a tool on another thread. Prompts are NOT stored (length and SHA-256 only): a prompt can hold anything a tool read, and shared artifacts must not.
+# Identity of a line: `run_id` (the results folder) + `stage` + `invocation` (one per runner process, so re-running a stage into the same folder cannot be confused with the
+# first run) + `attempt`. `seq` counts the lines of one invocation. `pending`/`observing` belong to the stop-sequence accounting (see settle_pending).
+def fresh_trace(**fields) -> dict:
+    return {"path": None, "stage": None, "run_id": None, "invocation": None, "attempt": None, "role": "orchestrator", "delegation_id": None, "event": 0, "turns": {},
+            "pending": None, "observing": False, **fields}
+
+
+TRACE = fresh_trace()
+
+
 def keep(record: dict) -> None:
-    """Append one finished attempt (redacted) to the stage's attempts.jsonl. No-op when no sink is set (direct calls in tests)."""
+    """Append one finished attempt (redacted) to the stage's attempts.jsonl. No-op when no sink is set (direct calls in tests). The record carries the run, stage and
+    invocation it belongs to: attempts.jsonl is appended to by every invocation of a stage."""
     if SINK["path"] is not None:
+        record = {"run_id": TRACE["run_id"], "stage": TRACE["stage"], "invocation_id": TRACE["invocation"], **record}
         with open(SINK["path"], "a") as handle:
             handle.write(drv.redact(json.dumps(record, default=str)) + "\n")
+    verification = record.get("verification") or {}
+    trace("attempt_end", attempt=record.get("attempt_id"), kind=record.get("kind"), success=record.get("success"),
+          agent_completed=verification.get("agent_completed"), task_verified=verification.get("task_verified"))
+
+
+def write_event(event: str, **fields) -> int | None:
+    """Append one line to trace.jsonl (redacted) and return its `seq`; None without a sink. A failing write is NOT swallowed: evidence that silently stops is worse than a stopped run."""
+    if TRACE["path"] is None:
+        return None
+    TRACE["event"] += 1
+    attempt = fields.pop("attempt", TRACE["attempt"])
+    line = {"seq": TRACE["event"], "t_utc": drv.now(), "run_id": TRACE["run_id"], "stage": TRACE["stage"], "invocation": TRACE["invocation"], "attempt": attempt, "event": event, **fields}
+    with open(TRACE["path"], "a", encoding="utf-8") as handle:
+        handle.write(drv.redact(json.dumps(line, default=str)) + "\n")
+    return TRACE["event"]
+
+
+def trace(event: str, **fields) -> None:
+    """`write_event`, after the previous generation's consumed text has been settled (anything that happens next proves effGen is done with that generation)."""
+    if TRACE["path"] is None:
+        return
+    settle_pending()
+    write_event(event, **fields)
+
+
+# ---- what effGen CONSUMED of a generation (review 005, P1-A) -------------------------------------------------------------------------------------------------------------
+# effGen 1.3.0 handles stop sequences in one of two ways (core/agent_generation.py): it SENDS them in `config.stop_sequences` and leaves the cutting to the provider, or it
+# sends none and cuts the returned text itself with `apply_stop_sequences` AFTER `generate` returned (the reasoning-only retry, reasoning-stream models, providers that refuse
+# stops beside tools). A wrapper on `generate` sees `stop_sequences=None` in both cases and in the case where no stops are in force at all, and the list effGen cuts with is the
+# frame's, not necessarily the default ReAct one. So the cut cannot be computed from the config. It is OBSERVED instead: for the length of an attempt `apply_stop_sequences`
+# in effgen.core.agent_generation is wrapped (restored on exit; effGen's code is not changed) and sees the real input, list and output. Called on a generation => local cut;
+# not called by the time anything else happens => no stops were in force and effGen consumed the text as returned; not observable (no attempt scope, interrupted) => `None`
+# with a reason, never a guess. A cut that cannot be matched to a generation is written as `local_stop_cut_unmatched`.
+def finish_consumed(record: dict, handling: str, local_stops, consumed) -> None:
+    raw = record["raw_output"]
+    record.update(stop_handling=handling, stop_sequences_local=local_stops, consumed_output=consumed,
+                  discarded_chars=None if consumed is None else len(raw) - len(consumed),
+                  consumed_status="established" if consumed is not None else record.get("consumed_status", "unavailable"))
+    write_event("generation_consumed", attempt=record.get("attempt"), generation_seq=record.get("trace_seq"), stop_handling=handling, stop_sequences_local=local_stops,
+                consumed_output=consumed, discarded_chars=record["discarded_chars"], consumed_status=record["consumed_status"])
+
+
+def settle_pending(unknown_reason: str | None = None) -> None:
+    """Resolve the last generation whose stops were not sent. `unknown_reason` (an interruption) leaves its consumed text unavailable instead of assuming it was kept whole."""
+    record = TRACE["pending"]
+    if record is None:
+        return
+    TRACE["pending"] = None
+    if unknown_reason is not None:
+        record["consumed_status"] = f"unavailable: {unknown_reason}"
+        finish_consumed(record, "undetermined", None, None)
+    else:
+        finish_consumed(record, "none", [], record["raw_output"])
+
+
+@contextlib.contextmanager
+def local_stop_observer():
+    try:
+        import effgen.core.agent_generation as generation
+    except ImportError:  # effGen's layout changed: nothing can be observed, so nothing is claimed
+        yield
+        return
+    real = getattr(generation, "apply_stop_sequences", None)
+    if real is None:
+        yield
+        return
+
+    def observed(text, stop_sequences):
+        cut = real(text, stop_sequences)
+        stops = [stop_sequences] if isinstance(stop_sequences, str) else list(stop_sequences or [])
+        record = TRACE["pending"]
+        if record is not None and record["raw_output"] == text:
+            TRACE["pending"] = None
+            finish_consumed(record, "local", stops, cut)
+        else:
+            write_event("local_stop_cut_unmatched", stop_sequences_local=stops, chars_in=len(text), chars_out=len(cut))
+        return cut
+
+    generation.apply_stop_sequences = observed
+    TRACE["observing"] = True
+    try:
+        yield
+    finally:
+        TRACE["observing"] = False
+        generation.apply_stop_sequences = real
+
+
+@contextlib.contextmanager
+def attempt_scope(attempt_id: str, task: str, role: str, **fields):
+    """Mark an attempt in the trace: its exact task and setup first, `attempt_aborted` if anything (Ctrl-C included) ends it early. Also observes effGen's local stop
+    handling for the attempt's length, and settles the last generation before the attempt is over."""
+    settle_pending()
+    TRACE.update(attempt=attempt_id, role=role, delegation_id=None, turns={})
+    trace("attempt_start", task=task, initial_role=role, **fields)
+    with local_stop_observer():
+        try:
+            yield
+        except BaseException as exc:
+            settle_pending(unknown_reason="the attempt ended before effGen's stop handling for the last generation could be observed")
+            trace("attempt_aborted", error=f"{type(exc).__name__}: {str(exc)[:300]}")
+            raise
+        else:
+            settle_pending()
+
+
+def agent_context() -> dict:
+    """Who is running right now, and how many generations that agent run has made. effGen's own loop iteration is not visible to a model wrapper (it
+    reaches only `generate`), so the number recorded is this agent's generation ordinal, which also counts nudges and retries that the loop makes."""
+    role, delegation = TRACE["role"], TRACE["delegation_id"]
+    return {"role": role, "delegation_id": delegation, "generation_in_agent": TRACE["turns"].get(f"{role}:{delegation}", 0)}
 
 
 # ------------------------------------------------------------------------------------------------------------------ evidence accounting
@@ -65,6 +196,25 @@ def consumed_text(raw: str, stops) -> str:
     return raw[:cut]
 
 
+REASONING_KEYS = ("reasoning_tokens", "reasoning_chars", "reasoning_only", "empty_response_reason")
+
+
+def generation_limits(config) -> dict | None:
+    """The generation settings effGen passed with this call (max_tokens, temperature, seed, stop sequences, ...). None = no config was passed at all."""
+    if config is None:
+        return None
+    return dataclasses.asdict(config) if dataclasses.is_dataclass(config) else {"repr": repr(config)}
+
+
+def reasoning_evidence(result) -> dict:
+    """What the provider REPORTED about reasoning, without inventing values. `None` means not reported; it is not zero. effGen writes `reasoning_tokens` into the
+    result metadata only when it is non-zero (models/_adapter_utils.annotate_reasoning_only), so an absent key means 'not reported OR zero' and is kept as absent."""
+    meta = getattr(result, "metadata", None)
+    if not isinstance(meta, dict):
+        return {"metadata_available": False, "reported": [], **{key: None for key in REASONING_KEYS}}
+    return {"metadata_available": True, "metadata_keys": sorted(meta), "reported": [key for key in REASONING_KEYS if key in meta], **{key: meta.get(key) for key in REASONING_KEYS}}
+
+
 def call_record(provider: str, prompt, config, result, seconds: float) -> dict:
     """One model generation: the RAW engine text, the stop sequences effGen requested, and the text effGen kept. Counts of tokens are what the engine
     GENERATED (including discarded text); they are not a measure of what the agent consumed."""
@@ -73,6 +223,95 @@ def call_record(provider: str, prompt, config, result, seconds: float) -> dict:
     kept = consumed_text(raw, stops)
     return {"provider": provider, "prompt": str(prompt), "raw_output": raw, "stop_sequences": stops, "consumed_output": kept, "discarded_chars": len(raw) - len(kept),
             "finish": result.finish_reason, "seconds": round(seconds, 2), "tokens": getattr(result, "tokens_used", None)}
+
+
+def generation_record(provider: str, prompt, config, result, seconds: float) -> dict:
+    """`call_record` (unchanged: a test pins it equal to tests/evidence.py) plus what a trajectory needs: the model name, the prompt's length and SHA-256 (the trace never
+    stores the prompt), the generation settings effGen passed, what the provider reported about reasoning, and its metadata as received (`None` = no metadata object)."""
+    text = str(prompt)
+    metadata = getattr(result, "metadata", None)
+    record = {**call_record(provider, prompt, config, result, seconds), "model": getattr(result, "model_name", None), "prompt_chars": len(text),
+              "prompt_sha256": hashlib.sha256(text.encode("utf-8", "replace")).hexdigest(), "limits": generation_limits(config), "reasoning": reasoning_evidence(result),
+              "provider_metadata": metadata if isinstance(metadata, dict) else None}
+    if record["stop_sequences"]:
+        # sent to the provider: effGen does no cutting of its own on this call; `consumed_output` is the call_record contract (text before the earliest sent stop)
+        record.update(stop_handling="provider", stop_sequences_local=None, consumed_status="established")
+    else:
+        # NOT sent: either no stops are in force or effGen cuts locally AFTER this call returns. `call_record` would say "consumed == raw", which is not known yet.
+        record.update(stop_handling="undetermined", stop_sequences_local=None, consumed_output=None, discarded_chars=None,
+                      consumed_status="pending" if TRACE["observing"] else "unavailable: effGen's local stop handling was not being observed (outside an attempt scope)")
+    return record
+
+
+def written_actions(text: str) -> list:
+    """Tool names a ReAct text WRITES (`Action: name`). A heuristic parse of model text; it never says anything was executed."""
+    return re.findall(r"(?:^|\n)[ \t]*Action:[ \t]*([A-Za-z_][\w.-]*)", text or "")
+
+
+def action_accounting(calls: list, executed: list) -> dict:
+    """Actions written in raw text, in the text effGen kept, and the tool calls that really ran (wrapper at `execute`). Only `executed` counts as a call; a
+    delegation written after a self-made `Observation:` shows up as raw-but-not-executed."""
+    raw = Counter(name for c in calls for name in written_actions(c["raw_output"]))
+    known = [c for c in calls if c["consumed_output"] is not None]
+    kept = Counter(name for c in known for name in written_actions(c["consumed_output"]))
+    ran = Counter(e["tool"] for e in executed)
+    return {"written_in_raw_text": dict(raw), "written_in_consumed_text": dict(kept), "generations_with_consumed_text_unavailable": len(calls) - len(known), "executed": dict(ran),
+            "raw_not_executed": {tool: n - ran[tool] for tool, n in raw.items() if n > ran[tool]},
+            "consumed_not_executed": {tool: n - ran[tool] for tool, n in kept.items() if n > ran[tool]}}
+
+
+def verdict(agent_completed: bool, checks: list) -> dict:
+    """The agent's own outcome and the runner's independent checks, kept apart. `checks` are (name, passed, detail). No checks verify nothing, so that is not a pass."""
+    items = [{"name": name, "passed": bool(passed), "detail": detail} for name, passed, detail in checks]
+    return {"agent_completed": bool(agent_completed), "checks": items, "task_verified": bool(items) and all(item["passed"] for item in items)}
+
+
+def tree_manifest(root: Path) -> dict:
+    """{relative path: sha256} of the files under `root`, taken by the runner from the real filesystem (not from anything the model said). Skips .git, caches, symlinks."""
+    found = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if path.is_symlink() or not path.is_file() or ".git" in relative.parts or "__pycache__" in relative.parts or path.suffix == ".pyc":
+            continue
+        found[relative.as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return found
+
+
+def tree_changes(root: Path, before: dict, after: dict) -> list:
+    """What really changed on disk between two manifests: path, kind of change, size and SHA-256. NOT the contents: the workspace is not archived, and whatever a model wrote
+    or read already appears in the tool calls of the trace (arguments and results), where the redaction applies; a second copy here would only widen what is shared."""
+    changes = []
+    for relative in sorted(set(before) | set(after)):
+        if before.get(relative) == after.get(relative):
+            continue
+        entry = {"path": relative, "change": "added" if relative not in before else "removed" if relative not in after else "modified", "sha256": after.get(relative)}
+        if relative in after:
+            entry["bytes"] = (root / relative).stat().st_size
+        changes.append(entry)
+    return changes
+
+
+def traced_generate(original, provider: str, calls: list):
+    """Wrap a model's `generate`: every call (or failure) is appended to `calls` and the trace, tagged with the agent that made it."""
+    def spy(prompt, config=None, **kw):
+        key = f"{TRACE['role']}:{TRACE['delegation_id']}"
+        TRACE["turns"][key] = TRACE["turns"].get(key, 0) + 1
+        who = agent_context()
+        started = time.perf_counter()
+        try:
+            result = original(prompt, config, **kw)
+        except BaseException as exc:
+            trace("generation_error", provider=provider, **who, prompt_chars=len(str(prompt)), limits=generation_limits(config), error=f"{type(exc).__name__}: {exc}")
+            raise
+        record = {**generation_record(provider, prompt, config, result, time.perf_counter() - started), **who, "attempt": TRACE["attempt"]}
+        calls.append(record)
+        trace("generation", **{k: v for k, v in record.items() if k not in ("prompt", "attempt")})
+        record["trace_seq"] = TRACE["event"] if TRACE["path"] is not None else None
+        if record["consumed_status"] == "pending":
+            TRACE["pending"] = record
+        return result
+
+    return spy
 
 
 def observation_accounting(calls: list) -> dict:
@@ -147,7 +386,7 @@ def result_reached_model(entries: list, prompts: list) -> bool:
     if not entries:
         return False
     for entry in entries:
-        key = entry.get("visible", "").strip()[:40]
+        key = (entry.get("visible") or "").strip()[:40]
         if not key or not any(key in prompt for prompt in prompts):
             return False
     return True
@@ -155,7 +394,9 @@ def result_reached_model(entries: list, prompts: list) -> bool:
 
 @contextlib.contextmanager
 def tool_log():
-    """Every tool call that really executed (wrapped at `execute`). A model-written 'Observation:' never appears here."""
+    """Every tool call that really executed (wrapped at `execute`), failures and exceptions included, with the arguments, the raw result and the model-visible text IN
+    FULL (they are the evidence). A model-written 'Observation:' or 'Action:' never appears here. While a `delegate` call runs, the trace attributes every generation and
+    tool call to that worker and delegation id (DelegateTool numbers its attempts d1, d2, ... from `_seq`; the id the tool reports is recorded and compared)."""
     from smol_harness.delegation import DelegateTool
     from smol_harness.tools import ShellTool, WorkspaceFileOperations
 
@@ -164,12 +405,46 @@ def tool_log():
 
     def wrap(original):
         async def execute(self, **kwargs):
+            is_delegate = isinstance(self, DelegateTool)
+            who = agent_context()
+            previous = (TRACE["role"], TRACE["delegation_id"])
+            seq_before = self._seq if is_delegate else None
+            if is_delegate:
+                # While the call runs, worker turns are attributed to the id this call WILL get (DelegateTool numbers its attempts from `_seq`). Whether the call was dispatched
+                # at all is decided afterwards: effGen's parameter validation can refuse it before the tool runs, and then no id was ever assigned (review 005, P1-B).
+                who = {**who, "delegation_id": f"d{seq_before + 1}"}
+                TRACE.update(role="worker", delegation_id=who["delegation_id"])
+            entry = {"tool": self.name, **who, "args": dict(kwargs)}
             started = time.perf_counter()
-            result = await original(self, **kwargs)
+
+            def settle_identity() -> None:
+                if is_delegate:
+                    dispatched = self._seq > seq_before
+                    entry.update(dispatched=dispatched, delegation_id=f"d{self._seq}" if dispatched else None)
+
+            try:
+                result = await original(self, **kwargs)
+            except BaseException as exc:
+                settle_identity()
+                entry.update(success=False, exception=True, seconds=round(time.perf_counter() - started, 2), error=f"{type(exc).__name__}: {exc}", result=None, visible=None,
+                             visible_unavailable="the tool raised: effGen builds the error observation itself (its wording differs by cause) and this wrapper does not see it")
+                log.append(entry)
+                trace("tool_call", **entry)
+                raise
+            finally:
+                if is_delegate:
+                    TRACE.update(role=previous[0], delegation_id=previous[1])
+            settle_identity()
             shown = result.output.get("result") if isinstance(result.output, dict) and "result" in result.output else result.output
-            visible = model_visible(result)
-            log.append({"tool": self.name, "args": {k: (v if len(str(v)) < 300 else str(v)[:300] + "...") for k, v in kwargs.items()}, "success": result.success,
-                        "seconds": round(time.perf_counter() - started, 2), "error": (result.error or "")[:300] or None, "result": str(shown)[:400], "visible": visible[:400]})
+            entry.update(success=result.success, exception=False, seconds=round(time.perf_counter() - started, 2), error=result.error or None, result=str(shown),
+                         visible=model_visible(result))
+            if is_delegate:
+                try:
+                    entry["delegation_id_reported"] = json.loads(result.output).get("delegation_id")
+                except (TypeError, ValueError, AttributeError):
+                    entry["delegation_id_reported"] = None  # a refused call returns an error text, not a report
+            log.append(entry)
+            trace("tool_call", **entry)
             return result
         return execute
 
@@ -226,6 +501,7 @@ def tracing_build(loads: list, calls: list, residency: dict | None = None):
     def build(spec):
         instance = real(spec)
         loads.append(instance)
+        trace("model_loaded", provider=spec.provider, spec=dataclasses.asdict(spec) if dataclasses.is_dataclass(spec) else repr(spec), model_name=getattr(instance, "model_name", None))
         if residency is not None and spec.provider == "hf":
             try:
                 residency["placements"].append(sorted({p.device.type for p in instance.model.parameters()}))
@@ -241,10 +517,10 @@ def tracing_build(loads: list, calls: list, residency: dict | None = None):
             instance.unload = unload
         original = instance.generate
 
+        traced = traced_generate(original, spec.provider, calls)
+
         def spy(prompt, config=None, **kw):
-            started = time.perf_counter()
-            result = original(prompt, config, **kw)
-            calls.append(call_record(spec.provider, prompt, config, result, time.perf_counter() - started))
+            result = traced(prompt, config, **kw)
             if residency is not None and spec.provider == "ollama" and residency["hf_loaded"]:
                 residency["probes"].append(coresidency_probe(spec.model))
             return result
@@ -253,6 +529,24 @@ def tracing_build(loads: list, calls: list, residency: dict | None = None):
         return instance
 
     return build
+
+
+def stage_header(ctx, args) -> dict:
+    """What a stage ran on, recorded at its start: run id, commit, the versions the RUNNING interpreter has, hardware, Ollama version, the model set and the sampling
+    overrides. `None` = not installed / not reachable / not reported (never a guess). The driver's environment/ folder holds the full package list and nvidia-smi output."""
+    def version(name):
+        try:
+            return importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            return None
+
+    gpus, gpu_error = drv.nvidia_smi_gpus()
+    status, data, _ = drv.http_json("GET", "/api/version", timeout=3)
+    return {"run_id": ctx.run_dir.name, "profile": ctx.profile_name, "git": drv.git_info(), "python": platform.python_version(), "platform": platform.platform(),
+            "machine": platform.machine(), "versions": {name: version(name) for name in ("effgen", "torch", "transformers", "bitsandbytes", "accelerate", "openai", "smol-harness")},
+            "gpus": gpus or None, "gpu_error": gpu_error or None, "ollama_version": data.get("version") if status == 200 and isinstance(data, dict) else None,
+            "models": {"ollama": ctx.profile.get("ollama"), "hf": ctx.profile.get("hf")}, "runner_overrides": None if args.production_defaults else SAMPLING,
+            "attempts_requested": args.attempts}
 
 
 @contextlib.contextmanager
@@ -272,8 +566,14 @@ def runner_overrides(production_defaults: bool):
 
 
 def digest(calls: list, limit: int = 500) -> list:
-    return [{"provider": c.get("provider"), "seconds": c["seconds"], "tokens": c["tokens"], "finish": c["finish"], "raw_output": c["raw_output"][:limit],
-             "consumed_output": c["consumed_output"][:limit], "discarded_chars": c["discarded_chars"]} for c in calls]
+    """A SHORT view for attempts.jsonl and result.json. Cut text says so (`*_truncated`); the full generations are in trace.jsonl."""
+    return [{"provider": c.get("provider"), "role": c.get("role"), "delegation_id": c.get("delegation_id"), "generation_in_agent": c.get("generation_in_agent"),
+             "seconds": c["seconds"], "tokens": c["tokens"], "finish": c["finish"], "limits": c.get("limits"), "reasoning": c.get("reasoning"),
+             "stop_sequences_sent": c.get("stop_sequences"), "stop_handling": c.get("stop_handling"), "stop_sequences_local": c.get("stop_sequences_local"),
+             "raw_output": c["raw_output"][:limit], "raw_output_chars": len(c["raw_output"]), "raw_output_truncated": len(c["raw_output"]) > limit,
+             "consumed_output": None if c["consumed_output"] is None else c["consumed_output"][:limit], "consumed_status": c.get("consumed_status"),
+             "consumed_output_truncated": c["consumed_output"] is not None and len(c["consumed_output"]) > limit, "discarded_chars": c["discarded_chars"]}
+            for c in calls]
 
 
 def make_secret_workspace(root: Path) -> Path:
@@ -318,33 +618,34 @@ def tool_use_attempts(model, model_spec, work: Path, n: int) -> list:
             STATE["seed"] = i
             log.clear()
             ws = make_secret_workspace(work / f"tooluse-{i}")
+            before = tree_manifest(ws)
             config = harness_mod._agent_config(AgentSpec(name="reader", model=model_spec, tools=("file_operations",), max_iterations=4), model,
                                                build_tools(["file_operations"], ws), "react")
             calls: list = []
             original = model.generate
-
-            def spy(prompt, config=None, _calls=calls, _orig=original, **kw):  # effGen passes `config=` by keyword: the name must match
-                started = time.perf_counter()
-                result = _orig(prompt, config, **kw)
-                _calls.append(call_record(model_spec.provider, prompt, config, result, time.perf_counter() - started))
-                return result
-
-            model.generate = spy
             started = time.perf_counter()
-            try:
-                with Agent(config) as agent:
-                    response = agent.run(READ_TASK)
-            finally:
-                del model.generate
+            with attempt_scope(f"tooluse-a{i + 1}", READ_TASK, "single", seed=i, model=dataclasses.asdict(model_spec), workspace_files_before=sorted(before)):
+                model.generate = traced_generate(original, model_spec.provider, calls)  # effGen passes `config=` by keyword: the wrapper's parameter name must match
+                try:
+                    with Agent(config) as agent:
+                        response = agent.run(READ_TASK)
+                finally:
+                    del model.generate
             executed = [e for e in log if e["tool"] == "file_operations"]
             read_ok = [e for e in executed if e["success"] and "secret.txt" in str(e["args"].get("path", ""))]
             seen = result_reached_model(executed, [c["prompt"] for c in calls[1:]])
             final = str(response.output)
-            record = {"attempt": i + 1, "seed": i, "seconds": round(time.perf_counter() - started, 1), "iterations": response.iterations, "termination": getattr(response, "termination", None),
+            checks = [("secret_read_executed", bool(read_ok), "a successful file_operations call on secret.txt really ran"),
+                      ("secret_reached_model", any(CODE in c["prompt"] for c in calls), "the code appears in a prompt the model was given"),
+                      ("answer_has_code", CODE in final, "the final answer contains the code")]
+            checked = verdict(bool(response.success), checks)
+            record = {"attempt": i + 1, "attempt_id": f"tooluse-a{i + 1}", "task": READ_TASK, "seed": i, "seconds": round(time.perf_counter() - started, 1),
+                      "iterations": response.iterations, "termination": getattr(response, "termination", None),
                       "any_call_executed": bool(executed), "executed_result_reached_model": seen, "valid_call_executed": bool(read_ok), "tools_really_executed": executed,
-                      "no_call_attempted": not executed, "final_answer": final[:300], "final_has_code": CODE in final, "generations": digest(calls),
-                      "observations": observation_accounting(calls), "trajectory": trajectory_id(calls),
-                      "success": bool(read_ok) and any(CODE in c["prompt"] for c in calls) and CODE in final and bool(response.success)}
+                      "no_call_attempted": not executed, "final_answer": final, "final_has_code": CODE in final, "generations": digest(calls),
+                      "observations": observation_accounting(calls), "actions": action_accounting(calls, log), "trajectory": trajectory_id(calls),
+                      "verification": checked, "workspace_changes": tree_changes(ws, before, tree_manifest(ws)),
+                      "success": checked["agent_completed"] and checked["task_verified"]}
             attempts.append(record)
             keep({"kind": "tool_use", **record})
             shutil.rmtree(ws, ignore_errors=True)
@@ -393,10 +694,13 @@ def delegation_attempts(ctx, work: Path, template: str, worker_kwargs: dict, tas
             real_build = models_mod.build_model
             models_mod.build_model = tracing_build(loads, calls, residency)
             before = drv.nvidia_smi_gpus()[0]
+            tree_before = tree_manifest(ws)
             started = time.perf_counter()
             try:
-                with tool_log() as log:
-                    code, doc, stderr = run_cli(config, task)
+                with attempt_scope(f"{label}-{variant}-a{i + 1}", task, "orchestrator", seed=i, variant=variant, config_file=str(config.relative_to(ctx.run_dir)),
+                                   workspace_files_before=sorted(tree_before)):
+                    with tool_log() as log:
+                        code, doc, stderr = run_cli(config, task)
             finally:
                 models_mod.build_model = real_build
             seconds = round(time.perf_counter() - started, 1)
@@ -407,14 +711,20 @@ def delegation_attempts(ctx, work: Path, template: str, worker_kwargs: dict, tas
             orchestrator_calls = [c for c in calls if "You are the worker agent" not in c["prompt"]]
             worker_prompts = [c["prompt"] for c in worker_calls]
             workers = (doc or {}).get("workers", [])
-            record = {"variant": variant, "attempt": i + 1, "seed": i, "seconds": seconds, "exit_code": code, "cli_success_flag": (doc or {}).get("success"),
+            reports = {w.get("delegation_id"): w for w in workers}
+            delegations = [{"delegation_id": e["delegation_id"], "worker": e["args"].get("worker"), "task": e["args"].get("task"), "context": e["args"].get("context"),
+                            "tool_success": e["success"], "report_status": (reports.get(e["delegation_id"]) or {}).get("status")} for e in delegate_runs]
+            record = {"variant": variant, "attempt": i + 1, "attempt_id": f"{label}-{variant}-a{i + 1}", "task": task, "delegations": delegations, "seed": i, "seconds": seconds,
+                      "exit_code": code, "cli_success_flag": (doc or {}).get("success"),
                       "termination": (doc or {}).get("termination"), "stop_reason": (doc or {}).get("stop_reason"), "error": (doc or {}).get("error"),
                       "models_built": [getattr(m, "model_name", "?") for m in loads],
                       "delegate_calls_executed": [e["args"] for e in delegate_runs], "worker_tools_really_executed": [e for e in log if e["tool"] != "delegate"],
                       "worker_records": workers, "worker_context_isolated": bool(worker_prompts) and not any("Available workers" in p for p in worker_prompts),
-                      "secret_reached_worker_model": any(CODE in p for p in worker_prompts), "final_answer": ((doc or {}).get("output") or "")[:300],
+                      "secret_reached_worker_model": any(CODE in p for p in worker_prompts), "final_answer": (doc or {}).get("output") or "",
                       "final_has_code": CODE in ((doc or {}).get("output") or ""), "cli_stderr_tail": drv.redact(stderr)[-500:], "generations": digest(calls),
-                      "observations": observation_accounting(calls), "trajectory": trajectory_id(calls),
+                      "observations": observation_accounting(calls), "actions": action_accounting(calls, log), "trajectory": trajectory_id(calls),
+                      "workspace_changes": tree_changes(ws, tree_before, tree_manifest(ws)),
+                      "role_split_agrees": [c["role"] == "worker" for c in calls] == ["You are the worker agent" in c["prompt"] for c in calls],
                       "orchestrator_generations": len(orchestrator_calls), "orchestrator_providers": sorted({c["provider"] for c in orchestrator_calls}),
                       "worker_generations": len(worker_calls), "worker_providers": sorted({c["provider"] for c in worker_calls}),
                       "delegation_report_reached_orchestrator": result_reached_model(delegate_runs, [c["prompt"] for c in orchestrator_calls]),
@@ -431,8 +741,13 @@ def delegation_attempts(ctx, work: Path, template: str, worker_kwargs: dict, tas
             record["executed_result_reached_model"] = result_reached_model(file_calls, worker_prompts[1:])
             record["mechanics_problems"] = delegation_problems(record, mixed)
             record["mechanics_ok"] = not record["mechanics_problems"]
-            record["success"] = bool(delegate_runs and worker_reads and workers and workers[0].get("status") == "completed" and record["secret_reached_worker_model"]
-                                     and record["final_has_code"] and (doc or {}).get("success"))
+            checked = verdict(bool((doc or {}).get("success") and workers and workers[0].get("status") == "completed"),
+                              [("delegate_executed", bool(delegate_runs), "the orchestrator really executed the delegate tool"),
+                               ("worker_read_secret", bool(worker_reads), "a successful file_operations call on secret.txt really ran"),
+                               ("secret_reached_worker_model", record["secret_reached_worker_model"], "the code appears in a prompt the worker model was given"),
+                               ("answer_has_code", record["final_has_code"], "the final answer contains the code")])
+            record["verification"] = checked
+            record["success"] = checked["agent_completed"] and checked["task_verified"]
             attempts.append(record)
             keep({"kind": f"delegation-{label}", **record})
             shutil.rmtree(ws, ignore_errors=True)
@@ -464,6 +779,7 @@ def coding_attempts(ctx, work: Path, n: int) -> list:
         for step in (("init", "-q", "-b", "main"), ("add", "-A"), ("commit", "-q", "-m", "initial: add() is wrong")):
             git(repo, *step)
         head, test_sha = git(repo, "rev-parse", "HEAD").strip(), hashlib.sha256((repo / "test_calc.py").read_bytes()).hexdigest()
+        tree_before = tree_manifest(repo)
         config = drv.render_config("mixed", ctx.run_dir, ctx, name=f"E-a{i + 1}", __WORKSPACE__=str(repo), __WORKER_NAME__="coder",
                                    __WORKER_DESCRIPTION__="reads, edits and tests code in the repository", __WORKER_TOOLS__="[file_operations, shell]",
                                    __HF_MODEL__=ctx.snapshot)
@@ -473,8 +789,9 @@ def coding_attempts(ctx, work: Path, n: int) -> list:
         models_mod.build_model = tracing_build(loads, calls)
         started = time.perf_counter()
         try:
-            with tool_log() as log:
-                code, doc, stderr = run_cli(config, CODING_TASK)
+            with attempt_scope(f"coding-a{i + 1}", CODING_TASK, "orchestrator", seed=i, config_file=str(config.relative_to(ctx.run_dir)), workspace_files_before=sorted(tree_before)):
+                with tool_log() as log:
+                    code, doc, stderr = run_cli(config, CODING_TASK)
         finally:
             models_mod.build_model = real_build
         seconds = round(time.perf_counter() - started, 1)
@@ -484,15 +801,21 @@ def coding_attempts(ctx, work: Path, n: int) -> list:
         shell_cmds = [e["args"].get("command") for e in log if e["tool"] == "shell"]
         test_runs = [c for c in shell_cmds if c and "pytest" in c]
         source_changed = (repo / "calc.py").read_text() != BUGGY
-        record = {"attempt": i + 1, "seed": i, "seconds": seconds, "exit_code": code, "cli_success_flag": (doc or {}).get("success"), "termination": (doc or {}).get("termination"),
-                  "stop_reason": (doc or {}).get("stop_reason"), "final_answer": ((doc or {}).get("output") or "")[:400], "worker_records": (doc or {}).get("workers", []),
+        test_unchanged = hashlib.sha256((repo / "test_calc.py").read_bytes()).hexdigest() == test_sha
+        checked = verdict(bool((doc or {}).get("success")),
+                          [("source_changed", source_changed, "calc.py differs from the buggy original"), ("test_file_unchanged", test_unchanged, "test_calc.py is byte-identical to the original"),
+                           ("independent_pytest_passes", host.returncode == 0, "pytest run by the runner on the host, not by the model")])
+        record = {"attempt": i + 1, "attempt_id": f"coding-a{i + 1}", "task": CODING_TASK, "seed": i, "seconds": seconds, "exit_code": code, "cli_success_flag": (doc or {}).get("success"),
+                  "termination": (doc or {}).get("termination"),
+                  "stop_reason": (doc or {}).get("stop_reason"), "final_answer": (doc or {}).get("output") or "", "worker_records": (doc or {}).get("workers", []),
                   "tool_executions": log[:], "shell_commands": shell_cmds, "pytest_runs": len(test_runs), "identical_test_command_rerun": len(test_runs) > len(set(test_runs)),
-                  "calc_py_after": (repo / "calc.py").read_text(), "test_file_unchanged": hashlib.sha256((repo / "test_calc.py").read_bytes()).hexdigest() == test_sha,
+                  "calc_py_after": (repo / "calc.py").read_text(), "test_file_unchanged": test_unchanged,
                   "head_unchanged": git(repo, "rev-parse", "HEAD").strip() == head, "git_status": git(repo, "status", "--porcelain").splitlines(),
                   "files_in_repo": sorted(p.name for p in repo.iterdir()), "independent_pytest_returncode": host.returncode,
                   "independent_pytest_tail": host.stdout.strip().splitlines()[-3:], "cli_stderr_tail": drv.redact(stderr)[-500:], "generations": digest(calls),
-                  "observations": observation_accounting(calls), "trajectory": trajectory_id(calls)}
-        record["success"] = source_changed and record["test_file_unchanged"] and host.returncode == 0
+                  "observations": observation_accounting(calls), "actions": action_accounting(calls, log), "trajectory": trajectory_id(calls), "verification": checked,
+                  "workspace_changes": tree_changes(repo, tree_before, tree_manifest(repo))}
+        record["success"] = checked["task_verified"]  # judged by the repository and our own pytest run, as before; the agent's flag is recorded beside it
         record["answer_claims_pass_but_repo_fails"] = ("pass" in record["final_answer"].lower()) and host.returncode != 0
         diff = git(repo, "diff", "HEAD")
         drv.write_text(ctx.run_dir / "stage_E" / f"repo_diff_attempt{i + 1}.diff", diff or "(no changes to tracked files)\n")
@@ -704,13 +1027,21 @@ def main(argv=None) -> int:
         started = time.time()
         (Path(args.run_dir) / f"stage_{args.stage}").mkdir(parents=True, exist_ok=True)
         SINK["path"] = Path(args.run_dir) / f"stage_{args.stage}" / "attempts.jsonl"
+        TRACE.clear()
+        TRACE.update(fresh_trace(path=Path(args.run_dir) / f"stage_{args.stage}" / "trace.jsonl", stage=args.stage, run_id=Path(args.run_dir).name, invocation=uuid.uuid4().hex[:12]))
         try:
+            try:
+                header = stage_header(ctx, args)
+            except Exception as exc:  # noqa: BLE001 - missing header facts must not fail the stage; they are recorded as missing
+                header = {"header_error": f"{type(exc).__name__}: {exc}"[:300]}
+            trace("stage_start", **header)
             result = STAGE_FUNCS[args.stage](ctx, args)
         except Exception as exc:  # noqa: BLE001 - a crash is a result, with its diagnosis
             import traceback
             result = {"stage": args.stage, "status": drv.FAIL, "reason": f"{type(exc).__name__}: {exc}"[:500], "traceback_tail": traceback.format_exc()[-1500:]}
         finally:
             SINK["path"] = None
+            TRACE["path"] = None
         result["runner_seconds"] = round(time.time() - started, 1)
     result["title"] = drv.TITLES[args.stage]
     result["finished_utc"] = drv.now()

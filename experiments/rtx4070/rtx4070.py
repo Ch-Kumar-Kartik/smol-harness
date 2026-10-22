@@ -1133,7 +1133,7 @@ def write_manifest(run_dir: Path) -> dict:
                 "models": {"profile": MODELS["profiles"].get(profile_name), "bitsandbytes_pin": MODELS["bitsandbytes"]["pin"]},
                 "stages": {s: {k: r.get(k) for k in ("status", "reason", "duration_s")} for s, r in results.items() if r},
                 "files": files, "excluded_from_archive": excluded, "re_redacted_files": [],
-                "never_collected": ["work/ (disposable workspaces)", "model weights"],
+                "never_collected": ["work/ (the disposable workspace folders themselves; file contents and shell output that passed through tool calls ARE in trace.jsonl, attempts.jsonl, cli_*.json and repo_diff files, redacted by pattern only)", "model weights"],
                 "redaction": "credentials, tokens, environment values with sensitive names and personal paths are removed before writing"}
     write_json(run_dir / "manifest.json", manifest)
     return manifest
@@ -1279,7 +1279,7 @@ def secrets_left(text: str) -> list:
         m.group(0)[:40] for m in re.finditer(r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?!\s*\(redacted\))", text)]
 
 
-TEXT_SUFFIXES = (".json", ".txt", ".log", ".md", ".yaml", ".yml", ".csv", ".diff")
+TEXT_SUFFIXES = (".json", ".jsonl", ".txt", ".log", ".md", ".yaml", ".yml", ".csv", ".diff")  # .jsonl: attempts.jsonl and trace.jsonl get the same second pass
 
 
 def re_redact_text_files(run_dir: Path) -> list:
