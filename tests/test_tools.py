@@ -41,17 +41,18 @@ WEB_LIKE = re.compile(r"web|search_engine|url_fetch|http", re.I)
 
 
 def _symlinks_ok() -> bool:
-    """Symlink creation needs a privilege on Windows (Developer Mode or admin)."""
-    probe = Path(tempfile.gettempdir()) / f"smol-symcheck-{os.getpid()}"
-    try:
-        probe.symlink_to(__file__)
-        probe.unlink()
-        return True
-    except OSError:
-        return False
+    """Symlink creation needs a privilege on Windows (Developer Mode or admin). Probed in a private directory."""
+    with tempfile.TemporaryDirectory(prefix="smol-symcheck-") as d:
+        try:
+            (Path(d) / "link").symlink_to(__file__)
+            return True
+        except OSError:
+            return False
 
 
-symlinks = pytest.mark.skipif(not _symlinks_ok(), reason="creating symlinks requires a privilege on this host")
+# Only Windows can lack the symlink privilege; on every other host a failing symlink is a real failure, never a skip.
+symlinks = pytest.mark.skipif(platform.system() == "Windows" and not _symlinks_ok(),
+                              reason="creating symlinks requires a privilege on this host")
 
 
 def run(tool: BaseTool, **kw):
@@ -210,10 +211,13 @@ def test_workspace_that_is_a_regular_file_is_rejected(tmp_path):
         build_tools(["file_operations"], f)
 
 
-@symlinks
-def test_empty_and_broken_symlink_workspaces_are_rejected(tmp_path):
+def test_empty_workspace_path_is_rejected():
     with pytest.raises(ToolBuildError, match="non-empty"):
         resolve_workspace("")
+
+
+@symlinks
+def test_broken_symlink_workspaces_are_rejected(tmp_path):
     (tmp_path / "broken").symlink_to(tmp_path / "nowhere")
     with pytest.raises(ToolBuildError, match="does not exist"):
         resolve_workspace(tmp_path / "broken")

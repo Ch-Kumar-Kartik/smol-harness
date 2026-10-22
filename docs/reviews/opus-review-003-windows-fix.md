@@ -93,3 +93,7 @@ Skips on the branch: 8 opt-in real-model tests, all 33 Windows-shell tests and 2
 ## Status
 
 Not merged. `main` is unchanged at `60ffb1a`. The branch is kept as the remote-tracking ref `origin/windows-fix`; no local branch was created, nothing was pushed or deleted. A resubmission should drop P0-1/P0-2 (or bring an approved opt-in design), remove the P2-2 artifacts, restore the P2-1 pins, and keep the Linux-neutral portability changes.
+
+## Follow-up (2026-10-22, after this review)
+
+The decision above stands: `origin/windows-fix` was not merged. Only the Linux-neutral portability fixes were re-applied by hand on `integrate/windows-portability` (independently reviewed: no P0/P1; one P2 in the new symlink test gate, since fixed). The findings above are unchanged; the "no local branch was created" sentence describes the state when this review was written.
