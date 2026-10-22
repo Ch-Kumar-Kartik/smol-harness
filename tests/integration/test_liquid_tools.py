@@ -22,6 +22,7 @@ import socket
 from pathlib import Path
 
 import pytest
+import tempfile
 import torch
 from tool_probe import probe_case
 
@@ -32,7 +33,7 @@ REVISION = "9e6c6ccf47cd318696e137d381a7ded8fe4df09f"
 FILES = ["config.json", "generation_config.json", "model.safetensors", "tokenizer.json",
          "tokenizer_config.json", "chat_template.jinja", "LICENSE"]
 CARD_WINDOW = 32768  # context length stated on the model card
-REPORT_PATH = Path(os.environ.get("SMOL_TOOLS_REPORT", "/tmp/smol-harness-lfm-tools.json"))
+REPORT_PATH = Path(os.environ.get("SMOL_TOOLS_REPORT", str(Path(tempfile.gettempdir()) / "smol-harness-lfm-tools.json")))
 JSON_CALL_PROMPT = "Output function calls as JSON."  # the model card's documented way to ask for JSON calls
 
 CASES = [

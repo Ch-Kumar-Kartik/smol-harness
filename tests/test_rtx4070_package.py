@@ -29,6 +29,9 @@ from types import SimpleNamespace
 
 import pytest
 
+# The package pins use POSIX process groups, /proc and Linux paths; on Windows some would signal the running pytest process.
+pytestmark = pytest.mark.skipif(platform.system() != "Linux", reason="the rtx4070 package pins run on POSIX hosts only")
+
 PKG = Path(__file__).resolve().parents[1] / "experiments" / "rtx4070"
 sys.path.insert(0, str(PKG))
 import rtx4070 as rtx  # noqa: E402

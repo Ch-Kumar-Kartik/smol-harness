@@ -40,6 +40,20 @@ from smol_harness.tools import (
 WEB_LIKE = re.compile(r"web|search_engine|url_fetch|http", re.I)
 
 
+def _symlinks_ok() -> bool:
+    """Symlink creation needs a privilege on Windows (Developer Mode or admin)."""
+    probe = Path(tempfile.gettempdir()) / f"smol-symcheck-{os.getpid()}"
+    try:
+        probe.symlink_to(__file__)
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+symlinks = pytest.mark.skipif(not _symlinks_ok(), reason="creating symlinks requires a privilege on this host")
+
+
 def run(tool: BaseTool, **kw):
     return asyncio.run(tool.execute(**kw))
 
@@ -90,6 +104,12 @@ def test_writes_a_workspace_file(fo, layout):
     data(run(fo, operation="write", path="a.txt", content="replaced"))
     assert (layout[0] / "a.txt").read_text() == "replaced"
 
+def test_write_summary_names_a_nested_file_with_forward_slashes(fo, layout):
+    # The summary is what the model sees; it must not depend on the host path separator.
+    (layout[0] / "pkg").mkdir()
+    summary = data(run(fo, operation="write", path="pkg/mod.py", content="y = 2\n"))
+    assert summary.startswith("wrote pkg/mod.py (")
+
 
 def test_nested_paths_create_parents_and_read_back(fo, layout):
     data(run(fo, operation="write", path="pkg/sub/mod.py", content="def f():\n    return 1\n"))
@@ -131,6 +151,7 @@ def test_absolute_path_escapes_are_refused(fo, layout):
     outside_unchanged(layout[1])
 
 
+@symlinks
 def test_symlink_escapes_are_refused_for_reads_and_writes(fo, layout):
     ws, outside = layout
     (ws / "file_link.txt").symlink_to(outside / "secret.txt")
@@ -146,6 +167,7 @@ def test_symlink_escapes_are_refused_for_reads_and_writes(fo, layout):
     outside_unchanged(outside)
 
 
+@symlinks
 def test_listing_and_search_do_not_leak_symlinked_or_parent_entries(fo, layout):
     ws, outside = layout
     (ws / "dir_link").symlink_to(outside, target_is_directory=True)
@@ -155,11 +177,13 @@ def test_listing_and_search_do_not_leak_symlinked_or_parent_entries(fo, layout):
     assert data(run(fo, operation="search", path=".", pattern="**/secret.txt", recursive=True)) == []
 
 
+@symlinks
 def test_symlink_inside_the_workspace_is_followed(fo, layout):
     (layout[0] / "alias.txt").symlink_to(layout[0] / "a.txt")
     assert data(run(fo, operation="read", path="alias.txt")) == "inside\n"
 
 
+@symlinks
 def test_a_symlinked_workspace_confines_to_its_target(layout, tmp_path):
     link = tmp_path / "ws_link"
     link.symlink_to(layout[0], target_is_directory=True)
@@ -186,6 +210,7 @@ def test_workspace_that_is_a_regular_file_is_rejected(tmp_path):
         build_tools(["file_operations"], f)
 
 
+@symlinks
 def test_empty_and_broken_symlink_workspaces_are_rejected(tmp_path):
     with pytest.raises(ToolBuildError, match="non-empty"):
         resolve_workspace("")
@@ -194,7 +219,8 @@ def test_empty_and_broken_symlink_workspaces_are_rejected(tmp_path):
         resolve_workspace(tmp_path / "broken")
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses permission bits")
+@pytest.mark.skipif(getattr(os, "geteuid", lambda: -1)() == 0, reason="root bypasses permission bits")
+@pytest.mark.skipif(platform.system() == "Windows", reason="POSIX permission bits do not restrict the owner there")
 def test_inaccessible_workspace_is_rejected(tmp_path):
     ws = tmp_path / "locked"
     ws.mkdir()
@@ -615,8 +641,10 @@ def test_network_is_blocked(shell):
 
 
 # ---- host Unix sockets (not covered by effGen's network namespace) ----------------------------------------
-HOST_SOCKETS = ["/run/systemd/resolve/io.systemd.Resolve", "/run/dbus/system_bus_socket", "/run/docker.sock",
-                f"/run/user/{os.getuid()}/bus", f"/run/user/{os.getuid()}/systemd/private"]
+HOST_SOCKETS: list[str] = []
+if platform.system() == "Linux":  # os.getuid does not exist elsewhere; these tests are linux_only anyway
+    HOST_SOCKETS = ["/run/systemd/resolve/io.systemd.Resolve", "/run/dbus/system_bus_socket", "/run/docker.sock",
+                    f"/run/user/{os.getuid()}/bus", f"/run/user/{os.getuid()}/systemd/private"]
 CONNECT = "python3 -c \"import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(2); s.connect(sys.argv[1])\" "
 
 
@@ -938,6 +966,7 @@ def test_home_directory_and_its_ancestors_are_rejected_but_subdirectories_are_no
     project = home / "projects" / "repo"
     project.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))  # Path.home() consults USERPROFILE on Windows
     for bad in (home, home.parent, tmp_path):
         with pytest.raises(ToolBuildError, match="contains the home directory"):
             build_tools(["file_operations"], bad)
@@ -945,6 +974,7 @@ def test_home_directory_and_its_ancestors_are_rejected_but_subdirectories_are_no
     assert resolve_workspace(home / "projects") == (home / "projects").resolve()
 
 
+@symlinks
 def test_a_symlink_to_the_filesystem_root_is_rejected(tmp_path):
     (tmp_path / "rootlink").symlink_to("/", target_is_directory=True)
     with pytest.raises(ToolBuildError, match="filesystem root"):

@@ -110,12 +110,12 @@ def redact_obj(obj):
 
 def write_json(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(redact_obj(data), indent=2, sort_keys=False, default=str) + "\n")
+    path.write_text(json.dumps(redact_obj(data), indent=2, sort_keys=False, default=str) + "\n", encoding="utf-8")
 
 
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(redact(text))
+    path.write_text(redact(text), encoding="utf-8")
 
 
 def sha256(path: Path) -> str:
@@ -864,14 +864,14 @@ def run_dir_for(profile_name: str, new: bool) -> Path:
     directory = RESULTS / run_id
     directory.mkdir(parents=True)
     write_json(directory / "run.json", {"run_id": run_id, "created_utc": now(), "profile": profile_name, "git": git_info()})
-    latest.write_text(run_id)
+    latest.write_text(run_id, encoding="ascii")
     return directory
 
 
 def read_json(path: Path, default):
     try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError):
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
         return default
 
 
@@ -985,7 +985,7 @@ def partial_attempts(stage_dir: Path) -> dict:
     path = stage_dir / "attempts.jsonl"
     if not path.exists():
         return {"attempts_recorded": 0}
-    lines = [ln for ln in path.read_text(errors="replace").splitlines() if ln.strip()]
+    lines = [ln for ln in path.read_text(encoding="utf-8", errors="replace").splitlines() if ln.strip()]
     return {"attempts_recorded": len(lines), "attempts_file": f"{stage_dir.name}/attempts.jsonl"}
 
 

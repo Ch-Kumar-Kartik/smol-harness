@@ -84,7 +84,9 @@ class WorkspaceFileOperations(FileOperations):
                 body = written.read_bytes()
             except OSError:
                 return out  # the write succeeded; a summary that cannot be read back is not worth failing it
-            shown = written.relative_to(self._allowed_directories[0]) if written.is_relative_to(self._allowed_directories[0]) else written
+            # as_posix: the model sees the same "sub/file.txt" on every platform (Windows would print a backslash).
+            shown = written.relative_to(self._allowed_directories[0]).as_posix() \
+                if written.is_relative_to(self._allowed_directories[0]) else str(written)
             lines = body.count(b"\n") + (1 if body and not body.endswith(b"\n") else 0)
             out = {**out, "data": f"wrote {shown} ({len(body)} bytes, {lines} line{"" if lines == 1 else "s"}, sha256 {hashlib.sha256(body).hexdigest()[:8]})"}
         return out

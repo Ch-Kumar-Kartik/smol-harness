@@ -53,6 +53,7 @@ from test_e2e_coding import BUGGY, FIXED, TEST_FILE, git, host_pytest, processes
 import smol_harness.__main__ as cli
 import smol_harness.harness as harness_mod
 import smol_harness.models as models_mod
+import tempfile
 from smol_harness.config import AgentSpec, ModelSpec
 from smol_harness.delegation import DelegateTool
 from smol_harness.harness import initialize_runtime
@@ -70,7 +71,7 @@ ATTEMPTS = 3
 CARD_WINDOW = 32768
 MAX_TOKENS = 256
 SAMPLING = dict(temperature=0.1, top_k=50, repetition_penalty=1.05)  # the model card's recommendation
-REPORT_PATH = Path(os.environ.get("SMOL_HARNESS_REPORT", "/tmp/smol-harness-lfm-harness.json"))
+REPORT_PATH = Path(os.environ.get("SMOL_HARNESS_REPORT", str(Path(tempfile.gettempdir()) / "smol-harness-lfm-harness.json")))
 CODE = "7391-QX"  # known only to a file on disk: it can reach the model only through an executed tool
 TEST_CMD = "python -m pytest -q -p no:cacheprovider test_calc.py"
 CODING_TASK = ("The test test_calc.py fails because add() in calc.py is wrong. Delegate to the worker 'coder': it must read calc.py, "

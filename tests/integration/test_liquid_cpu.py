@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 import pytest
+import tempfile
 import torch
 
 pytestmark = pytest.mark.real_model
@@ -40,7 +41,7 @@ PROMPT = "What is the capital of France? Answer in one short sentence."
 # Generation settings recommended on the model card: temperature 0.1, top_k 50, repetition_penalty 1.05.
 SAMPLING = dict(temperature=0.1, top_k=50, repetition_penalty=1.05)
 MAX_NEW_TOKENS = 32
-REPORT_PATH = Path(os.environ.get("SMOL_SMOKE_REPORT", "/tmp/smol-harness-lfm-cpu-smoke.json"))
+REPORT_PATH = Path(os.environ.get("SMOL_SMOKE_REPORT", str(Path(tempfile.gettempdir()) / "smol-harness-lfm-cpu-smoke.json")))
 
 
 def _proc_mb() -> dict[str, int]:
