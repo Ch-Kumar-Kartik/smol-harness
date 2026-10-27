@@ -72,7 +72,7 @@ def keep(record: dict) -> None:
     if SINK["path"] is not None:
         record = {"run_id": TRACE["run_id"], "stage": TRACE["stage"], "invocation_id": TRACE["invocation"], **record}
         with open(SINK["path"], "a") as handle:
-            handle.write(drv.redact(json.dumps(record, default=str)) + "\n")
+            handle.write(drv.redact_record(record) + "\n")  # values first, then the text (review B2: escaped secrets)
     verification = record.get("verification") or {}
     trace("attempt_end", attempt=record.get("attempt_id"), kind=record.get("kind"), success=record.get("success"),
           agent_completed=verification.get("agent_completed"), task_verified=verification.get("task_verified"))
@@ -86,7 +86,7 @@ def write_event(event: str, **fields) -> int | None:
     attempt = fields.pop("attempt", TRACE["attempt"])
     line = {"seq": TRACE["event"], "t_utc": drv.now(), "run_id": TRACE["run_id"], "stage": TRACE["stage"], "invocation": TRACE["invocation"], "attempt": attempt, "event": event, **fields}
     with open(TRACE["path"], "a", encoding="utf-8") as handle:
-        handle.write(drv.redact(json.dumps(line, default=str)) + "\n")
+        handle.write(drv.redact_record(line) + "\n")  # values first, then the text (review B2: escaped secrets)
     return TRACE["event"]
 
 

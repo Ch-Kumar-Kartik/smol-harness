@@ -33,7 +33,7 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_DB = Path(os.environ.get("SMOL_HISTORY_DB") or HERE / "history.db")
 SCHEMA_VERSION = 1
 
-SCHEMA = """
+TABLES = """
 CREATE TABLE imports (          -- what was imported, per invocation: decides whether a re-import changes anything
   invocation TEXT PRIMARY KEY, source TEXT NOT NULL, trace_lines INTEGER NOT NULL, trace_sha256 TEXT NOT NULL,   -- hash of the trace lines alone
   bundle_sha256 TEXT NOT NULL,                                                                                  -- hash of trace + attempts + prompts
@@ -66,7 +66,7 @@ CREATE TABLE tool_calls (
   tool_call_id TEXT PRIMARY KEY,  -- "<invocation>:<seq of tool_call_start>" ("<invocation>:<seq of tool_call>" for a legacy trace without starts)
   session_id TEXT NOT NULL REFERENCES sessions,
   started_seq INTEGER, completed_seq INTEGER, started_utc TEXT, completed_utc TEXT,
-  status TEXT NOT NULL,           -- completed | failed (it ran and reported failure, or raised) | unfinished (started, no completion line)
+  status TEXT NOT NULL,           -- completed (it ran and reported success) | returned (it gave back a result and NOTHING confirms success: success is NULL) | failed (it ran and reported failure, or raised) | unfinished (started, no completion line)
   tool TEXT, role TEXT, agent_name TEXT, generation_in_agent INTEGER,
   delegation_id TEXT,             -- agent context for a worker's call; for a `delegate` call the id it was CONFIRMED to get (NULL if refused or unfinished)
   delegation_id_expected TEXT,    -- `delegate` only: the id the call expected when it started
@@ -80,28 +80,30 @@ CREATE TABLE events (           -- every line that is not a message, a tool call
 CREATE TABLE issues (           -- everything that could not be imported cleanly, so nothing is lost silently
   issue_id INTEGER PRIMARY KEY, source TEXT NOT NULL, invocation TEXT, line_no INTEGER, kind TEXT NOT NULL, detail TEXT, excerpt TEXT);
 
-CREATE VIEW timeline AS
+"""
+
+
+# Views hold no data, so they are refreshed whenever a database is opened (see `connect`) instead of bumping the schema version.
+VIEWS = {
+    "timeline": """CREATE VIEW timeline AS
   SELECT session_id, start_seq AS seq, 'session_start' AS kind, session_id AS ref, NULL AS role, NULL AS delegation_id FROM sessions WHERE start_seq IS NOT NULL
   UNION ALL SELECT session_id, seq, 'message', message_id, role, delegation_id FROM messages
   UNION ALL SELECT session_id, started_seq, 'tool_start', tool_call_id, role, COALESCE(delegation_id, delegation_id_expected) FROM tool_calls WHERE started_seq IS NOT NULL
   UNION ALL SELECT session_id, completed_seq, 'tool_end', tool_call_id, role, delegation_id FROM tool_calls WHERE completed_seq IS NOT NULL
-  UNION ALL SELECT session_id, end_seq, 'session_end', session_id, NULL, NULL FROM sessions WHERE end_seq IS NOT NULL;
-
-CREATE VIEW delegations AS      -- a delegate call: what was asked, of whom, and how it ended
+  UNION ALL SELECT session_id, end_seq, 'session_end', session_id, NULL, NULL FROM sessions WHERE end_seq IS NOT NULL""",
+    "delegations": """CREATE VIEW delegations AS      -- a delegate call: what was asked, of whom, and how it ended
   SELECT session_id, tool_call_id, started_seq, COALESCE(delegation_id, delegation_id_expected) AS delegation_id, delegation_id IS NOT NULL AS confirmed,
          json_extract(args, '$.worker') AS worker, json_extract(args, '$.task') AS task, status, dispatched, requested_by_message_id
-  FROM tool_calls WHERE tool = 'delegate';
-
-CREATE VIEW tool_counts AS      -- unfinished calls are NOT executions that completed
-  SELECT session_id, tool, role, SUM(status = 'completed') AS completed, SUM(status = 'failed') AS failed, SUM(status = 'unfinished') AS unfinished
-  FROM tool_calls GROUP BY session_id, tool, role;
-
-CREATE VIEW session_usage AS    -- sums of what providers REPORTED; the *_without_usage columns say how incomplete the sums are
+  FROM tool_calls WHERE tool = 'delegate'""",
+    "tool_counts": """CREATE VIEW tool_counts AS      -- unfinished calls are NOT executions that completed; `returned` = it gave back a string and nothing confirms it worked
+  SELECT session_id, tool, role, SUM(status = 'completed') AS completed, SUM(status = 'returned') AS returned, SUM(status = 'failed') AS failed, SUM(status = 'unfinished') AS unfinished
+  FROM tool_calls GROUP BY session_id, tool, role""",
+    "session_usage": """CREATE VIEW session_usage AS    -- sums of what providers REPORTED; the *_without_usage columns say how incomplete the sums are
   SELECT session_id, COUNT(*) AS messages, SUM(status = 'ok') AS ok_messages,
          SUM(prompt_tokens) AS prompt_tokens, SUM(completion_tokens) AS completion_tokens, SUM(cost_usd) AS cost_usd,
          SUM(status = 'ok' AND usage_status = 'not_reported') AS messages_without_usage, SUM(status = 'ok' AND cost_status != 'reported') AS messages_without_cost
-  FROM messages GROUP BY session_id;
-"""
+  FROM messages GROUP BY session_id""",
+}
 
 
 # ------------------------------------------------------------------------------------------------------------------ database
@@ -131,11 +133,16 @@ def connect(path: Path) -> sqlite3.Connection:
         raise SystemExit(f"{path}: journal mode is {mode!r} and could not be switched (another connection holds the database open). WAL files (-wal/-shm) can keep copies of deleted text; close the other connection and retry")
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version == 0:
-        conn.executescript(SCHEMA)
+        conn.executescript(TABLES)
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     elif version != SCHEMA_VERSION:
         conn.close()
         raise SystemExit(f"{path}: schema version {version}, this tool writes {SCHEMA_VERSION}. Rebuild: history.py rebuild <run folder> --db {path}")
+    for name, sql in VIEWS.items():
+        stored = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'view' AND name = ?", (name,)).fetchone()
+        if stored is None or stored[0] != sql:
+            conn.execute(f"DROP VIEW IF EXISTS {name}")
+            conn.execute(sql)
     return conn
 
 
@@ -217,6 +224,7 @@ def build_invocation(inv: str, events: list, attempts: dict, prompts: dict, sour
     tools: dict = {}
     extra: list = []
     capture_on = any(e.get("event") == "prompt_capture_enabled" for _, e in events)
+    starts: dict = {}
 
     def issue(kind, line_no, detail, excerpt=None):
         issues.append({"source": source, "invocation": inv, "line_no": line_no, "kind": kind, "detail": detail, "excerpt": excerpt})
@@ -243,14 +251,21 @@ def build_invocation(inv: str, events: list, attempts: dict, prompts: dict, sour
             s = session(attempt, line_no, e)
             ok = kind == "generation"
             meta = e.get("provider_metadata") if ok else None
-            row = dict(message_id=f"{inv}:{seq}", session_id=s["session_id"], seq=seq, t_utc=e.get("t_utc"), role=e.get("role"), agent_name=None, delegation_id=e.get("delegation_id"),
+            row = dict(message_id=f"{inv}:{seq}", session_id=s["session_id"], seq=seq, t_utc=e.get("t_utc"), role=e.get("role"), agent_name=e.get("agent_name"), delegation_id=e.get("delegation_id"),
                        generation_in_agent=as_int(e.get("generation_in_agent")), provider=e.get("provider"), model=e.get("model"), status="ok" if ok else "error",
                        prompt_sha256=e.get("prompt_sha256"), prompt_chars=as_int(e.get("prompt_chars")), prompt_text=None, prompt_integrity="missing" if capture_on else "not_captured",
                        raw_output=e.get("raw_output"), consumed_output=e.get("consumed_output"), consumed_status=e.get("consumed_status"), consumed_seq=None, stop_handling=e.get("stop_handling"),
                        stop_sequences_sent=dumps(e.get("stop_sequences")), stop_sequences_local=dumps(e.get("stop_sequences_local")), discarded_chars=as_int(e.get("discarded_chars")),
                        finish_reason=e.get("finish"), seconds=e.get("seconds"), limits=dumps(e.get("limits")), reasoning=dumps(e.get("reasoning")), provider_metadata=dumps(meta),
-                       tokens_used_reported=as_int(e.get("tokens")), error=e.get("error"), **usage_of(meta))
+                       tokens_used_reported=as_int(e.get("tokens")), error=e.get("error"), _parent=e.get("parent_tool_call_id"), _started_seq=as_int(e.get("started_seq")),
+                       **usage_of(meta))
             messages[row["message_id"]] = row
+        elif kind == "attribution_unknown":  # the CLI recorder could not tell who started this agent run: said at the source, kept, and listed
+            issue("attribution_unknown", line_no, f"agent run {e.get('agent_name')!r} (seq {e.get('agent_run_start_seq')}) reached no delegate call's context: role, parent and delegation id are unknown")
+            extra.append((e, sessions.get(f"{inv}:{attempt}", {}).get("session_id") if attempt else None))
+        elif kind == "generation_start":
+            session(attempt, line_no, e)
+            starts[seq] = (line_no, e)  # folded into its `generation` line when that arrives; one that never does is an unfinished generation
         elif kind == "generation_consumed":
             target = messages.get(f"{inv}:{e.get('generation_seq')}")
             if target is None:
@@ -263,24 +278,28 @@ def build_invocation(inv: str, events: list, attempts: dict, prompts: dict, sour
             s = session(attempt, line_no, e)
             tid = f"{inv}:{seq}"
             tools[tid] = dict(tool_call_id=tid, session_id=s["session_id"], started_seq=seq, completed_seq=None, started_utc=e.get("t_utc"), completed_utc=None, status="unfinished", tool=e.get("tool"),
-                              role=e.get("role"), agent_name=None, generation_in_agent=as_int(e.get("generation_in_agent")), delegation_id=e.get("delegation_id"),
+                              role=e.get("role"), agent_name=e.get("agent_name"), generation_in_agent=as_int(e.get("generation_in_agent")), delegation_id=e.get("delegation_id"),
                               delegation_id_expected=e.get("delegation_id_expected"), requested_by_message_id=None, link_basis=None, args=dumps(e.get("args")), success=None, exception=None,
                               error=None, result=None, visible=None, visible_unavailable=None, seconds=None, dispatched=None, delegation_id_reported=None,
-                              _recorded_link=("requested_by_generation_seq" in e), _requested_seq=as_int(e.get("requested_by_generation_seq")))
+                              _recorded_link=("requested_by_generation_seq" in e), _requested_seq=as_int(e.get("requested_by_generation_seq")),
+                              _parent=e.get("parent_tool_call_id"))
         elif kind == "tool_call":
             s = session(attempt, line_no, e)
             tid = e.get("tool_call_id") or f"{inv}:{seq}"  # a legacy line has no id: it is its own, started_seq stays NULL
             row = tools.get(tid)
             if row is None:
                 row = tools[tid] = dict(tool_call_id=tid, session_id=s["session_id"], started_seq=None, completed_seq=None, started_utc=None, completed_utc=None, status="unfinished", tool=e.get("tool"),
-                                        role=e.get("role"), agent_name=None, generation_in_agent=as_int(e.get("generation_in_agent")), delegation_id=None, delegation_id_expected=None,
+                                        role=e.get("role"), agent_name=e.get("agent_name"), generation_in_agent=as_int(e.get("generation_in_agent")), delegation_id=None, delegation_id_expected=None,
                                         requested_by_message_id=None, link_basis=None, args=dumps(e.get("args")), success=None, exception=None, error=None, result=None, visible=None,
                                         visible_unavailable=None, seconds=None, dispatched=None, delegation_id_reported=None,
-                                        _recorded_link=("requested_by_generation_seq" in e), _requested_seq=as_int(e.get("requested_by_generation_seq")))
+                                        _recorded_link=("requested_by_generation_seq" in e), _requested_seq=as_int(e.get("requested_by_generation_seq")),
+                                        _parent=e.get("parent_tool_call_id"))
                 if e.get("tool_call_id"):
                     issue("tool_call_without_start", line_no, f"completion of {tid} has no tool_call_start line")
-            failed = bool(e.get("exception")) or not e.get("success")
-            row.update(completed_seq=seq, completed_utc=e.get("t_utc"), status="failed" if failed else "completed", delegation_id=e.get("delegation_id"), success=flag(e.get("success")),
+            outcome = e.get("success") if "success" in e else False  # a legacy line without the key counted as failed, and still does
+            failed = bool(e.get("exception")) or (outcome is not None and not outcome)
+            unknown = not failed and outcome is None  # the CLI recorder writes null: middleware cannot tell whether the tool worked
+            row.update(completed_seq=seq, completed_utc=e.get("t_utc"), status="failed" if failed else "returned" if unknown else "completed", delegation_id=e.get("delegation_id"), success=flag(e.get("success")),
                        exception=flag(e.get("exception")), error=e.get("error"), result=e.get("result"), visible=e.get("visible"), visible_unavailable=e.get("visible_unavailable"),
                        seconds=e.get("seconds"), dispatched=flag(e.get("dispatched")), delegation_id_reported=e.get("delegation_id_reported"))
         elif kind in ("attempt_end", "attempt_aborted"):
@@ -309,6 +328,31 @@ def build_invocation(inv: str, events: list, attempts: dict, prompts: dict, sour
     for attempt in attempts:
         if f"{inv}:{attempt}" not in sessions:
             issue("attempt_record_without_trace", None, f"attempts.jsonl holds attempt {attempt!r} but the trace has no line for it")
+
+    # ---- generations that started and never completed (killed, interrupted, or blocked by a later hook): kept as `generation_start` events, and said so
+    completed_starts = {m["_started_seq"] for m in messages.values() if m.get("_started_seq") is not None}
+    for start_seq, (line_no, e) in starts.items():
+        if start_seq not in completed_starts:
+            extra.append((e, sessions.get(f"{inv}:{e.get('attempt')}", {}).get("session_id")))
+            issue("generation_unfinished", line_no, f"a {e.get('role')} model call (seq {start_seq}) started and has no completion line: not counted as a message")
+
+    # ---- worker identity, CLI recorder: the delegate call a worker event names (parent_tool_call_id) gives the worker and the task; the delegation id only once the report confirmed it
+    for table in (messages, tools):
+        for row in table.values():
+            pid = row.get("_parent")
+            if not pid:
+                continue
+            parent = tools.get(pid)
+            if parent is None or parent["tool"] != "delegate":
+                issue("parent_tool_call_unresolved", None, f"{row.get('message_id') or row['tool_call_id']} names parent call {pid}, which is not a delegate call in this trace")
+                continue
+            if parent["session_id"] != row["session_id"]:  # as for requested_by links: a link never crosses sessions
+                issue("parent_in_other_session", None, f"{row.get('message_id') or row['tool_call_id']} names parent call {pid}, which belongs to {parent['session_id']}, not to {row['session_id']}; not linked")
+                continue
+            args = json.loads(parent["args"]) if parent["args"] else {}
+            worker = args.get("worker") if isinstance(args, dict) else None
+            row["agent_name"] = worker if isinstance(worker, str) else None
+            row["delegation_id"] = parent["delegation_id"]  # NULL until the report came back: never predicted
 
     # ---- worker identity: the delegate call that claims the delegation id names the worker
     claims: dict = {}
@@ -519,6 +563,9 @@ def timeline_lines(conn: sqlite3.Connection, session_id: str, full: bool = False
             continue
         indent = "    " if item["role"] == "worker" else ""
         who = f"{item['role']}" + (f" {item['delegation_id']}" if item["delegation_id"] else "")
+        if kind == "message":  # a worker that has no confirmed delegation id yet is still named (by the delegate call that started it)
+            name = conn.execute("SELECT agent_name FROM messages WHERE message_id = ?", (ref,)).fetchone()[0]
+            who += f" {name}" if name and item["role"] == "worker" and not item["delegation_id"] else ""
         if kind == "message":
             m = conn.execute("SELECT * FROM messages WHERE message_id = ?", (ref,)).fetchone()
             usage = f"tokens p={m['prompt_tokens']} c={m['completion_tokens']}" if m["usage_status"] == "reported" else "usage not reported"
@@ -528,8 +575,10 @@ def timeline_lines(conn: sqlite3.Connection, session_id: str, full: bool = False
             if prompts and m["prompt_text"] is not None:
                 out.append(f"{indent}    prompt text: {clip(m['prompt_text'], width)}")
             if m["status"] == "ok":
-                out.append(f"{indent}    raw: {clip(m['raw_output'], width)}")
-                if m["consumed_output"] is None:
+                out.append(f"{indent}    raw: {clip(m['raw_output'], width)}" if m["raw_output"] is not None else f"{indent}    raw: UNAVAILABLE (only the text effGen consumed was observable)")
+                if m["raw_output"] is None and m["consumed_output"] is not None:
+                    out.append(f"{indent}    consumed: {clip(m['consumed_output'], width)}")
+                elif m["consumed_output"] is None:
                     out.append(f"{indent}    consumed: UNAVAILABLE ({m['consumed_status']})")
                 elif m["consumed_output"] != m["raw_output"]:
                     out.append(f"{indent}    consumed ({m['stop_handling']}, {m['discarded_chars']} chars cut): {clip(m['consumed_output'], width)}")
@@ -542,15 +591,21 @@ def timeline_lines(conn: sqlite3.Connection, session_id: str, full: bool = False
                 link = f" requested by {t['requested_by_message_id']} [{t['link_basis']}]" if t["requested_by_message_id"] else " requested by: not established"
                 line = f"{indent}#{item['seq']} [{who}] TOOL START {t['tool']}{name}{link}"
                 if t["tool"] == "delegate":
-                    line += f" -> worker {json.loads(t['args'] or '{}').get('worker')!r} (expects {t['delegation_id_expected']})"
+                    line += f" -> worker {json.loads(t['args'] or '{}').get('worker')!r}" + (f" (expects {t['delegation_id_expected']})" if t["delegation_id_expected"] else "")
                 out += [line, f"{indent}    args: {clip(t['args'], width)}"]
             else:
-                out.append(f"{indent}#{item['seq']} [{who}] TOOL END   {t['tool']} {t['status'].upper()} in {t['seconds']}s" + (f" as {t['delegation_id']}" if t["tool"] == "delegate" and t["delegation_id"] else ""))
+                shown = "RETURNED (outcome not confirmed)" if t["status"] == "returned" else t["status"].upper()
+                out.append(f"{indent}#{item['seq']} [{who}] TOOL END   {t['tool']} {shown} in {t['seconds']}s" + (f" as {t['delegation_id']}" if t["tool"] == "delegate" and t["delegation_id"] else ""))
+                hint = looks_like_error(t["result"]) if t["status"] == "returned" else None
+                if hint:
+                    out.append(f"{indent}    heuristic (NOT a confirmed outcome): result {hint}")
                 out.append(f"{indent}    result: {clip(t['result'], width)}" if t["result"] is not None else f"{indent}    result: none ({t['error']})")
                 if t["visible"] is None:
                     out.append(f"{indent}    the model saw: UNAVAILABLE ({t['visible_unavailable']})")
                 elif t["visible"] != t["result"]:
                     out.append(f"{indent}    the model saw: {clip(t['visible'], width)}")
+    for g in conn.execute("SELECT * FROM events WHERE session_id = ? AND type = 'generation_start' ORDER BY seq", (session_id,)):  # only unmatched starts are kept as events
+        out.append(f"!!  UNFINISHED: a model call by {json.loads(g['payload']).get('role')} (seq {g['seq']}) started and has no completion; NOT counted as a message")
     for t in conn.execute("SELECT * FROM tool_calls WHERE session_id = ? AND status = 'unfinished' ORDER BY started_seq", (session_id,)):
         out.append(f"!!  UNFINISHED: {t['tool']} {t['tool_call_id']} started and never completed; NOT counted as an execution")
     verdict = f"=== verdict: status={s['status']}  agent_completed={fmt(s['agent_completed'])}  task_verified={fmt(s['task_verified'])}"
@@ -559,6 +614,23 @@ def timeline_lines(conn: sqlite3.Connection, session_id: str, full: bool = False
     if s["error"]:
         out.append(f"error: {clip(s['error'], width)}")
     return out
+
+
+def looks_like_error(result) -> str | None:
+    """A guess, kept apart from every stored outcome: why a returned result reads like a failure, or None. Computed when displayed, never written to the database."""
+    text = "" if result is None else str(result).lstrip()
+    if text[:6].lower() in ("error:", "error ") or text.lower().startswith(("error", "failed", "traceback")):
+        return "starts like an error message"
+    try:
+        report = json.loads(text)
+    except ValueError:
+        return None
+    if isinstance(report, dict):
+        if report.get("success") is False:
+            return 'says "success": false'
+        if report.get("status") in ("failed", "timeout"):
+            return f'is a delegation report with status "{report["status"]}" (the worker failed; the delegate call itself returned)'
+    return None
 
 
 def fmt(value) -> str:
@@ -572,11 +644,11 @@ def cmd_timeline(args) -> int:
 
 def cmd_sessions(args) -> int:
     conn = connect(args.db)
-    print(f"{'session_id':32} {'stage':14} {'status':11} {'agent_done':10} {'verified':9} {'msgs':>4} {'tools ok/fail/unfinished':>24}  task")
+    print(f"{'session_id':32} {'stage':14} {'status':11} {'agent_done':10} {'verified':9} {'msgs':>4} {'tools returned/failed/unfin.':>27}  task")
     for s in conn.execute("SELECT * FROM sessions ORDER BY started_utc, session_id"):
         n = conn.execute("SELECT COUNT(*) FROM messages WHERE session_id = ?", (s["session_id"],)).fetchone()[0]
-        t = conn.execute("SELECT COALESCE(SUM(status='completed'),0), COALESCE(SUM(status='failed'),0), COALESCE(SUM(status='unfinished'),0) FROM tool_calls WHERE session_id = ?", (s["session_id"],)).fetchone()
-        print(f"{s['session_id']:32} {str(s['stage']):14} {s['status']:11} {fmt(s['agent_completed']):10} {fmt(s['task_verified']):9} {n:>4} {f'{t[0]}/{t[1]}/{t[2]}':>24}  {clip(s['task'], 50)}")
+        t = conn.execute("SELECT COALESCE(SUM(status IN ('completed', 'returned')),0), COALESCE(SUM(status='failed'),0), COALESCE(SUM(status='unfinished'),0) FROM tool_calls WHERE session_id = ?", (s["session_id"],)).fetchone()
+        print(f"{s['session_id']:32} {str(s['stage']):14} {s['status']:11} {fmt(s['agent_completed']):10} {fmt(s['task_verified']):9} {n:>4} {f'{t[0]}/{t[1]}/{t[2]}':>27}  {clip(s['task'], 50)}")
     return 0
 
 
@@ -590,7 +662,7 @@ def cmd_usage(args) -> int:
     for r in conn.execute("SELECT role, delegation_id, COUNT(*) n, SUM(prompt_tokens) p, SUM(completion_tokens) c FROM messages WHERE session_id = ? AND status = 'ok' GROUP BY role, delegation_id ORDER BY MIN(seq)", (args.session,)):
         print(f"  {r['role']:12} {str(r['delegation_id'] or '-'):4} calls={r['n']} prompt={r['p']} completion={r['c']}")
     for r in conn.execute("SELECT * FROM tool_counts WHERE session_id = ?", (args.session,)):
-        print(f"  tool {r['tool']:16} role={r['role']:12} completed={r['completed']} failed={r['failed']} unfinished={r['unfinished']}")
+        print(f"  tool {r['tool']:16} role={r['role']:12} completed={r['completed']} returned={r['returned']} failed={r['failed']} unfinished={r['unfinished']}")
     return 0
 
 

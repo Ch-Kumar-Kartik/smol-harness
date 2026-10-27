@@ -98,6 +98,8 @@ src/smol_harness/
   tools.py       # build_tools(names, workspace); pinned sandboxed shell
   delegation.py  # WorkerResult, WorkerRegistry, DeadlineMiddleware, DelegateTool
   harness.py     # wire orchestrator + workers; Harness.run(task) -> HarnessResult
+  recorder.py    # optional execution history: an effGen middleware writing JSONL (Phase 2)
+  redaction.py   # the one stdlib-only redaction policy (recorder + experiment driver)
   __main__.py    # CLI
 configs/example.yaml
 tests/           # unit tests use scripted effGen BaseModel fakes (no GPU / network)
@@ -112,7 +114,9 @@ tests/           # unit tests use scripted effGen BaseModel fakes (no GPU / netw
 | `tools.py` | `build_tools(names, workspace) -> list[BaseTool]` from a fixed registry: `file_operations`, `shell` (later maybe `edit_file`). | Register web or network tools; implement path checks effGen already does |
 | `delegation.py` | `DelegateTool` (an effGen `BaseTool`), `WorkerResult` / `WorkerRecord`, `WorkerRegistry` (in-memory lifecycle: `pending → running → completed / failed / timeout`), `DeadlineMiddleware`. | Run its own reasoning loop; merge histories |
 | `harness.py` | Build the orchestrator and worker factories from config (`build_harness_from_config`, T5.0: tools first, then models via one `ModelCache`, then `AgentConfig`s with the effGen settings stated explicitly). `Harness.run(task) -> HarnessResult(output, success, termination, workers=[WorkerRecord...])`; `Harness.close()` unloads only a cache it created. `initialize_runtime()` installs the explicit, process-wide effGen loop patch (F1) that the builder and `run` require. | Re-implement `Agent.run`; install the patch implicitly; close a caller's cache |
-| `__main__.py` | The CLI (T5.1): `smol-harness run --config FILE --task TEXT [--json]` / `python -m smol_harness run ...`. Calls `initialize_runtime()`, `load_config()`, `build_harness_from_config()` and runs the task in `with harness:`; stdout = the answer (or one JSON document), stderr = delegation summary and diagnostics; exit codes 0 ok, 1 task failed, 2 usage, 3 start-up, 4 run raised, 130 interrupted. | Re-implement loading, delegation, tools or cleanup; print tracebacks, environment or full reports |
+| `recorder.py` | Optional (`--history-dir`): `ExecutionRecorder`, an `AgentMiddleware` on every agent plus `begin/finish/abort` called by `Harness.run`. Writes `trace.jsonl` / `attempts.jsonl` (and opt-in private `prompts.local.jsonl`) that `experiments/history/history.py` imports into SQLite. Worker events are attributed to their `delegate` call through a `ContextVar`; per-run state lives on `RunContext.metadata`. Any recorder error disables it and never reaches the run. | Change a prompt, argument, result or return value; predict delegation ids; claim a tool succeeded; implement tracing beyond JSONL lines |
+| `redaction.py` | `redact`, `redact_obj`: credentials and personal paths removed from anything shared. Stdlib only; `experiments/rtx4070/rtx4070.py` loads it by path. | Be weakened for one caller |
+| `__main__.py` | The CLI (T5.1; `--history-dir` / `--capture-prompts` added in history Phase 2): `smol-harness run --config FILE --task TEXT [--json]` / `python -m smol_harness run ...`. Calls `initialize_runtime()`, `load_config()`, `build_harness_from_config()` and runs the task in `with harness:`; stdout = the answer (or one JSON document), stderr = delegation summary and diagnostics; exit codes 0 ok, 1 task failed, 2 usage, 3 start-up, 4 run raised, 130 interrupted. | Re-implement loading, delegation, tools or cleanup; print tracebacks, environment or full reports |
 
 ## 5. Orchestrator-worker execution flow
 

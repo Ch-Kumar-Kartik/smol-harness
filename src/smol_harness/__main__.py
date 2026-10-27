@@ -7,6 +7,10 @@ Streams: stdout carries the task's answer (or, with `--json`, one JSON document)
 (worker summary, failures, warnings). Exit codes: 0 success; 1 the task failed (a failed `HarnessResult`); 2 usage error;
 3 start-up failure (effGen patch, configuration, tools, model loading); 4 the run raised; 130 interrupted.
 
+Optional execution history: `--history-dir DIR` records the run as JSONL under DIR (see `recorder.py`; import it with
+`experiments/history/history.py`), `--capture-prompts` also keeps the exact prompts in a private file. Recording is
+best-effort: a recorder problem is a stderr warning and never changes the answer, the output or the exit code.
+
 Diagnostics are short on purpose: exception type and a scrubbed, truncated message, a one-line summary per delegation.
 No tracebacks, environment, configuration contents or full tool output are printed.
 """
@@ -23,6 +27,7 @@ from typing import Any
 from smol_harness.config import load_config
 from smol_harness.delegation import WorkerRecord
 from smol_harness.harness import Harness, HarnessResult, build_harness_from_config, initialize_runtime
+from smol_harness.recorder import ExecutionRecorder
 
 EXIT_OK, EXIT_TASK_FAILED, EXIT_USAGE, EXIT_STARTUP, EXIT_RUN_ERROR, EXIT_INTERRUPTED = 0, 1, 2, 3, 4, 130
 
@@ -119,23 +124,48 @@ def _run_task(harness: Harness, task: str, as_json: bool) -> int:
     return _report_result(result, as_json)
 
 
-def run_command(config_path: str, task: str, as_json: bool) -> int:
+def _open_recorder(history_dir: str | None, capture_prompts: bool) -> ExecutionRecorder | None:
+    """The recorder asked for, or None. A history that cannot be created is a loud warning, not a failed task."""
+    if history_dir is None:
+        return None
+    try:
+        return ExecutionRecorder(history_dir, capture_prompts=capture_prompts)
+    except Exception as exc:
+        _err(f"smol-harness: warning: history recording is OFF, nothing will be recorded: {type(exc).__name__}: {_short(exc, MESSAGE_CHARS)}")
+        return None
+
+
+def _report_history(recorder: ExecutionRecorder | None) -> None:
+    if recorder is None:
+        return
+    if recorder.error:
+        _err(f"smol-harness: warning: history recording stopped early (the run itself was not affected): {_short(recorder.error, MESSAGE_CHARS)}")
+    _err(f"history: {recorder.dir}" + (" (prompts captured in prompts.local.jsonl: private, do not share)" if recorder.capture_prompts else ""))
+
+
+def run_command(config_path: str, task: str, as_json: bool, history_dir: str | None = None, capture_prompts: bool = False) -> int:
+    recorder = None
     try:
         try:
-            initialize_runtime()  # the process-wide effGen patch must be in place before any agent exists
-            harness = build_harness_from_config(load_config(config_path))
-        except Exception as exc:
-            return _report_error("startup", exc, (), as_json, EXIT_STARTUP)
-        code = EXIT_OK
-        try:
-            with harness:  # closes the models this harness loaded, on success, failure or interrupt
-                code = _run_task(harness, task, as_json)
-        except Exception as exc:  # only releasing resources can raise here: the task's outcome stands, the problem is shown
-            _err(f"smol-harness: warning: releasing resources failed: {type(exc).__name__}: {_short(exc, MESSAGE_CHARS)}")
-        return code
-    except KeyboardInterrupt:
-        _err("smol-harness: interrupted")
-        return EXIT_INTERRUPTED
+            recorder = _open_recorder(history_dir, capture_prompts)  # inside the interrupt handling: Ctrl-C here is still exit 130
+            try:
+                initialize_runtime()  # the process-wide effGen patch must be in place before any agent exists
+                config = load_config(config_path)
+                harness = build_harness_from_config(config) if recorder is None else build_harness_from_config(config, recorder=recorder)
+            except Exception as exc:
+                return _report_error("startup", exc, (), as_json, EXIT_STARTUP)
+            code = EXIT_OK
+            try:
+                with harness:  # closes the models this harness loaded, on success, failure or interrupt
+                    code = _run_task(harness, task, as_json)
+            except Exception as exc:  # only releasing resources can raise here: the task's outcome stands, the problem is shown
+                _err(f"smol-harness: warning: releasing resources failed: {type(exc).__name__}: {_short(exc, MESSAGE_CHARS)}")
+            return code
+        except KeyboardInterrupt:
+            _err("smol-harness: interrupted")
+            return EXIT_INTERRUPTED
+    finally:
+        _report_history(recorder)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -148,6 +178,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--config", required=True, metavar="FILE", help="YAML configuration (workspace, models, tools, limits)")
     run.add_argument("--task", required=True, metavar="TEXT", help="what the orchestrator should get done")
     run.add_argument("--json", action="store_true", help="print one JSON document on stdout instead of the bare answer")
+    run.add_argument("--history-dir", metavar="DIR", help="record this run (messages, tool calls, delegations) as JSONL in a new folder under DIR; "
+                     "import it with experiments/history/history.py. The folder is private (0700) and can hold anything a tool read")
+    run.add_argument("--capture-prompts", action="store_true",
+                     help="with --history-dir: also keep the exact prompts, in a private prompts.local.jsonl (SHA-256 checked); never share it")
     return parser
 
 
@@ -162,7 +196,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_usage(sys.stderr)
         _err("smol-harness run: error: --task must not be empty")
         return EXIT_USAGE
-    return run_command(args.config, task, args.json)
+    if args.capture_prompts and not args.history_dir:
+        parser.print_usage(sys.stderr)
+        _err("smol-harness run: error: --capture-prompts needs --history-dir")
+        return EXIT_USAGE
+    return run_command(args.config, task, args.json, args.history_dir, args.capture_prompts)
 
 
 if __name__ == "__main__":

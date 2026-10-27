@@ -63,49 +63,20 @@ MAX_ARCHIVE_FILE_BYTES = 25 * 1024 * 1024
 WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".bin", ".pt", ".pth", ".ckpt", ".onnx")
 PASS, WARN, FAIL, UNVERIFIED, SKIP = "pass", "warn", "fail", "unverified", "skip"
 
-_SECRET_NAME = re.compile(r"(?i)(key|token|secret|passw|credential|auth|cookie)")
-# A key block a model happened to `cat` (shell reads are not confined, R1): the whole block goes, including a truncated one.
-_PEM = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S)
-_REDACTIONS = (
-    (re.compile(r"hf_[A-Za-z0-9]{20,}"), "hf_***"),
-    (re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"), "gh_***"),
-    (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"), "sk-***"),
-    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"), "Bearer ***"),
-    (re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/\s:@]+(?::[^/\s@]*)?@"), r"\g<scheme>***@"),
-    (re.compile(r"(?i)([\w.-]*(?:api[_-]?key|token|password|passwd|secret|credential)[\w.-]*)(\s*[=:]\s*)[^\s,;\"']+"), r"\1\2***"),
-    (_PEM, "-----BEGIN PRIVATE KEY (redacted)-----"),
-)
+# The redaction policy lives in ONE place, src/smol_harness/redaction.py (also used by the CLI execution recorder). Loaded by path, not imported as
+# `smol_harness.redaction`: this driver is standard library only and runs before the project environment (and so the installed package) exists.
+import importlib.util as _ilu
+
+_spec = _ilu.spec_from_file_location("smol_harness_redaction", REPO / "src" / "smol_harness" / "redaction.py")
+_redaction = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_redaction)
+_SECRET_NAME, _PEM, _REDACTIONS = _redaction._SECRET_NAME, _redaction._PEM, _redaction._REDACTIONS
+redact, redact_obj, redact_record = _redaction.redact, _redaction.redact_obj, _redaction.redact_record
 
 
 # --------------------------------------------------------------------------------------------------- small helpers
 def now() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def redact(text: str) -> str:
-    """Remove credentials and personal paths from text before it is written anywhere."""
-    for pattern, replacement in _REDACTIONS:
-        text = pattern.sub(replacement, text)
-    for name, value in os.environ.items():  # exact values of sensitive environment variables, wherever they appear
-        if _SECRET_NAME.search(name) and len(value) >= 8:
-            text = text.replace(value, "***")
-    try:
-        user, home = getpass.getuser(), str(Path.home())
-    except Exception:  # noqa: BLE001 - no resolvable user: nothing personal to remove
-        return text
-    if home not in ("/", ""):
-        text = text.replace(home, "~")
-    return re.sub(r"/mnt/c/Users/[^/\s]+", "/mnt/c/Users/<user>", text.replace("/home/" + user, "~")) if user else text
-
-
-def redact_obj(obj):
-    if isinstance(obj, str):
-        return redact(obj)
-    if isinstance(obj, dict):
-        return {k: ("***" if isinstance(k, str) and _SECRET_NAME.search(k) and isinstance(v, str) and len(v) >= 8 else redact_obj(v)) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [redact_obj(v) for v in obj]
-    return obj
 
 
 def write_json(path: Path, data) -> None:

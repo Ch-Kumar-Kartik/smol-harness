@@ -29,6 +29,7 @@ from smol_harness.delegation import (
 )
 from smol_harness.config import AgentSpec, HarnessConfig
 from smol_harness.models import ModelCache
+from smol_harness.recorder import ExecutionRecorder
 from smol_harness.tools import build_tools
 
 # ---- effGen loop compatibility (docs/reviews/opus-review-001.md F1; audit Part 3, "F1 compatibility patch") ----------
@@ -215,9 +216,11 @@ class Harness:
         max_delegations: int | None = None,
         max_report_chars: int | None = None,
         owned_cache: ModelCache | None = None,
+        recorder: ExecutionRecorder | None = None,
     ) -> None:
         validate_limits(max_delegations, max_report_chars)  # fail at build time, not mid-run
         self._owned_cache = owned_cache
+        self.recorder = recorder  # optional execution history; `build_harness` also adds it as middleware to every agent config
         self._closed = False
         self.max_delegations = max_delegations
         self.max_report_chars = max_report_chars
@@ -274,24 +277,44 @@ class Harness:
         config = replace(self._orchestrator, tools=[*self._orchestrator.tools, delegate], enable_sub_agents=False)
         if any(getattr(tool, STATEFUL_TOOL_MARKER, False) for tool in config.tools):
             _require_loop_compat()  # `delegate` is always marked, so this always applies
-        with Agent(config) as agent:
+        if self.recorder is not None:
             try:
-                response = agent.run(task)
-            except RunStoppedError as exc:
-                response = _stopped_response(exc)
-                if response is None:  # a RunStoppedError without a usable response: say so, do not invent a result
+                models = self._model_names()
+            except Exception:  # recording-only metadata: the session is recorded without it, the run is not touched
+                models = None
+            self.recorder.begin(task, models)  # never raises: a recorder error only stops recording
+        try:
+            with Agent(config) as agent:
+                try:
+                    response = agent.run(task)
+                except RunStoppedError as exc:
+                    response = _stopped_response(exc)
+                    if response is None:  # a RunStoppedError without a usable response: say so, do not invent a result
+                        _keep_records(exc, records)
+                        raise
+                except Exception as exc:
                     _keep_records(exc, records)
                     raise
-            except Exception as exc:
-                _keep_records(exc, records)
-                raise
-        return HarnessResult(
+        except BaseException as exc:  # includes Ctrl-C: the history says the session was aborted, then the exception goes on unchanged
+            if self.recorder is not None:
+                self.recorder.abort(exc)
+            raise
+        result = HarnessResult(
             output=str(response.output),
             success=bool(response.success),
             termination=getattr(response, "termination", None),
             response=response,
             workers=records,
         )
+        if self.recorder is not None:
+            self.recorder.finish(result)
+        return result
+
+    def _model_names(self) -> dict[str, Any]:
+        """Model names by agent, for the history's session record. Names only; provider and quantization are not known here."""
+        name = lambda config: getattr(config.model, "model_name", None) or type(config.model).__name__  # noqa: E731
+        return {"orchestrator": name(self._orchestrator),
+                "workers": {worker: name(self.registry.get_config(worker)) for worker in self.registry.names()}}
 
 
 def _stopped_response(exc: RunStoppedError) -> Any | None:
@@ -324,17 +347,23 @@ def build_harness(
     max_delegations: int | None = None,
     max_report_chars: int | None = None,
     owned_cache: ModelCache | None = None,
+    recorder: ExecutionRecorder | None = None,
 ) -> Harness:
     """Register `workers` (name -> config) and return a `Harness` for `orchestrator`.
 
     `worker_timeout_s` is a cooperative per-delegation deadline; `max_delegations` caps
     delegation attempts per `run`; `max_report_chars` caps each report's serialized size.
     None = no limit for all three. `owned_cache`: a cache the returned harness will close.
+    `recorder`: optional execution history; it is appended to every agent's middleware (after any the config
+    already has, so its `after_*` hooks see the final values) and nothing else about the agents changes.
     """
+    if recorder is not None:
+        orchestrator = replace(orchestrator, middleware=[*orchestrator.middleware, recorder])
+        workers = {name: replace(config, middleware=[*config.middleware, recorder]) for name, config in workers.items()}
     registry = WorkerRegistry()
     for name, config in workers.items():
         registry.register(name, config, (descriptions or {}).get(name, ""))
-    return Harness(orchestrator, registry, worker_timeout_s, max_delegations, max_report_chars, owned_cache)
+    return Harness(orchestrator, registry, worker_timeout_s, max_delegations, max_report_chars, owned_cache, recorder)
 
 
 TOOL_CALLING_MODES = ("auto", "native", "react", "hybrid")  # AgentConfig.tool_calling_mode (effGen core/agent_config.py)
@@ -368,6 +397,7 @@ def _agent_config(spec: AgentSpec, model: BaseModel, tools: list[BaseTool], tool
 
 def build_harness_from_config(
     config: HarnessConfig, *, cache: ModelCache | None = None, tool_calling_mode: str = "react",
+    recorder: ExecutionRecorder | None = None,
 ) -> Harness:
     """A runnable `Harness` for a validated `HarnessConfig`.
 
@@ -383,6 +413,8 @@ def build_harness_from_config(
     Ownership: with no `cache`, the harness creates one and owns it (`Harness.close()` unloads its models, each once).
     A `cache` you pass stays yours; the harness never closes it, and models already loaded into it stay loaded if
     assembly fails. If assembly fails, a cache this call created is closed before the original exception propagates.
+
+    `recorder` (optional, see `recorder.py`) records the runs of the returned harness; it never changes them.
     """
     if tool_calling_mode not in TOOL_CALLING_MODES:
         raise ValueError(f"tool_calling_mode must be one of {TOOL_CALLING_MODES}, got {tool_calling_mode!r}")
@@ -398,7 +430,7 @@ def build_harness_from_config(
             configs[0], {spec.name: agent for spec, agent in zip(config.workers, configs[1:], strict=True)},
             {spec.name: spec.description for spec in config.workers},
             worker_timeout_s=config.limits.worker_timeout_s, max_delegations=config.limits.max_delegations,
-            max_report_chars=config.limits.max_report_chars, owned_cache=owned,
+            max_report_chars=config.limits.max_report_chars, owned_cache=owned, recorder=recorder,
         )
     except BaseException as exc:
         if owned is not None:

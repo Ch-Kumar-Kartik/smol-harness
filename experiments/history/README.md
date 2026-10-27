@@ -1,11 +1,38 @@
-# Execution history (SQLite), Phase 1
+# Execution history (SQLite), Phases 1 and 2
 
 A SQLite **index** over the experiment evidence, so one orchestrator-worker session can be read in order: every model turn, every tool call, the verdict. The JSONL files stay the
 evidence; the database is derived from them and can be deleted and rebuilt at any time. Standard library only (`sqlite3`). It runs as a separate offline process, never inside a
 model run, so a database problem cannot touch a task.
 
-Scope of Phase 1: runs made through the experiment runner (`experiments/rtx4070/stage_runner.py`, so the RTX stages and `experiments/dgx/dgx_diag.py`). A plain `smol-harness run` writes
-no trace and therefore has no history yet; that is a separate later milestone.
+Phase 1 covers runs made through the experiment runner (`experiments/rtx4070/stage_runner.py`, so the RTX stages and `experiments/dgx/dgx_diag.py`). Phase 2 covers a plain
+`smol-harness run` (next section). Both write the same files and are imported by the same command.
+
+## Phase 2: recording an ordinary `smol-harness run`
+
+```bash
+smol-harness run --config harness.yaml --task "..." --history-dir ~/smol-history [--capture-prompts]
+python experiments/history/history.py import ~/smol-history --db ~/smol-history/history.db
+python experiments/history/history.py timeline <session id from `sessions`>
+```
+The CLI prints `history: <folder>` on stderr. Each process writes one folder `<UTC time>-<id>/` (mode 0700) with `trace.jsonl`, `attempts.jsonl` and, only with `--capture-prompts`,
+`prompts.local.jsonl` (mode 0600, the exact adapter-input prompt per model call, SHA-256 checked on import; never share it). The recorder is an effGen middleware
+(`src/smol_harness/recorder.py`); trace and attempts lines pass through the same redaction as the experiments (`redaction.redact_record`: every value first, so a secret
+holding quotes or backslashes is caught before JSON escapes it, then the whole line). Keep the folder and the database outside any
+shared package and Git (`*.local.jsonl` and `*.db` are already ignored).
+
+What a CLI session records differently from an experiment session, and why:
+
+- **Unknown is NULL.** Middleware sees the string a tool returned, not a success flag, so `tool_calls.success` is NULL and the status is `returned` (not `completed`). A file that was not found
+  is `returned`, like a file that was written. `timeline` prints a clearly marked *heuristic* when a returned result reads like an error; it is computed at display time and stored nowhere.
+- **Raw model text is not available** (`raw_output` NULL): middleware sees what effGen consumed. Retries inside one model call, the provider payload and what effGen finally showed the model are also not visible.
+- **Delegation ids are never predicted.** A worker's events carry `parent_tool_call_id` (the `delegate` call that started it), so the worker's name and the task come from that call's arguments;
+  `delegation_id` is filled in only when the report that holds it came back. A delegation that never reported (Ctrl-C, kill) keeps worker, task and parent, with the id NULL.
+- **Attribution that could not be established is `unknown`.** Only the first agent run of a session is the orchestrator. When `Harness.run` is called under a running event loop, effGen runs the
+  delegate tool on a thread without the caller's context, so a worker cannot be tied to its `delegate` call: it is recorded with `role` `unknown`, its own agent name, no parent and no delegation id,
+  and `issues` lists it (`attribution_unknown`). The CLI never runs that way. A parent link into another session is refused (`parent_in_other_session`).
+- **Unfinished calls.** A tool call with a start and no completion is `unfinished`; a model call that started and never completed is listed as `UNFINISHED` in the timeline and in `issues`
+  (`generation_unfinished`). A call the worker deadline blocked looks the same: its hook ran before the deadline raised.
+- **Recording never changes a run.** The first recorder error stops recording and is printed as a warning; the answer, the output and the exit code are those of the unrecorded run.
 
 ## Use
 
@@ -81,7 +108,6 @@ a prompt that matches no message and every similar inconsistency become rows in 
 
 ## What Phase 1 cannot give you
 
-- History for plain `smol-harness run` (no trace exists there).
 - The provider's final payload or the tokenised input; effGen's loop iteration and ledger totals; a worker's own effGen trace.
 - A model call that never returned (no trace line, hence no prompt); the start time of a tool call other than from its start line; sub-second timestamps (order by `seq`).
 - Cost for local models: the provider reports none, and the database stores NULL.
