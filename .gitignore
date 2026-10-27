@@ -4,3 +4,12 @@ __pycache__/
 .pytest_cache/
 CLAUDE.md
 AGENTS.md
+
+# local-only execution history: captured prompts and SQLite databases (they can hold anything a tool read)
+*.local.jsonl
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3

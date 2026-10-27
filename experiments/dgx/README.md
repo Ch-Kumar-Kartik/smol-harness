@@ -58,6 +58,9 @@ uv run python experiments/dgx/dgx_diag.py e2 --out "$OUT" --tag "$TAG" --num-ctx
 python3 experiments/rtx4070/rtx4070.py package --run-dir "$OUT"                            # one redacted archive; refuses if a credential survives
 ```
 
+Optional, explicit: add `--capture-prompts` to `e1`/`e2` to also record every prompt (the string effGen hands to the model; not the provider's final payload) in a **local-only** `prompts.local.jsonl`
+(mode 0600; never archived or rewritten by `package`). `experiments/history/history.py` can then index the run into SQLite for reading (`import`, `timeline`); see `experiments/history/README.md`.
+
 Run **one attempt first** (the default). Look at `trace.jsonl` before adding `--attempts 2` or `3` (seeds 0..N-1; E1 stops at the first verified attempt, E2 at the first
 verified attempt with the mechanics shown). Exit status: E0 `1` if any check FAILED; E1/E2 `0` if the mechanics were demonstrated, `1` if not, `2` if refused.
 **Exit `0` does not mean the task was solved.**

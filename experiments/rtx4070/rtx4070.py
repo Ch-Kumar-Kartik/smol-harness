@@ -1104,8 +1104,14 @@ def write_summary(run_dir: Path) -> None:
     write_text(run_dir / "summary.md", "\n".join(lines))
 
 
+PRIVATE_ARTIFACT_SUFFIXES = (".local.jsonl", ".db", ".sqlite", ".sqlite3", ".db-wal", ".db-shm", ".db-journal")
+
+
 def exclusion_reason(path: Path) -> str | None:
-    """Why a file must never go into an archive (model weights, or anything too big to be a diagnostic)."""
+    """Why a file must never go into an archive (model weights, anything too big to be a diagnostic, or a private local artifact). The same test keeps the redaction pass away
+    from these files: they are neither archived nor rewritten."""
+    if path.name.lower().endswith(PRIVATE_ARTIFACT_SUFFIXES):
+        return "private local artifact (captured prompts or a SQLite history database): never archived, never rewritten"
     if path.suffix.lower() in WEIGHT_SUFFIXES:
         return "looks like model weights"
     if path.stat().st_size > MAX_ARCHIVE_FILE_BYTES:
@@ -1133,7 +1139,7 @@ def write_manifest(run_dir: Path) -> dict:
                 "models": {"profile": MODELS["profiles"].get(profile_name), "bitsandbytes_pin": MODELS["bitsandbytes"]["pin"]},
                 "stages": {s: {k: r.get(k) for k in ("status", "reason", "duration_s")} for s, r in results.items() if r},
                 "files": files, "excluded_from_archive": excluded, "re_redacted_files": [],
-                "never_collected": ["work/ (the disposable workspace folders themselves; file contents and shell output that passed through tool calls ARE in trace.jsonl, attempts.jsonl, cli_*.json and repo_diff files, redacted by pattern only)", "model weights"],
+                "never_collected": ["private local artifacts: captured prompts (*.local.jsonl) and SQLite databases (*.db, *.sqlite*): never archived, never rewritten", "work/ (the disposable workspace folders themselves; file contents and shell output that passed through tool calls ARE in trace.jsonl, attempts.jsonl, cli_*.json and repo_diff files, redacted by pattern only)", "model weights"],
                 "redaction": "credentials, tokens, environment values with sensitive names and personal paths are removed before writing"}
     write_json(run_dir / "manifest.json", manifest)
     return manifest
@@ -1160,7 +1166,10 @@ def render_config(template: str, run_dir: Path, ctx: Ctx, name: str | None = Non
     if left:
         raise ValueError(f"unfilled placeholders in {template}.yaml: {sorted(set(left))}")
     target = run_dir / "configs_rendered" / f"{template}-{name or values.get('__WORKER_NAME__', 'x')}.yaml"
-    write_text(target, text)
+    # Written VERBATIM, not through the redacting writer: the harness reads this file back, and redaction rewrites the home directory to `~`, which turned the workspace path into
+    # `~/...` and made every run from a checkout under $HOME fail at start-up. What is shared is still redacted: `package` runs the redactor over every yaml before archiving.
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
     return target
 
 

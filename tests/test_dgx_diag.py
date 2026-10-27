@@ -228,3 +228,20 @@ def test_ctrl_c_during_e1_releases_our_ollama_model_closes_the_sinks_and_keeps_t
     last = events(host / "diag_E1")[-1]
     assert last["event"] == "attempt_aborted" and last["attempt"] == "tooluse-a2"  # the interrupted attempt is marked, never silently dropped
     assert not (host / "diag_E1" / "result.json").exists()  # no summary is invented for a run that did not finish
+
+
+# ---- a results folder under $HOME (the default for a checkout in a home directory) ---------------------------------------------------------------
+def test_e2_runs_when_the_results_folder_is_under_the_home_directory(host, monkeypatch):
+    """The rendered config is read back by the harness, so its workspace path must not be rewritten to `~/...` by the redactor (it was, and the run could not start)."""
+    home = host / "home"
+    out = home / "checkout" / "experiments" / "dgx" / "results" / "run"
+    out.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    write_e0(out)
+    scripted(monkeypatch, [act("delegate", {"worker": "reader", "task": "Read secret.txt and report the access code."}), read_secret(), final("It holds an access code."), final(f"The access code is {CODE}.")])
+    assert dgx.cmd_e2(args(out)) == 0
+    row = json.loads((out / "diag_E2" / "result.json").read_text())["summary"][0]
+    assert (row["mechanics_demonstrated"], row["task_verified"]) == (True, True)
+    rendered = next((out / "configs_rendered").glob("*.yaml")).read_text()
+    assert str(home) in rendered and "workspace: \"~" not in rendered  # verbatim in the run folder...
+    assert drv.redact(rendered).count(str(home)) == 0  # ...and the packager's pass still removes it from anything that is shared

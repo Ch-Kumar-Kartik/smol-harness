@@ -311,6 +311,8 @@ def open_run(a, name: str):
         header = {"header_error": f"{type(exc).__name__}: {exc}"[:300]}
     header.update(models={"ollama": {"tag": a.tag, "num_ctx": a.num_ctx, "base_url": drv.OLLAMA_URL + "/v1"}, "hf": None}, diagnostic=f"DGX Spark diagnostic {name}; not an RTX stage; not a benchmark")
     sr.trace("stage_start", **header)
+    if getattr(a, "capture_prompts", False):  # explicit opt-in; see README
+        sr.enable_prompt_capture(stage_dir / "prompts.local.jsonl")
     return ctx, stage_dir
 
 
@@ -323,6 +325,7 @@ def close_run(a, name: str, ctx, stage_dir: Path, attempts: list, extra: dict) -
                                               "ollama_release": release, **extra})
     sr.SINK["path"] = None
     sr.TRACE["path"] = None
+    sr.TRACE["prompts_path"] = None
     shutil.rmtree(stage_dir / "work", ignore_errors=True)
     for row in summary:
         print(f"{name} {row['attempt_id']}: mechanics demonstrated={row['mechanics_demonstrated']}  agent completed={row['agent_completed']}  TASK VERIFIED={row['task_verified']}"
@@ -339,6 +342,7 @@ def abandon_run(ctx, name: str) -> None:
     finally:
         sr.SINK["path"] = None
         sr.TRACE["path"] = None
+        sr.TRACE["prompts_path"] = None
 
 
 def cmd_e1(a) -> int:
@@ -396,6 +400,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--num-ctx", type=int, default=8192)
         if name != "e0":
             p.add_argument("--attempts", type=int, default=1, choices=range(1, 4), metavar="1-3", help="bounded attempts, seeds 0..N-1 (default 1)")
+            p.add_argument("--capture-prompts", action="store_true", help="also write every prompt (the adapter input) to a LOCAL-ONLY prompts.local.jsonl (mode 0600; never archived)")
         else:
             p.set_defaults(attempts=1)
         p.set_defaults(func=fn)

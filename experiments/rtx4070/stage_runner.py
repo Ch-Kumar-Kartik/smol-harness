@@ -55,10 +55,12 @@ GPU_FRACTION_MIN = 0.95  # an Ollama model that is less than this on the GPU has
 # running: DelegateTool.execute (wrapped by tool_log) switches them to the worker for the length of the delegation. Module state, not a ContextVar, because
 # effGen may run a tool on another thread. Prompts are NOT stored (length and SHA-256 only): a prompt can hold anything a tool read, and shared artifacts must not.
 # Identity of a line: `run_id` (the results folder) + `stage` + `invocation` (one per runner process, so re-running a stage into the same folder cannot be confused with the
-# first run) + `attempt`. `seq` counts the lines of one invocation. `pending`/`observing` belong to the stop-sequence accounting (see settle_pending).
+# first run) + `attempt`. `seq` counts the lines of one invocation. `pending`/`observing` belong to the stop-sequence accounting (see settle_pending). `last_gen` maps an agent
+# (`role:delegation_id`) to the `seq` of its latest SUCCESSFUL generation line: the generation a tool call that agent makes is the product of (tool_call_start records it).
+# `prompts_path` is set only by an explicit opt-in (enable_prompt_capture).
 def fresh_trace(**fields) -> dict:
     return {"path": None, "stage": None, "run_id": None, "invocation": None, "attempt": None, "role": "orchestrator", "delegation_id": None, "event": 0, "turns": {},
-            "pending": None, "observing": False, **fields}
+            "pending": None, "observing": False, "last_gen": {}, "prompts_path": None, **fields}
 
 
 TRACE = fresh_trace()
@@ -88,12 +90,42 @@ def write_event(event: str, **fields) -> int | None:
     return TRACE["event"]
 
 
-def trace(event: str, **fields) -> None:
-    """`write_event`, after the previous generation's consumed text has been settled (anything that happens next proves effGen is done with that generation)."""
+def trace(event: str, **fields) -> int | None:
+    """`write_event`, after the previous generation's consumed text has been settled (anything that happens next proves effGen is done with that generation). Returns the line's `seq`."""
     if TRACE["path"] is None:
-        return
+        return None
     settle_pending()
-    write_event(event, **fields)
+    return write_event(event, **fields)
+
+
+# ---- private prompt capture (opt-in) ---------------------------------------------------------------------------------------------------------------------
+PROMPT_CAPTURE_NOTE = ("the prompt string that effGen passed to the model's generate(), i.e. the adapter INPUT. It is not the provider's final payload: the OpenAI-compatible adapter wraps it "
+                       "in chat messages, and a Hugging Face engine may apply a chat template or add tool definitions before tokenising.")
+
+
+def prompt_digest(prompt) -> tuple[str, str]:
+    text = str(prompt)
+    return text, hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
+def enable_prompt_capture(path: Path) -> None:
+    """Explicit opt-in. Prompts go to a SEPARATE local-only file (`*.local.jsonl`, mode 0600, never redacted so that the SHA-256 in the trace still verifies) and never into
+    trace.jsonl. The packager neither archives nor rewrites it (rtx4070.exclusion_reason), and it is Git-ignored. A prompt can hold anything a tool read: do not share the file."""
+    os.close(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600))
+    os.chmod(path, 0o600)
+    TRACE["prompts_path"] = path
+    write_event("prompt_capture_enabled", file=path.name, what=PROMPT_CAPTURE_NOTE)
+
+
+def capture_prompt(seq: int | None, prompt) -> None:
+    """One line per model call, keyed by the invocation and the `seq` of the trace line it belongs to (a `generation` or `generation_error`). A generation that never returned
+    leaves no trace line and therefore no prompt."""
+    if TRACE["prompts_path"] is None or seq is None:
+        return
+    text, digest = prompt_digest(prompt)
+    line = {"invocation": TRACE["invocation"], "run_id": TRACE["run_id"], "attempt": TRACE["attempt"], "seq": seq, "sha256": digest, "chars": len(text), "text": text}
+    with os.fdopen(os.open(TRACE["prompts_path"], os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(line) + "\n")
 
 
 # ---- what effGen CONSUMED of a generation (review 005, P1-A) -------------------------------------------------------------------------------------------------------------
@@ -163,7 +195,7 @@ def attempt_scope(attempt_id: str, task: str, role: str, **fields):
     """Mark an attempt in the trace: its exact task and setup first, `attempt_aborted` if anything (Ctrl-C included) ends it early. Also observes effGen's local stop
     handling for the attempt's length, and settles the last generation before the attempt is over."""
     settle_pending()
-    TRACE.update(attempt=attempt_id, role=role, delegation_id=None, turns={})
+    TRACE.update(attempt=attempt_id, role=role, delegation_id=None, turns={}, last_gen={})  # a tool call is never attributed to a generation of an earlier attempt
     trace("attempt_start", task=task, initial_role=role, **fields)
     with local_stop_observer():
         try:
@@ -301,12 +333,17 @@ def traced_generate(original, provider: str, calls: list):
         try:
             result = original(prompt, config, **kw)
         except BaseException as exc:
-            trace("generation_error", provider=provider, **who, prompt_chars=len(str(prompt)), limits=generation_limits(config), error=f"{type(exc).__name__}: {exc}")
+            _, digest = prompt_digest(prompt)
+            seq = trace("generation_error", provider=provider, **who, prompt_chars=len(str(prompt)), prompt_sha256=digest, limits=generation_limits(config),
+                        error=f"{type(exc).__name__}: {exc}")
+            capture_prompt(seq, prompt)
             raise
         record = {**generation_record(provider, prompt, config, result, time.perf_counter() - started), **who, "attempt": TRACE["attempt"]}
         calls.append(record)
-        trace("generation", **{k: v for k, v in record.items() if k not in ("prompt", "attempt")})
-        record["trace_seq"] = TRACE["event"] if TRACE["path"] is not None else None
+        record["trace_seq"] = trace("generation", **{k: v for k, v in record.items() if k not in ("prompt", "attempt")})
+        if record["trace_seq"] is not None:
+            TRACE["last_gen"][key] = record["trace_seq"]  # a failed call is not recorded here: a tool call is never attributed to a generation that produced nothing
+        capture_prompt(record["trace_seq"], prompt)
         if record["consumed_status"] == "pending":
             TRACE["pending"] = record
         return result
@@ -407,6 +444,9 @@ def tool_log():
         async def execute(self, **kwargs):
             is_delegate = isinstance(self, DelegateTool)
             who = agent_context()
+            # The generation that produced this call is the latest successful one of the agent making it (read before the context switches to the worker). Recorded here, at the
+            # source, so that nobody has to reconstruct the link later.
+            requested_by = TRACE["last_gen"].get(f"{who['role']}:{who['delegation_id']}")
             previous = (TRACE["role"], TRACE["delegation_id"])
             seq_before = self._seq if is_delegate else None
             if is_delegate:
@@ -414,7 +454,14 @@ def tool_log():
                 # at all is decided afterwards: effGen's parameter validation can refuse it before the tool runs, and then no id was ever assigned (review 005, P1-B).
                 who = {**who, "delegation_id": f"d{seq_before + 1}"}
                 TRACE.update(role="worker", delegation_id=who["delegation_id"])
-            entry = {"tool": self.name, **who, "args": dict(kwargs)}
+            entry = {"tool": self.name, **who, "args": dict(kwargs), "requested_by_generation_seq": requested_by}
+            # Written BEFORE the tool is dispatched: a process that dies inside a long tool call or a delegation still leaves the arguments, the delegated task text, the agent that
+            # asked and the id this call expects. Its `seq` is the stable id of the call (`<invocation>:<seq>`); the completion line below repeats it.
+            start = {k: v for k, v in entry.items() if k != "delegation_id"} if is_delegate else dict(entry)
+            if is_delegate:
+                start["delegation_id_expected"] = who["delegation_id"]
+            start_seq = trace("tool_call_start", **start)
+            entry.update(start_seq=start_seq, tool_call_id=f"{TRACE['invocation']}:{start_seq}" if start_seq is not None else None)
             started = time.perf_counter()
 
             def settle_identity() -> None:
@@ -1035,6 +1082,8 @@ def main(argv=None) -> int:
             except Exception as exc:  # noqa: BLE001 - missing header facts must not fail the stage; they are recorded as missing
                 header = {"header_error": f"{type(exc).__name__}: {exc}"[:300]}
             trace("stage_start", **header)
+            if os.environ.get("SMOL_CAPTURE_PROMPTS") == "1":  # explicit opt-in; the driver passes its environment on to the stage
+                enable_prompt_capture(Path(args.run_dir) / f"stage_{args.stage}" / "prompts.local.jsonl")
             result = STAGE_FUNCS[args.stage](ctx, args)
         except Exception as exc:  # noqa: BLE001 - a crash is a result, with its diagnosis
             import traceback
@@ -1042,6 +1091,7 @@ def main(argv=None) -> int:
         finally:
             SINK["path"] = None
             TRACE["path"] = None
+            TRACE["prompts_path"] = None
         result["runner_seconds"] = round(time.time() - started, 1)
     result["title"] = drv.TITLES[args.stage]
     result["finished_utc"] = drv.now()
