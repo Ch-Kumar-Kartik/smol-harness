@@ -167,6 +167,7 @@ Not yet verified at all: Ollama contact from the harness (no Ollama server has b
 - The shell sandbox is not complete isolation (see above) and is Linux only.
 - effGen's native tool calling cannot read the small test model's default call format, so the harness uses ReAct mode. Tool calling through Ollama has not been verified.
 - A successful exit does not imply a correct result; the harness has no built-in task verification.
+- A `delegate` call whose input exceeds 10,000 characters (effGen's tool-input limit, counted on the JSON the model writes) is refused with an explicit error; the orchestrator must shorten the task and context. Context between workers travels only through the orchestrator, as text it writes into the next delegation.
 - The process-wide effGen loop patch is required so identical repeated calls of `shell`, `file_operations` and `delegate` actually run. The CLI installs it; library users must call `smol_harness.harness.initialize_runtime()` first. It is pinned to effGen 1.3.0 and fails loudly on any other version.
 - Execution history cannot report tool success, raw model text or the provider payload (see above).
 - Persistent memory, context compaction, recursive hierarchies, checkpointing and web access are intentionally out of scope.

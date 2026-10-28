@@ -22,6 +22,7 @@ from effgen.tools.base_tool import BaseTool
 from smol_harness.delegation import (
     DELEGATE_TOOL_NAME,
     STATEFUL_TOOL_MARKER,
+    DelegateInputGuard,
     DelegateTool,
     WorkerRecord,
     WorkerRegistry,
@@ -274,7 +275,9 @@ class Harness:
             self.registry, records, self.worker_timeout_s,
             max_delegations=self.max_delegations, max_report_chars=self.max_report_chars,
         )
-        config = replace(self._orchestrator, tools=[*self._orchestrator.tools, delegate], enable_sub_agents=False)
+        # The guard goes last, after the recorder if there is one: the recorder's hook runs first, so a refused call is still recorded (its result is the refusal).
+        config = replace(self._orchestrator, tools=[*self._orchestrator.tools, delegate], middleware=[*self._orchestrator.middleware, DelegateInputGuard()],
+                         enable_sub_agents=False)
         if any(getattr(tool, STATEFUL_TOOL_MARKER, False) for tool in config.tools):
             _require_loop_compat()  # `delegate` is always marked, so this always applies
         if self.recorder is not None:

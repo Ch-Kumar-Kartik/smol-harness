@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import json
+import re
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
@@ -91,6 +92,39 @@ class DeadlineMiddleware(AgentMiddleware):
 
     def before_tool_call(self, ctx: Any) -> None:
         self._check(f"tool {ctx.tool_name!r}")
+
+
+# effGen cuts every tool input to 10,000 characters BEFORE parsing it (`Agent._sanitize_tool_input`, effgen/core/agent_runtime.py, called from
+# `_execute_tool_guarded` after the middleware hooks; audit Part 3, "Subagent context transfer"). The input of `delegate` is the JSON object the model wrote
+# (keys, quotes and escape sequences included), so a long `task`/`context` is cut in the middle, the JSON no longer parses, and the model is told only that
+# "Parameter 'task' is required"; no worker runs. effGen offers no switch for the limit. The hook point before the cut is `before_tool_call`, which sees the
+# raw input: `DelegateInputGuard` refuses an oversized call there, with an accurate message. tests/test_delegate_input_guard.py pins effGen's limit and its counting.
+MAX_TOOL_INPUT_CHARS = 10_000
+_EFFGEN_STRIPPED_CONTROLS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")  # effGen removes these (not \n or \t) before it counts
+
+
+def tool_input_size(tool_input: str) -> int:
+    """The length effGen measures against its limit: the input after control characters are stripped."""
+    return len(_EFFGEN_STRIPPED_CONTROLS.sub("", tool_input))
+
+
+class DelegateInputGuard(AgentMiddleware):
+    """Refuse a `delegate` call whose input effGen would cut, instead of letting the JSON be truncated (see MAX_TOOL_INPUT_CHARS).
+
+    Answers the call itself (the documented `before_tool_call` short-circuit): the tool does not run, no worker starts, no delegation id is used and
+    `max_delegations` is not charged. The refusal text starts with "Error:" and states the measured size, so a model can shorten its call. Every other
+    tool, and a call at or under the limit, is untouched. It never edits the input.
+    """
+
+    def before_tool_call(self, ctx: Any) -> str | None:
+        if ctx.tool_name != DELEGATE_TOOL_NAME or not isinstance(ctx.tool_input, str):
+            return None
+        size = tool_input_size(ctx.tool_input)
+        if size <= MAX_TOOL_INPUT_CHARS:
+            return None
+        return (f"Error: the delegate call was NOT run. Its input (the whole JSON object you wrote, counting the keys, quotes and escape characters) is {size} "
+                f"characters and the limit is {MAX_TOOL_INPUT_CHARS}; longer input would be cut in the middle and become invalid. No worker started and this "
+                "was not counted as a delegation. Call delegate again with a shorter task and context: send the worker only what it needs.")
 
 
 # The deadline of the worker run in progress, for tools that can bound themselves by it (ShellTool, review F8). Set by

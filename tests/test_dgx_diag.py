@@ -245,3 +245,268 @@ def test_e2_runs_when_the_results_folder_is_under_the_home_directory(host, monke
     rendered = next((out / "configs_rendered").glob("*.yaml")).read_text()
     assert str(home) in rendered and "workspace: \"~" not in rendered  # verbatim in the run folder...
     assert drv.redact(rendered).count(str(home)) == 0  # ...and the packager's pass still removes it from anything that is shared
+
+
+# ---- E3: context transfer between two workers through the orchestrator ------------------------------------------------------------------------------
+VALUE = dgx.E3_VALUE
+
+
+def write_e2(out: Path, **over):
+    report = {"experiment": "E2", "tag": TAG, "num_ctx": CTX, "summary": [{"attempt_id": "X2-a1", "mechanics_demonstrated": True}], **over}
+    (out / "diag_E2").mkdir(parents=True, exist_ok=True)
+    (out / "diag_E2" / "result.json").write_text(json.dumps(report))
+
+
+def e3_script(*, writer_delegation=None, writer_calls=None, reader_task="Read source.txt and report the transfer value.", writer_content=f"{VALUE}\n"):
+    """The turns of ONE shared scripted model, in the order the agents call it: orchestrator, reader (x2), orchestrator, writer (x2), orchestrator."""
+    writer_delegation = writer_delegation or {"worker": "writer", "task": f"Create the file result.txt containing exactly {VALUE} on one line."}
+    writer_calls = writer_calls or [act("file_operations", {"operation": "write", "path": "result.txt", "content": writer_content})]
+    return [act("delegate", {"worker": "reader", "task": reader_task}),
+            act("file_operations", {"operation": "read", "path": "source.txt"}), final(f"The transfer value is {VALUE}."),
+            act("delegate", writer_delegation), *writer_calls, final("I created result.txt."),
+            final(f"I wrote {VALUE} to result.txt.")]
+
+
+def e3_row(host):
+    return json.loads((host / "diag_E3" / "result.json").read_text())["summary"][0]
+
+
+def e3_record(host):
+    return json.loads((host / "diag_E3" / "attempts.jsonl").read_text().splitlines()[0])
+
+
+def test_e3_exact_transfer_and_a_verified_result_are_both_recorded_and_the_arguments_are_in_the_trace(host, monkeypatch):
+    write_e0(host)
+    write_e2(host)
+    model = scripted(monkeypatch, e3_script())
+    assert dgx.cmd_e3(args(host)) == 0
+    row = e3_row(host)
+    assert (row["mechanics_demonstrated"], row["agent_completed"], row["task_verified"], row["context_transfer_exact"]) == (True, True, True, True)
+    assert row["failed_checks"] == [] and row["transfer_failed_checks"] == []
+    record = e3_record(host)
+    first, second = record["delegations"]
+    assert (first["worker"], first["delegation_id"], VALUE in first["report_output"]) == ("reader", "d1", True)
+    assert (second["worker"], second["delegation_id"], VALUE in second["task"], second["context"]) == ("writer", "d2", True, None) and record["value_carried_in"] == ["task"]
+    assert [(t["worker"], t["tool"], t["args"].get("operation")) for t in record["worker_tool_calls"]] == [("reader", "file_operations", "read"), ("writer", "file_operations", "write")]
+    assert record["result_file"] == {"exists": True, "content": f"{VALUE}\n"} and record["writer_read_source"] is False
+    # what the SQLite index shows about the transfer: the second delegate call's arguments, and the writer's own calls attributed to it
+    trace = events(host / "diag_E3")
+    starts = [e for e in trace if e["event"] == "tool_call_start" and e["tool"] == "delegate"]
+    assert [s["args"]["worker"] for s in starts] == ["reader", "writer"] and VALUE in starts[1]["args"]["task"] and VALUE not in starts[0]["args"]["task"]
+    sys.path.insert(0, str(ROOT / "experiments" / "history"))
+    import history
+
+    conn = history.connect(host / "h.db")
+    history.import_source(conn, host / "diag_E3" / "trace.jsonl", "2026-10-28T00:00:00Z")
+    sent = [dict(r) for r in conn.execute("SELECT json_extract(args, '$.worker') w, json_extract(args, '$.task') t, delegation_id d FROM tool_calls WHERE tool = 'delegate' ORDER BY started_seq")]
+    assert [(r["w"], r["d"]) for r in sent] == [("reader", "d1"), ("writer", "d2")] and VALUE in sent[1]["t"]
+    assert [dict(r) for r in conn.execute("SELECT agent_name a, delegation_id d FROM tool_calls WHERE role = 'worker' ORDER BY started_seq")] == [{"a": "reader", "d": "d1"}, {"a": "writer", "d": "d2"}]
+    # independent contexts: the writer's model never saw the reader's task or tool call, the reader's never saw the writer's
+    prompts = [str(c.prompt) for c in model.calls]
+    writer_prompts = [p for p in prompts if "You are the worker agent 'writer'" in p]
+    reader_prompts = [p for p in prompts if "You are the worker agent 'reader'" in p]
+    assert writer_prompts and reader_prompts and record["worker_context_isolated"] is True
+    assert not any("Read source.txt and report" in p or '"path": "source.txt"' in p for p in writer_prompts) and not any("result.txt" in p for p in reader_prompts)
+
+
+def test_e3_exact_transfer_does_not_mean_the_task_succeeded(host, monkeypatch):
+    write_e0(host)
+    write_e2(host)
+    scripted(monkeypatch, e3_script(writer_content="WRONG-0000\n"))
+    assert dgx.cmd_e3(args(host)) == 0
+    row = e3_row(host)
+    assert row["context_transfer_exact"] is True and row["task_verified"] is False and row["failed_checks"] == ["result_file_exact"]
+
+
+def test_e3_a_correct_file_that_bypassed_the_orchestrator_is_not_an_exact_transfer(host, monkeypatch):
+    """The writer reads source.txt itself: the file is right, but nothing was carried through the delegation."""
+    write_e0(host)
+    write_e2(host)
+    scripted(monkeypatch, e3_script(writer_delegation={"worker": "writer", "task": "Create result.txt containing the transfer value from source.txt."},
+                                    writer_calls=[act("file_operations", {"operation": "read", "path": "source.txt"}),
+                                                  act("file_operations", {"operation": "write", "path": "result.txt", "content": f"{VALUE}\n"})]))
+    assert dgx.cmd_e3(args(host)) == 0
+    row = e3_row(host)
+    assert row["task_verified"] is True and row["context_transfer_exact"] is False
+    # the value also never reached the writer's FIRST prompt (it only appeared later, as the result of its own read), which is why that check fails as well
+    assert row["transfer_failed_checks"] == ["value_in_writer_delegation", "value_reached_writer_model", "writer_did_not_read_source"] and e3_record(host)["writer_read_source"] is True
+
+
+def test_e3_the_value_may_travel_in_the_context_argument(host, monkeypatch):
+    write_e0(host)
+    write_e2(host)
+    scripted(monkeypatch, e3_script(writer_delegation={"worker": "writer", "task": "Create result.txt with the value below on one line.", "context": f"value: {VALUE}"}))
+    assert dgx.cmd_e3(args(host)) == 0
+    assert (e3_row(host)["context_transfer_exact"], e3_row(host)["task_verified"]) == (True, True) and e3_record(host)["value_carried_in"] == ["context"]
+
+
+def test_e3_a_value_known_before_the_reader_ran_is_flagged(host, monkeypatch):
+    write_e0(host)
+    write_e2(host)
+    scripted(monkeypatch, e3_script(reader_task=f"Read source.txt; it should say {VALUE}."))
+    assert dgx.cmd_e3(args(host)) == 0
+    assert e3_row(host)["transfer_failed_checks"] == ["value_absent_before_the_reader"]
+
+
+def test_e3_a_model_that_never_delegates_demonstrates_nothing(host, monkeypatch):
+    write_e0(host)
+    write_e2(host)
+    scripted(monkeypatch, [final(f"I wrote {VALUE} to result.txt.")])
+    assert dgx.cmd_e3(args(host)) == 1
+    row = e3_row(host)
+    assert (row["mechanics_demonstrated"], row["task_verified"], row["context_transfer_exact"]) == (False, False, False)
+    assert "result_file_exists" in row["failed_checks"] and "reader_read_source" in row["transfer_failed_checks"]
+
+
+@pytest.mark.parametrize("prepare, fragment", [
+    (lambda out: None, "no E0 report"),
+    (lambda out: write_e0(out), "no E2 result"),
+    (lambda out: (write_e0(out), write_e2(out, tag="other:tag")), "E2 result was made for tag 'other:tag'"),
+    (lambda out: (write_e0(out), write_e2(out, summary=[{"attempt_id": "X2-a1", "mechanics_demonstrated": False}])), "did not demonstrate the delegation mechanics"),
+    (lambda out: (write_e0(out, gates_e1_e2=False), write_e2(out)), "E0 did not pass"),
+])
+def test_e3_refuses_to_run_until_its_prerequisites_are_met(host, monkeypatch, capsys, prepare, fragment):
+    prepare(host)
+    monkeypatch.setattr(models_mod, "build_model", lambda spec: pytest.fail("a model was loaded although E3 was refused"))
+    assert dgx.cmd_e3(args(host)) == 2
+    assert fragment in capsys.readouterr().out and not (host / "diag_E3").exists()
+
+
+# ---- E3 review remediation (Opus review of the E3 verifier): B1 the report the orchestrator really received, B2 whole-token matching, the bypass check ----------------------------
+def reader_report_turns(report: str):
+    turns = e3_script()
+    turns[2] = final(report)  # the reader worker's final answer, i.e. its report
+    return turns
+
+
+def test_e3_b1_the_report_is_read_from_the_delegate_result_not_the_500_character_cli_preview(host, monkeypatch):
+    write_e0(host)
+    write_e2(host)
+    scripted(monkeypatch, reader_report_turns("Report: " + "padding " * 90 + f"The transfer value is {VALUE}."))  # the value sits after ~720 characters
+    assert dgx.cmd_e3(args(host)) == 0
+    first = e3_record(host)["delegations"][0]
+    assert VALUE in first["report_output"] and VALUE not in first["report_output_cli_preview"] and len(first["report_output_cli_preview"]) < 600  # the preview WAS cut
+    row = e3_row(host)
+    assert row["context_transfer_exact"] is True and row["transfer_failed_checks"] == [] and row["task_verified"] is True
+
+
+def test_e3_b1_a_value_beyond_what_the_orchestrator_received_is_not_credited_even_if_the_orchestrator_names_it(host, monkeypatch):
+    """max_report_chars (3000 in the E3 config) cuts the report the orchestrator gets. If the value is past the cut, a later correct delegation did not come from the report."""
+    write_e0(host)
+    write_e2(host)
+    scripted(monkeypatch, reader_report_turns("Report: " + "padding " * 450 + f"The transfer value is {VALUE}."))  # ~3,600 characters
+    assert dgx.cmd_e3(args(host)) == 0
+    first = e3_record(host)["delegations"][0]
+    assert first["report_truncated"] is True and VALUE not in first["report_output"]
+    assert e3_row(host)["transfer_failed_checks"] == ["reader_report_has_value"] and e3_row(host)["context_transfer_exact"] is False
+
+
+def test_e3_b1_an_altered_value_in_the_reader_report_fails_that_check(host, monkeypatch):
+    write_e0(host)
+    write_e2(host)
+    scripted(monkeypatch, reader_report_turns(f"The transfer value is {VALUE}9."))
+    assert dgx.cmd_e3(args(host)) == 0
+    assert e3_row(host)["transfer_failed_checks"] == ["reader_report_has_value"]
+
+
+@pytest.mark.parametrize("text, expected", [
+    (VALUE, True), (f"{VALUE}.", True), (f'"{VALUE}"', True), (f"value: {VALUE}\n", True), (f"({VALUE})", True), (f"a {VALUE}, b", True),
+    (f"{VALUE}9", False), (f"X{VALUE}", False), (f"{VALUE}-b", False), (f"{VALUE}_x", False), (f"a-{VALUE}", False), (f"{VALUE.lower()}", False), ("TRANSFER-417", False), ("", False), (None, False),
+])
+def test_e3_b2_the_value_is_matched_as_a_whole_token(text, expected):
+    assert dgx.has_token(text, VALUE) is expected
+
+
+@pytest.mark.parametrize("altered", [f"{VALUE}9", f"X{VALUE}", f"{VALUE}-b", f"{VALUE}_x"])
+def test_e3_b2_an_altered_value_is_not_an_exact_transfer_even_when_the_file_is_right(host, monkeypatch, altered):
+    write_e0(host)
+    write_e2(host)
+    scripted(monkeypatch, e3_script(writer_delegation={"worker": "writer", "task": f"Create the file result.txt containing exactly {altered} on one line."}))  # the writer still writes the right value
+    assert dgx.cmd_e3(args(host)) == 0
+    row = e3_row(host)
+    assert row["task_verified"] is True  # result.txt is exactly right
+    assert row["context_transfer_exact"] is False and row["transfer_failed_checks"] == ["value_in_writer_delegation", "value_reached_writer_model"]
+
+
+def test_e3_b2_the_writers_own_later_output_does_not_count_as_the_value_reaching_it(host, monkeypatch):
+    """The writer's second prompt contains its own earlier `Action Input` with the value; only its FIRST prompt shows what the delegation gave it."""
+    write_e0(host)
+    write_e2(host)
+    model = scripted(monkeypatch, e3_script(writer_delegation={"worker": "writer", "task": "Create result.txt containing the transfer value."}))
+    assert dgx.cmd_e3(args(host)) == 0
+    writer_prompts = [str(c.prompt) for c in model.calls if "You are the worker agent 'writer'" in str(c.prompt)]
+    assert dgx.has_token(writer_prompts[-1]) and not dgx.has_token(writer_prompts[0])  # present later (its own text), absent at the start
+    assert "value_reached_writer_model" in e3_row(host)["transfer_failed_checks"]
+
+
+def test_e3_b2_the_value_next_to_punctuation_still_counts(host, monkeypatch):
+    write_e0(host)
+    write_e2(host)
+    scripted(monkeypatch, e3_script(writer_delegation={"worker": "writer", "task": f'Create result.txt containing "{VALUE}".'}))
+    assert dgx.cmd_e3(args(host)) == 0
+    assert e3_row(host)["context_transfer_exact"] is True
+
+
+# ---- the writer's access to the source ------------------------------------------------------------------------------------------------------------------------
+def test_e3_names_only_operations_on_the_source_are_recorded_but_are_not_a_bypass(host, monkeypatch):
+    """effGen's search is a filename glob and list/metadata return names and sizes: none of them can show the writer the value."""
+    write_e0(host)
+    write_e2(host)
+    scripted(monkeypatch, e3_script(writer_calls=[act("file_operations", {"operation": "list", "path": "."}), act("file_operations", {"operation": "search", "path": ".", "pattern": "*.txt"}),
+                                                  act("file_operations", {"operation": "metadata", "path": "source.txt"}),
+                                                  act("file_operations", {"operation": "write", "path": "result.txt", "content": f"{VALUE}\n"})]))
+    assert dgx.cmd_e3(args(host)) == 0
+    row, record = e3_row(host), e3_record(host)
+    assert row["context_transfer_exact"] is True and row["task_verified"] is True and record["writer_read_source"] is False
+    writer = [t for t in record["worker_tool_calls"] if t["worker"] == "writer"]
+    assert [(t["args"]["operation"], t["names_source"], t["content_access"], t["observed_value"]) for t in writer] == [
+        ("list", False, False, False), ("search", False, False, False), ("metadata", True, False, False), ("write", False, False, False)]
+
+
+def test_e3_convert_and_read_of_the_source_are_a_bypass(host, monkeypatch):
+    """`convert` reads the source and writes a copy; reading the copy (source.json) names no `source.txt`, so a path check on source.txt alone would miss it."""
+    write_e0(host)
+    write_e2(host)
+    scripted(monkeypatch, e3_script(writer_calls=[act("file_operations", {"operation": "convert", "path": "source.txt", "target_format": "json"}),
+                                                  act("file_operations", {"operation": "read", "path": "source.json"}),
+                                                  act("file_operations", {"operation": "write", "path": "result.txt", "content": f"{VALUE}\n"})]))
+    assert dgx.cmd_e3(args(host)) == 0
+    row, record = e3_row(host), e3_record(host)
+    assert "writer_did_not_read_source" in row["transfer_failed_checks"] and row["context_transfer_exact"] is False and record["writer_read_source"] is True
+    writer = [t for t in record["worker_tool_calls"] if t["worker"] == "writer"]
+    assert [(t["args"]["operation"], t["content_access"]) for t in writer[:2]] == [("convert", True), ("read", True)]  # source.json also names `source.`
+
+
+def log_entry(delegation_id, tool, args, visible="", **extra):
+    return {"tool": tool, "delegation_id": delegation_id, "args": args, "success": True, "visible": visible, **extra}
+
+
+def judge(extra_writer_calls):
+    """e3_judgements on a hand-made log in which everything passes except what `extra_writer_calls` adds: for routes the scripted tools cannot produce."""
+    delegate = lambda did, worker, **kw: log_entry(did, "delegate", {"worker": worker, "task": kw.get("task", "t")}, kw.get("visible", ""), dispatched=True)  # noqa: E731
+    report = json.dumps({"worker": "reader", "status": "completed", "output": f"The transfer value is {VALUE}.", "truncated": False})
+    log = [log_entry("d1", "file_operations", {"operation": "read", "path": "source.txt"}, f"The transfer value is {VALUE}."), delegate("d1", "reader", visible=report),
+           delegate("d2", "writer", task=f"Create result.txt with {VALUE}"), *extra_writer_calls]
+    calls = [{"prompt": f"You are the worker agent 'writer'. Task: create result.txt with {VALUE}"}]
+    return dgx.e3_judgements(log, {"success": True, "workers": [{"status": "completed"}, {"status": "completed"}]}, calls, Path("/nonexistent"), {}, {})
+
+
+def failed_transfer(judged):
+    return [c["name"] for c in judged["context_transfer"]["checks"] if not c["passed"]]
+
+
+def test_e3_a_value_returned_to_the_writer_by_any_other_file_is_a_bypass_but_its_own_result_file_is_not():
+    other = log_entry("d2", "file_operations", {"operation": "read", "path": "notes.dat"}, f"copied: {VALUE}")
+    own = log_entry("d2", "file_operations", {"operation": "read", "path": "result.txt"}, f"{VALUE}\n")
+    wrote = log_entry("d2", "file_operations", {"operation": "write", "path": "result.txt", "content": VALUE}, f"wrote result.txt ({VALUE})")
+    assert failed_transfer(judge([other])) == ["writer_did_not_read_source"]
+    assert failed_transfer(judge([own, wrote])) == []
+    assert failed_transfer(judge([])) == []
+
+
+def test_e3_the_reader_must_have_been_shown_the_value_by_its_read():
+    judged = dgx.e3_judgements([log_entry("d1", "file_operations", {"operation": "read", "path": "source.txt"}, "empty file"),
+                                log_entry("d1", "delegate", {"worker": "reader", "task": "t"}, json.dumps({"status": "completed", "output": VALUE}), dispatched=True),
+                                log_entry("d2", "delegate", {"worker": "writer", "task": VALUE}, json.dumps({"status": "completed", "output": "ok"}), dispatched=True)],
+                               {"success": True, "workers": []}, [{"prompt": f"You are the worker agent 'writer'. {VALUE}"}], Path("/nonexistent"), {}, {})
+    assert "reader_read_source" in failed_transfer(judged)

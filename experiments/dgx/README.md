@@ -63,11 +63,40 @@ Optional, explicit: add `--capture-prompts` to `e1`/`e2` to also record every pr
 
 Run **one attempt first** (the default). Look at `trace.jsonl` before adding `--attempts 2` or `3` (seeds 0..N-1; E1 stops at the first verified attempt, E2 at the first
 verified attempt with the mechanics shown). Exit status: E0 `1` if any check FAILED; E1/E2 `0` if the mechanics were demonstrated, `1` if not, `2` if refused.
-**Exit `0` does not mean the task was solved.**
+**Exit `0` does not mean the task was solved.** (E3 is run after E2, see below.)
 
 Fixed across E1, E2 and reruns: the model tag and its digest, `num_ctx 8192`, ReAct mode, the runner's sampling overrides (temperature 0.1, `max_tokens` 768, recorded in every
 result), seeds 0..N-1, the task strings in `stage_runner.py`, tool allowlists (`file_operations` only), the limits in `experiments/rtx4070/configs/ollama_only.yaml`.
 These are the runner's labelled overrides, not the production defaults.
+
+### E3: context transfer between two workers (prepared, NOT RUN; needs a passed E0 and a demonstrated E2)
+
+```bash
+uv run python experiments/dgx/dgx_diag.py e3 --out "$OUT" --tag "$TAG" --num-ctx 8192 [--capture-prompts]   # one attempt, one short value; same $OUT and $TAG as e0 and e2
+```
+What it asks: one Ollama model plays the orchestrator and two workers (`reader`, `writer`, both `file_operations` only). Worker `reader` reads the value from `source.txt`
+(`TRANSFER-4172`, written by the runner and never mentioned in the task text), reports it to the orchestrator, and the orchestrator must put the value into its delegation to `writer`
+(the task text says so; the writer cannot see the conversation), which creates `result.txt`. Limits: `max_delegations 3`, report cap 3000 characters. E3 refuses (exit 2, nothing
+loaded) unless E0 passed for this tag and context AND `diag_E2/result.json` exists for the same tag with the mechanics demonstrated.
+
+Two verdicts, kept apart, both decided by the runner from executions, prompts and the disk, never from the model's answer:
+
+| Verdict (field) | Checks |
+|---|---|
+| `context_transfer.exact` | the reader executed a successful read of `source.txt` whose result showed it the value; the reader was dispatched before the writer; the value is NOT in the first delegation; the report the orchestrator received from the reader contains the value; the value is in the writer delegation's `task` or `context`; the value is in the writer model's FIRST prompt (what the delegation handed it, not its own later output); no writer file call bypassed the orchestrator (below) |
+| `verification` (task) | `result.txt` exists; its stripped content is exactly the value; `source.txt` is byte-identical; `result.txt` is the only file added or changed |
+
+**Matching.** The value is matched as a whole token (`has_token`): `TRANSFER-4172.`, `"TRANSFER-4172"` and `value: TRANSFER-4172` match; `TRANSFER-41729`, `XTRANSFER-4172`, `TRANSFER-4172-b` and `TRANSFER-4172_x` do not, so an altered value is never an exact transfer. `result.txt` is compared by exact equality of its stripped content.
+**Which report.** The reader's report is the executed `delegate` call's own result (`diag_E3/trace.jsonl`, `tool_call.visible`), bounded only by `max_report_chars` (3000), i.e. what the orchestrator received. The CLI's `--json` worker output is a display preview cut to 500 characters; it is stored beside it as `report_output_cli_preview` and no check reads it. If the value lies beyond the 3000-character cut, the transfer fails even if a later delegation names the correct value. Nothing is inferred from the orchestrator's final answer.
+**Writer bypass.** effGen's `file_operations` has six operations: `read` and `convert` read file content (`convert` also writes a copy); `search` is a filename glob, `list` and `metadata` return names, sizes and times, none of which can show the value. The writer fails the transfer if it calls `read` or `convert` with any argument naming `source.` (so `source.txt` and a converted `source.json`), or if any other call's observation returned the value to it (a read of a copy, say), except its own `write` and its own `result.txt`. `list`, `search` and `metadata` on the source are recorded (`names_source`) and are not a bypass.
+Exact transfer does not imply a correct file, and a correct file does not imply an exact transfer (a writer that reads `source.txt` itself passes the task and fails the transfer). The
+result row prints both (`TASK VERIFIED=..  CONTEXT TRANSFER EXACT=..`); exit `0` still means only that the mechanics (two dispatched delegations, a worker file call, reports back at the
+orchestrator) ran. The attempt record holds the full `delegations` (task AND context as sent, worker, id, the report output), every worker tool call attributed to a worker and
+delegation id, `value_carried_in`, `writer_read_source`, `result_file`, and `worker_context_isolated`. In SQLite (`history.py import`), the transferred text is
+`SELECT json_extract(args,'$.task'), json_extract(args,'$.context') FROM tool_calls WHERE tool = 'delegate'`, and with `--capture-prompts` the writer's exact prompt is in `timeline --prompts`.
+Delegate input is limited to 10,000 characters (see `docs/effgen-api-audit.md`, Part 3, "Subagent context transfer"): a longer call is refused with an explicit error.
+What the evidence cannot show: the check proves no recorded writer tool call read or returned the source; it cannot prove how a model produced a value that is not in its prompt (that is the point of an unguessable value), and it knows only the writer's `file_operations` calls (the E3 config gives workers no other tool). Only the first dispatched writer delegation is judged: a retry that adds the value later scores as not exact.
+Not part of E3 yet: several values, long values, other tags, parallel or direct worker-to-worker passing.
 
 ## 4. Evidence files (all under `$OUT`; every one is redacted when written)
 
