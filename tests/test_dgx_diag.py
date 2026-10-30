@@ -345,7 +345,8 @@ def test_e3_a_value_known_before_the_reader_ran_is_flagged(host, monkeypatch):
     write_e2(host)
     scripted(monkeypatch, e3_script(reader_task=f"Read source.txt; it should say {VALUE}."))
     assert dgx.cmd_e3(args(host)) == 0
-    assert e3_row(host)["transfer_failed_checks"] == ["value_absent_before_the_reader"]
+    # the reader's INITIAL prompt already held the value, so it did not first appear after the reader's own read: both checks say so
+    assert e3_row(host)["transfer_failed_checks"] == ["value_absent_before_the_reader", "value_first_seen_by_reader"]
 
 
 def test_e3_a_model_that_never_delegates_demonstrates_nothing(host, monkeypatch):
@@ -485,9 +486,10 @@ def judge(extra_writer_calls):
     """e3_judgements on a hand-made log in which everything passes except what `extra_writer_calls` adds: for routes the scripted tools cannot produce."""
     delegate = lambda did, worker, **kw: log_entry(did, "delegate", {"worker": worker, "task": kw.get("task", "t")}, kw.get("visible", ""), dispatched=True)  # noqa: E731
     report = json.dumps({"worker": "reader", "status": "completed", "output": f"The transfer value is {VALUE}.", "truncated": False})
-    log = [log_entry("d1", "file_operations", {"operation": "read", "path": "source.txt"}, f"The transfer value is {VALUE}."), delegate("d1", "reader", visible=report),
+    log = [log_entry("d1", "file_operations", {"operation": "read", "path": "source.txt"}, f"The transfer value is {VALUE}.", start_seq=10), delegate("d1", "reader", visible=report),
            delegate("d2", "writer", task=f"Create result.txt with {VALUE}"), *extra_writer_calls]
-    calls = [{"prompt": f"You are the worker agent 'writer'. Task: create result.txt with {VALUE}"}]
+    calls = [{"prompt": f"You are the worker agent 'reader'. Observation: The transfer value is {VALUE}.", "role": "worker", "delegation_id": "d1", "trace_seq": 12},  # after its read (seq 10)
+             {"prompt": f"You are the worker agent 'writer'. Task: create result.txt with {VALUE}", "role": "worker", "delegation_id": "d2", "trace_seq": 20}]
     return dgx.e3_judgements(log, {"success": True, "workers": [{"status": "completed"}, {"status": "completed"}]}, calls, Path("/nonexistent"), {}, {})
 
 
