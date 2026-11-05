@@ -3,6 +3,8 @@
 `rich3278_pilot.py` connects the existing harness to the reference pipeline validated on 2026-11-03 (baseline 16 failed / 7 passed, gold patch 23 passed). It is an
 **experiment utility** for ONE task; it is not a benchmark runner, and it is not part of `src/`.
 
+**Colleague runbook:** [`../../instructions.md`](../../instructions.md) has the step-by-step procedure for running this pilot against a model served by a DGX Spark (controller machine plus DGX, SSH tunnel, evidence collection, failure handling).
+
 **Status: ready for one explicitly authorized real attempt, with the limitations below; no real agent run has happened.** The tests (`tests/test_coding_eval_pilot.py`) use a fake container, scripted agents and stand-in HTTP servers (not models). No real model has run through the sandbox, so
 the driver is **not** end-to-end validated.
 

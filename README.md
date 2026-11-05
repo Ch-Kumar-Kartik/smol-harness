@@ -66,7 +66,7 @@ Optional, depending on the backends you configure:
 
 - **Ollama backend:** a running Ollama server (default `http://127.0.0.1:11434/v1`) with the model tag already pulled. The configured `context_length` must not exceed the context window the server actually serves.
 - **Hugging Face backend:** model weights downloadable or cached locally. With `device: cuda` (the default) an NVIDIA GPU with a working CUDA PyTorch is required; the harness does not fall back to CPU. With `device: cpu`, only `quantization: none` is accepted and an explicit `dtype` is required.
-- **4-bit and 8-bit quantization:** `bitsandbytes` and a CUDA GPU. `bitsandbytes` is not in the lock file; the RTX 4070 package installs a pinned version for its own runs.
+- **4-bit and 8-bit quantization:** `bitsandbytes` and a CUDA GPU. `bitsandbytes` is not in the lock file; install a pinned version yourself if you need it. (The old RTX 4070 package that did this is historical and not an active target.)
 
 Native Windows is not supported for the `shell` tool: building it there fails closed with an error. The `file_operations` tool and the scripted tests are not Linux specific, but nothing in this repository has been verified on Windows or WSL2 for the shell.
 
@@ -156,17 +156,18 @@ Details, table definitions and retention behaviour: [`experiments/history/README
 
 - **Scripted-model tests (completed).** The default test suite drives the real effGen loop, delegation, tools, sandbox and CLI with scripted models. This is what the feature list above is verified against.
 - **Local real-model experiments (completed, negative result).** `LiquidAI/LFM2.5-350M` on CPU, in ReAct mode, drove the harness mechanically (valid tool calls were parsed and executed, worker records and cleanup worked) but succeeded at none of the tool-use or delegation tasks in 12 recorded attempts. Details are in [`docs/implementation-plan.md`](docs/implementation-plan.md) (task T5.2b). No real model has completed a coding task through the harness.
-- **RTX 4070 package (prepared, not hardware-validated).** [`experiments/rtx4070/`](experiments/rtx4070/README.md) is a step-by-step package for a WSL2 machine with an RTX 4070 (Ollama plus a Hugging Face NF4 worker). It has been tested with mocks only.
-- **DGX Spark diagnostic E0/E1/E2 (prepared, not run).** [`experiments/dgx/`](experiments/dgx/README.md) contains a preflight (E0), a single-agent file read (E1) and an orchestrator-worker delegation (E2). Nothing in it has been run on a DGX Spark, and no DGX result should be assumed.
+- **DGX Spark diagnostics (run once, Qwen3 only).** [`experiments/dgx/`](experiments/dgx/README.md) contains a preflight (E0), a single-agent file read (E1), an orchestrator-worker delegation (E2) and a repeated context-transfer test (E3). On 2026-10-30 E0, E2 and a five-trial E3 repeat were run on a DGX Spark with `smol-qwen3-14b:8k` (Ollama): the delegation mechanics worked, and E3 passed 4 of 5 trials (one trial exhausted its reasoning budget before delegating). These are smoke tests on one model; no Gemma model has been run.
+- **`rich_3278` coding-evaluation pilot (implemented, not yet run with a real model).** [`experiments/coding_eval/`](experiments/coding_eval/README.md) is a single-task pilot on a dataset task: a sandboxed agent plus an independent Docker evaluator, tested with scripted models and stand-in servers only. The step-by-step procedure for running it against a model served by a DGX Spark is in [`instructions.md`](instructions.md).
+- **RTX 4070 package (historical).** [`experiments/rtx4070/`](experiments/rtx4070/README.md) was prepared for a WSL2 machine that is no longer available. It was never run on hardware, is excluded from active workflows, and is kept for provenance. Some of its code is still imported by `experiments/dgx/` and by tests, so it cannot simply be removed.
 
-Not yet verified at all: Ollama contact from the harness (no Ollama server has been used), a bitsandbytes GPU load, a mixed Ollama plus Hugging Face delegation with real models, and the shell on Windows or WSL2.
+Not yet verified at all: any Gemma model, a bitsandbytes GPU load, a mixed Ollama plus Hugging Face delegation with real models, and the shell on Windows or WSL2. Ollama contact from the harness has been verified only on a DGX Spark with one Qwen3 model.
 
 ## Limitations
 
 - Workers run sequentially and delegation depth is 1.
 - The worker timeout is cooperative; a long generation or tool call can overrun it by one call. There is no orchestrator deadline.
 - The shell sandbox is not complete isolation (see above) and is Linux only.
-- effGen's native tool calling cannot read the small test model's default call format, so the harness uses ReAct mode. Tool calling through Ollama has not been verified.
+- effGen's native tool calling cannot read the small test model's default call format, so the harness uses ReAct mode. Tool calling through Ollama (ReAct mode) has been exercised only with one Qwen3 model on a DGX Spark.
 - A successful exit does not imply a correct result; the harness has no built-in task verification.
 - A `delegate` call whose input exceeds 10,000 characters (effGen's tool-input limit, counted on the JSON the model writes) is refused with an explicit error; the orchestrator must shorten the task and context. Context between workers travels only through the orchestrator, as text it writes into the next delegation.
 - The process-wide effGen loop patch is required so identical repeated calls of `shell`, `file_operations` and `delegate` actually run. The CLI installs it; library users must call `smol_harness.harness.initialize_runtime()` first. It is pinned to effGen 1.3.0 and fails loudly on any other version.

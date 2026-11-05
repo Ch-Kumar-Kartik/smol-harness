@@ -1,7 +1,6 @@
 # DGX Spark validation: E0, E1, E2
 
-**Status: PREPARED, NOT RUN ON A DGX SPARK.** The driver and its tests ran only on an x86_64 laptop with scripted models. Nothing below is hardware-validated until the commands
-have run on the DGX and their evidence has been reviewed. What was and was not checked is listed at the end.
+**Status (corrected 2026-11-05): E0, E2 and a five-trial E3 repeat were run on a DGX Spark on 2026-10-30 with `smol-qwen3-14b:8k` (results: `docs/new-session.md` section 4, 2026-10-31 entry). No Gemma model has been run here.** The text below was written before that run and is otherwise unchanged; where it says "not run", read it as historical. This tool imports code from `experiments/rtx4070/` (a historical package) and is **not** used by the Gemma pilot runbook, `../../instructions.md`.
 
 Purpose: Linux (ARM64) correctness of the harness with a real model, and a reproducible trajectory for every attempt. Not a benchmark; not an RTX 4070 stage.
 
