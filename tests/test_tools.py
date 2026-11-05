@@ -257,7 +257,7 @@ def test_each_call_returns_fresh_instances(layout):
     assert a is not b
 
 
-@pytest.mark.parametrize("name", ["bash", "code_executor", "edit_file", "FILE_OPERATIONS", "", "web_search",
+@pytest.mark.parametrize("name", ["bash", "code_executor", "edit_files", "FILE_OPERATIONS", "", "web_search",
                                   "url_fetch", "http_request", "browser", "agentic_search", "wikipedia"])
 def test_unknown_and_web_tools_are_rejected(layout, name):
     with pytest.raises(ToolBuildError, match="unknown tool"):

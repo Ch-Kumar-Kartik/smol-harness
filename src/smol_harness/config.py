@@ -30,7 +30,7 @@ HF_DTYPES = ("bf16", "fp16", "fp32")
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434/v1"  # Ollama's OpenAI-compatible endpoint (audit §1.5)
 
 # Tools the harness can build (T4.x). Anything else is rejected, whatever the YAML says.
-KNOWN_TOOLS = ("file_operations", "shell")
+KNOWN_TOOLS = ("file_operations", "shell", "edit_file")
 _WEB_TOOL_HINT = re.compile(r"web|search|browser|http|fetch|url|crawl|scrape|duckduckgo|ddgs|wiki|news", re.I)
 
 DEFAULT_ORCHESTRATOR_ITERATIONS = 10

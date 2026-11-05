@@ -253,9 +253,10 @@ Convention since T3.2b: tests that load a real checkpoint carry the `real_model`
 
 **T4.3 (contingent) `edit_file` exact-replace tool**
 
-- **Status:** Not started
-- **Do only if** T5.2 shows whole-file writes failing for small workers.
-- **Acceptance:** Unique-match replacement works; zero or multiple matches return clear errors; the path is confined.
+- **Status:** **Implemented and tested with scripted models (2026-11-03); never used by a real model.** Triggered by the `rich_3278` preflight (a one-line fix needs a 240-line, 6,905-character whole-file rewrite, which does not fit the observed 1,024-token output ceiling of the DGX setup; that ceiling is an observation, not a verified server limit).
+- **Done:** `tools.EditFileTool` (registered as `edit_file`, also in `config.KNOWN_TOOLS`). Behaviour, safety properties and limits: architecture §9. `tests/test_edit_file.py` (73 tests: success, preservation, missing file/text, duplicate and overlapping matches, traversal, absolute paths, symlink files and parents, FIFO/directory/hard link/read-only/binary/invalid UTF-8/size, empty replacement, CRLF, concurrent modification, registration, schema, real harness with scripted models, and the real `rich/ansi.py` gold change as a ~100-character edit, byte-identical to the reference fix). Mutation-checked: nine deliberate breakages of the safety lines each fail tests, and five more for the review remediation (control-character diagnostic, orchestrator prompt, temporary-file rule). Follow-up 2026-11-04: `new_text` may not contain C0 control characters other than TAB, LF and CR (refused before the file is touched, with a bounded diagnostic); escapes that decode to ordinary characters stay undetected (pinned by tests). Review remediation 2026-11-03: backslashes copied verbatim from a file reach the tool as control characters through effGen's `literal_eval` fallback, so the refusal explains doubling them and the tool description and worker prompt say so.
+- **Acceptance (met):** unique-match replacement works; zero or multiple matches return clear errors; the path is confined (also against symlinks).
+- **Not verified:** use by a real model (prompt clarity, whether a 14B model copies `old_text` exactly); behaviour on non-POSIX platforms (the tool refuses to build).
 
 ### M5: CLI and end-to-end coding smoke test
 

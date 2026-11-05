@@ -4,19 +4,24 @@ The registry is fixed. Web or network tools, `delegate` (the harness adds it to 
 orchestrator only) and unknown names are never built. Path confinement for
 `file_operations` is effGen's own (`FileOperations`, audit §1.9); `shell` runs commands
 in effGen's `SubprocessSandbox` (Linux namespaces) and fails closed when that cannot
-be enforced (audit Part 3, T4.2). Neither is a VM or container boundary.
+be enforced (audit Part 3, T4.2). Neither is a VM or container boundary. `edit_file` (T4.3) replaces one exact
+occurrence of a text in an existing file without following symbolic links (`EditFileTool`); it is not a sandbox either.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import errno
 import hashlib
 import math
 import os
 import platform
 import re
+import secrets
 import shlex
 import shutil
+import stat
 import tempfile
 import time
 from collections.abc import Callable, Sequence
@@ -332,9 +337,241 @@ def _report(echo: str, exit_code: int, timed_out: bool, timeout_s: int, stdout: 
     return "\n".join(lines)
 
 
+class _Refused(Exception):
+    """`edit_file` refuses the call; the message goes to the model, nothing was changed."""
+
+
+class EditFileTool(BaseTool):
+    """Replace ONE exact piece of text in an existing file, without rewriting the file (plan T4.3).
+
+    Why it exists: `file_operations` can only overwrite a whole file, which a small model cannot do for a file of a few
+    thousand characters inside its output limit (docs/new-session.md, rich_3278 preflight).
+
+    Safety, all enforced here and tested (`tests/test_edit_file.py`): the path is workspace-relative; every component is
+    opened with `O_NOFOLLOW` through directory file descriptors starting at the resolved workspace, so no symbolic link
+    in the path (parent directories included) is ever followed and a path swapped for a link after validation cannot
+    redirect the edit; only a regular, single-link, UTF-8 text file within the size limit is edited; `old_text` must occur
+    exactly once (overlapping occurrences count); nothing is normalised (line endings, whitespace, BOM stay as they are);
+    the new content goes to a temporary file in the same directory that atomically replaces the target, after the
+    target is re-read and found unchanged since it was first read. Not enforced: that re-check is detection, not a lock
+    (a writer that changes the file between it and the rename still wins the race), ownership and extended attributes
+    are not preserved by the replace, and `.git` components are refused but there is no other deny-list (unlike
+    `file_operations`, credential-shaped file names are not special-cased).
+    """
+
+    executes_every_call = True  # an identical edit must run again; see STATEFUL_TOOL_MARKER
+
+    MAX_FILE_BYTES = FileOperations.DEFAULT_MAX_FILE_SIZE  # the limit `file_operations` applies to reads
+    MAX_TEXT_CHARS = 10_000  # effGen cuts any tool input at 10,000 characters anyway (audit Part 3, 2026-10-28)
+    MAX_SHOWN_LINES = 5
+    # effGen reads a tool call's JSON input leniently: text that is not valid JSON (a file's `\x1b` copied with ONE backslash) is
+    # re-read with `ast.literal_eval` (core/agent_tool_execution.py), which turns it into a real control character. So a model that
+    # copies backslashes from a file verbatim sends text that cannot match; the refusal explains the doubling (review P1-1).
+    _CONTROL_NAMES = {0x07: "BEL", 0x08: "BS", 0x0B: "VT", 0x0C: "FF", 0x1B: "ESC"}
+    # The same mistake in `new_text` is worse than in `old_text`: the call would MATCH and the control character would be written into the
+    # file, so `new_text` may not contain C0 control characters other than TAB, LF and CR. Escapes that decode to ordinary characters
+    # (`\x41` -> `A`, a naive `\t` -> TAB, `\n` -> LF) cannot be told apart from intended text after parsing and are NOT detected.
+    _ESCAPE_RULE = ' In the JSON input write every backslash as two backslashes, in old_text and in new_text: to match or write the text \\x1b send "\\\\x1b"'
+
+    def __init__(self, workspace: Path | str) -> None:
+        if not (hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and os.open in os.supports_dir_fd and os.rename in os.supports_dir_fd and os.unlink in os.supports_dir_fd):
+            raise ToolBuildError("edit_file needs POSIX file APIs (O_NOFOLLOW and directory file descriptors) and is unavailable on this platform")
+        self._workspace = resolve_workspace(workspace)
+        super().__init__(metadata=ToolMetadata(
+            name="edit_file",
+            description=(
+                "Replace ONE exact piece of text in an existing file without rewriting the whole file. Give the file path "
+                "(relative to the project directory), old_text (copied exactly from the file: indentation, quotes and line breaks "
+                "included) and new_text (what replaces it; an empty new_text deletes old_text). old_text must occur exactly once in "
+                "the file. If it is missing or occurs more than once, nothing is changed and you are told why: copy a few more "
+                "neighbouring lines into old_text to make it unique. Read the file first. Prefer this over file_operations write "
+                "for changing an existing file. Line endings and whitespace are never altered. In the JSON input write every backslash as two "
+                "backslashes, in old_text and in new_text: to match or write the text \\x1b send \\\\x1b. new_text may not contain control "
+                "characters other than tab, line feed and carriage return."),
+            category=ToolCategory.FILE_OPERATIONS,
+            parameters=[
+                ParameterSpec(name="path", type=ParameterType.STRING, description="File to edit, relative to the project directory (for example rich/ansi.py)",
+                              required=True, min_length=1, max_length=500),
+                ParameterSpec(name="old_text", type=ParameterType.STRING, description="The exact text to replace; must occur exactly once in the file",
+                              required=True, min_length=1, max_length=self.MAX_TEXT_CHARS),
+                ParameterSpec(name="new_text", type=ParameterType.STRING, description="The replacement text (may be empty to delete old_text); control characters other than tab, line feed and carriage return are refused",
+                              required=True, max_length=self.MAX_TEXT_CHARS),
+            ],
+            returns={"type": "object", "properties": {"success": {"type": "boolean"}, "result": {"type": "string"}, "error": {"type": "string"}}},
+            tags=["files", "edit"],
+            examples=[{"path": "pkg/mod.py", "old_text": "    return a - b", "new_text": "    return a + b"}],
+        ))
+
+    def validate_parameters(self, **kwargs: Any) -> tuple[bool, str | None]:
+        unknown = sorted(set(kwargs) - {"path", "old_text", "new_text"})
+        if unknown:  # effGen would drop them silently; a call with a misspelled parameter must not run
+            return False, f"Unknown parameter(s) {unknown}: this tool accepts only 'path', 'old_text' and 'new_text'"
+        return super().validate_parameters(**kwargs)
+
+    async def _execute(self, path: str, old_text: str, new_text: str) -> dict[str, Any]:
+        try:
+            return await asyncio.to_thread(self._edit, path, old_text, new_text)
+        except _Refused as exc:
+            return {"success": False, "error": f"edit_file refused: {exc}. Nothing was changed."}
+        except OSError as exc:
+            return {"success": False, "error": f"edit_file failed with {errno.errorcode.get(exc.errno or 0, 'an OS error')}. Nothing was changed."}
+
+    # -- path handling -------------------------------------------------------------------------------------------------
+    @classmethod
+    def _control_names(cls, text: str) -> str:
+        """Names of the C0 control characters in `text` other than TAB, LF and CR (at most 3, bounded); empty when there are none. Never quotes anything else."""
+        found = sorted({ord(c) for c in text if ord(c) < 32 and c not in "\t\n\r"})
+        return ", ".join(f"{cls._CONTROL_NAMES.get(o, 'control')} (U+{o:04X})" for o in found[:3])
+
+    @staticmethod
+    def _components(path: str) -> list[str]:
+        if not isinstance(path, str) or not path.strip() or "\x00" in path:
+            raise _Refused("the path must be a non-empty workspace-relative path")
+        if path.startswith(("/", "\\")) or re.match(r"[A-Za-z]:", path) or "\\" in path:
+            raise _Refused("absolute paths and backslashes are not accepted: use a path relative to the project directory")
+        parts = [p for p in path.split("/") if p not in ("", ".")]
+        if not parts:
+            raise _Refused("the path names no file")
+        if ".." in parts:
+            raise _Refused("'..' is not allowed in a path")
+        if ".git" in parts:
+            raise _Refused("files inside .git are not editable")
+        return parts
+
+    @staticmethod
+    def _open(name: str, flags: int, dir_fd: int, what: str) -> int:
+        try:
+            return os.open(name, flags | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY, dir_fd=dir_fd)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                raise _Refused(f"{what} does not exist") from None
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise _Refused(f"{what} is a symbolic link or not a directory (symbolic links are never followed)") from None
+            raise
+
+    @staticmethod
+    def _read(fd: int, limit: int) -> bytes:
+        chunks, total = [], 0
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                return b"".join(chunks)
+            total += len(chunk)
+            if total > limit:
+                raise _Refused(f"the file is larger than the {limit} byte limit")
+            chunks.append(chunk)
+
+    @staticmethod
+    def _occurrences(text: str, old: str) -> list[int]:
+        found, i = [], text.find(old)
+        while i != -1 and len(found) <= EditFileTool.MAX_SHOWN_LINES:
+            found.append(i)
+            i = text.find(old, i + 1)  # +1: overlapping occurrences are ambiguous too
+        return found
+
+    # -- the edit ------------------------------------------------------------------------------------------------------
+    def _edit(self, path: str, old_text: str, new_text: str) -> dict[str, Any]:
+        parts = self._components(path)
+        shown = "/".join(parts)[:200]
+        for label, value in (("old_text", old_text), ("new_text", new_text)):
+            if not isinstance(value, str) or "\x00" in value:
+                raise _Refused(f"{label} must be text without NUL characters." + (self._ESCAPE_RULE if isinstance(value, str) else ""))
+            if len(value) > self.MAX_TEXT_CHARS:
+                raise _Refused(f"{label} is longer than {self.MAX_TEXT_CHARS} characters")
+            if label == "new_text" and (names := self._control_names(value)):  # checked before the filesystem is touched, like the other argument checks
+                raise _Refused(f"new_text contains the control character(s) {names}, which edit_file never writes: a backslash sequence was probably read as an escape."
+                               + self._ESCAPE_RULE)
+        if not old_text:
+            raise _Refused("old_text must not be empty")
+        if old_text == new_text:
+            raise _Refused("old_text and new_text are identical")
+        try:
+            new_text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise _Refused("new_text is not valid text") from None
+        fds: list[int] = []
+        tmp_name = parent = None
+        try:
+            fd = os.open(self._workspace, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            fds.append(fd)
+            for part in parts[:-1]:
+                fd = self._open(part, os.O_RDONLY | os.O_DIRECTORY, fd, f"directory '{part}'")
+                fds.append(fd)
+            parent, name = fd, parts[-1]
+            ffd = self._open(name, os.O_RDONLY | os.O_NONBLOCK, parent, f"file '{shown}'")  # O_NONBLOCK: a FIFO must not hang the open
+            fds.append(ffd)
+            st = os.fstat(ffd)
+            if not stat.S_ISREG(st.st_mode):
+                raise _Refused(f"'{shown}' is not a regular file")
+            if st.st_nlink != 1:
+                raise _Refused(f"'{shown}' has several hard links")
+            if not st.st_mode & stat.S_IWUSR:  # a rename would replace it regardless of its mode; an open-for-write would not
+                raise _Refused(f"'{shown}' is read-only")
+            if st.st_size > self.MAX_FILE_BYTES:
+                raise _Refused(f"'{shown}' is larger than the {self.MAX_FILE_BYTES} byte limit")
+            data = self._read(ffd, self.MAX_FILE_BYTES)
+            if b"\x00" in data:
+                raise _Refused(f"'{shown}' looks like a binary file")
+            try:
+                text = data.decode("utf-8")  # strict; no newline translation: line endings stay byte for byte
+            except UnicodeDecodeError:
+                raise _Refused(f"'{shown}' is not valid UTF-8 text") from None
+            at = self._occurrences(text, old_text)
+            if not at:
+                hint = " The file uses CRLF line endings: write them (\\r\\n) in old_text." if "\r\n" in text and "\n" in old_text and "\r\n" not in old_text else ""
+                raise _Refused(f"old_text was not found in '{shown}'. It must match the file exactly, indentation and line breaks included.{hint}"
+                               + (f" old_text contains the control character(s) {names}: a backslash sequence was probably read as an escape.{self._ESCAPE_RULE}"
+                                  if (names := self._control_names(old_text)) else ""))
+            if len(at) > 1:
+                lines = ", ".join(str(text.count("\n", 0, i) + 1) for i in at[:self.MAX_SHOWN_LINES])
+                more = "more than " if len(at) > self.MAX_SHOWN_LINES else ""
+                raise _Refused(f"old_text occurs {more}{min(len(at), self.MAX_SHOWN_LINES)} times in '{shown}' (starting at lines {lines}); "
+                               "add neighbouring lines to old_text so that it matches exactly once")
+            line = text.count("\n", 0, at[0]) + 1
+            result = text[:at[0]] + new_text + text[at[0] + len(old_text):]
+            out = result.encode("utf-8")
+            if len(out) > self.MAX_FILE_BYTES:
+                raise _Refused("the edited file would exceed the size limit")
+            tmp_name = f".{name}.edit-{secrets.token_hex(6)}"
+            tfd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=parent)
+            try:
+                os.fchmod(tfd, stat.S_IMODE(st.st_mode))
+                view = memoryview(out)
+                while view:
+                    view = view[os.write(tfd, view):]
+                os.fsync(tfd)
+            finally:
+                os.close(tfd)
+            # Detection, not a lock: the target must still be the file (same inode, same bytes) that the edit was computed from.
+            cfd = self._open(name, os.O_RDONLY | os.O_NONBLOCK, parent, f"file '{shown}'")
+            try:
+                now = os.fstat(cfd)
+                unchanged = (now.st_ino, now.st_dev, now.st_size, now.st_mtime_ns) == (st.st_ino, st.st_dev, st.st_size, st.st_mtime_ns) and self._read(cfd, self.MAX_FILE_BYTES) == data
+            finally:
+                os.close(cfd)
+            if not unchanged:
+                raise _Refused(f"'{shown}' was changed by someone else while it was being edited; read it again and retry")
+            os.rename(tmp_name, name, src_dir_fd=parent, dst_dir_fd=parent)  # POSIX rename(2) replaces the target atomically
+            tmp_name = None
+            with contextlib.suppress(OSError):
+                os.fsync(parent)  # the replace has happened; a failed directory sync does not undo it
+            digest = hashlib.sha256(out).hexdigest()[:8]
+            return {"success": True, "sha256": digest,
+                    "result": (f"edited {shown}: replaced 1 occurrence at line {line} ({old_text.count(chr(10)) + 1} -> {new_text.count(chr(10)) + 1} lines); "
+                               f"the file is now {len(out)} bytes, sha256 {digest}")}
+        finally:
+            if tmp_name is not None and parent is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_name, dir_fd=parent)  # a refused or failed edit leaves no temporary file behind
+            for f in fds:
+                with contextlib.suppress(OSError):
+                    os.close(f)
+
+
 _REGISTRY: dict[str, Callable[[Path], BaseTool]] = {
     "file_operations": _file_operations,
     "shell": ShellTool,
+    "edit_file": EditFileTool,
 }
 TOOL_NAMES = tuple(_REGISTRY)
 

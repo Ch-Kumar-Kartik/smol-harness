@@ -13,3 +13,6 @@ AGENTS.md
 *.db-journal
 *.sqlite
 *.sqlite3
+
+# downloaded coding-benchmark dataset (about 21 GB, untrusted third-party repositories, holds reference patches): never commit
+/dataset/
