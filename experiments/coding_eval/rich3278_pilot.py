@@ -66,7 +66,7 @@ BASIS = {"rich_3278": {"experiment_basis": "snapshot-based",
 
 DEVIATIONS = (
     "the agent has file_operations (read/list/search/write) and edit_file (exact single-occurrence replacement, this project's tool) and no shell or test runner; the competition agent has run_command, read_file/edit_file/write_file and the code-graph tools",
-    "the agent child runs in a systemd-scope + bubblewrap sandbox (no network except a TCP relay to the one model host:port; read-only code; only <run>/agent is a writable bind, plus ephemeral memory-backed /tmp, /dev/shm and the bridge directory); tests and the evaluator are unchanged",
+    "the agent child runs in a systemd-scope + bubblewrap sandbox by default, or a Docker sandbox when --agent-sandbox docker is selected (no network except a TCP relay to the one model host:port; read-only code; only <run>/agent is writable); tests and the evaluator are unchanged",
     "the agent workspace and the evaluator copy have no .git directory (not run by the agent; avoids executing a git config the agent can write)",
     "the prompt is a minimal reconstruction of the competition's task prompt, not the official one (no budget text, no graph tools, no workspace layout)",
     "protected-file handling is reproduced from the README text; the official verifier code was not available",
@@ -323,7 +323,7 @@ def build_test_script(spec: TaskSpec, limits: ContainerLimits) -> str:
             'RC=$?; E=$(date +%s%N); echo "pytest_exit=$RC wall_ms=$(( (E-S)/1000000 ))"; exit $RC')
 
 
-def create_argv(name: str, image: str, limits: ContainerLimits, script: str, run_id: str) -> list[str]:
+def create_argv(name: str, image: str, limits: ContainerLimits, script: str, run_id: str, runtime_mounts: tuple[str, ...] = ()) -> list[str]:
     """Every isolation setting in one place. Deliberately absent: -v/--mount, --privileged, --network (other than none), any socket."""
     return ["docker", "create", "--pull", "never", "--name", name, "--label", "purpose=coding-eval-pilot", "--label", f"run={run_id}",
             "--network", "none", "--ipc", "none", "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
@@ -331,6 +331,7 @@ def create_argv(name: str, image: str, limits: ContainerLimits, script: str, run
             "--pids-limit", str(limits.pids), "--ulimit", f"nofile={limits.nofile}:{limits.nofile}", "--ulimit", f"fsize={limits.fsize_bytes}", "--ulimit", "core=0",
             "--tmpfs", f"/tmp:rw,noexec,nosuid,nodev,size={limits.tmp_size}", "--tmpfs", "/data:rw,noexec,nosuid,nodev,size=16m",  # /data: the image's VOLUME, kept off disk
             "--hostname", "pilot", "--stop-timeout", "5",
+            *runtime_mounts,
             "-e", "HOME=/tmp", "-e", "PYTHONPATH=/opt/site", "-e", "PYTHONNOUSERSITE=1", "-e", "PYTHONDONTWRITEBYTECODE=1", "-e", "PYTHONHASHSEED=0", "-e", "LC_ALL=C.UTF-8",
             "--entrypoint", "bash", image, "-c", script]
 
@@ -340,6 +341,7 @@ class DockerRunner:
 
     def __init__(self, python_dir: Path, site_dir: Path, run_id: str, *, image: str = "redis:7", limits: ContainerLimits = ContainerLimits()) -> None:
         self.python_dir, self.site_dir, self.run_id, self.image, self.limits = Path(python_dir).resolve(), Path(site_dir), run_id, image, limits
+        self.system_python = self.python_dir == Path("/usr")
 
     def _docker(self, *args: str, timeout: float = 60) -> subprocess.CompletedProcess:
         return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
@@ -352,16 +354,30 @@ class DockerRunner:
             if image_id.returncode != 0:
                 raise PilotError(f"image {self.image!r} is not available locally (the driver never pulls): {image_id.stderr.strip()}")
             info["image_id"] = image_id.stdout.strip()
-            created = subprocess.run(create_argv(name, self.image, self.limits, script, self.run_id), capture_output=True, text=True, timeout=60)
+            runtime_mounts = ()
+            if self.system_python:
+                script = script.replace("/opt/python/bin/python3", "/usr/bin/python3")
+                runtime_mounts = ("--mount", "type=bind,src=/usr,dst=/usr,readonly",
+                                  "--mount", "type=bind,src=/lib,dst=/lib,readonly")
+                if Path("/lib64").exists():
+                    runtime_mounts += ("--mount", "type=bind,src=/lib64,dst=/lib64,readonly")
+            created = subprocess.run(create_argv(name, self.image, self.limits, script, self.run_id, runtime_mounts), capture_output=True, text=True, timeout=60)
             if created.returncode != 0:
                 raise PilotError(f"docker create failed: {created.stderr.strip()}")
-            for src, dst in ((self.python_dir, "/opt/python"), (self.site_dir, "/opt/site"), (workspace, "/workspace")):
+            copies = ((self.site_dir, "/opt/site"), (workspace, "/workspace"))
+            if not self.system_python:
+                copies = ((self.python_dir, "/opt/python"), *copies)
+            for src, dst in copies:
                 cp = self._docker("cp", "-q", str(src), f"{name}:{dst}", timeout=300)
                 if cp.returncode != 0:
                     raise PilotError(f"docker cp to {dst} failed: {cp.stderr.strip()}")
             host = json.loads(self._docker("inspect", name).stdout)[0]["HostConfig"]
+            mounts = host.get("Mounts") or []
+            allowed_runtime_mounts = self.system_python and all(
+                m.get("Destination") in {"/usr", "/lib", "/lib64"} and m.get("RW") is False for m in mounts
+            )
             wrong = [k for k, ok in (("NetworkMode", host["NetworkMode"] == "none"), ("Privileged", host["Privileged"] is False), ("CapDrop", host["CapDrop"] == ["ALL"]),
-                                     ("Binds", not host.get("Binds")), ("Mounts", not host.get("Mounts"))) if not ok]
+                                     ("Binds", not host.get("Binds")), ("Mounts", (not mounts) or allowed_runtime_mounts)) if not ok]
             if wrong:
                 raise PilotError(f"container isolation not as configured ({', '.join(wrong)}); refusing to run")
             info["isolation"] = {k: host[k] for k in ("NetworkMode", "Privileged", "CapDrop", "Memory", "PidsLimit", "NanoCpus")}
@@ -773,6 +789,58 @@ def run_agent_phase(agent_dir: Path, params: dict, timeout_s: float, cmd: list[s
     return {"command": cmd, "exit_code": code, "timed_out": timed_out, "seconds": round(time.monotonic() - start, 2)}
 
 
+def docker_agent_command(agent_dir: Path, bridge_dir: Path, params: dict, *, image: str = "redis:7") -> list[str]:
+    """Run the agent in Docker for hosts where unprivileged user namespaces are unavailable.
+
+    The host Python/runtime is mounted read-only because the evaluator's standalone Python is
+    intentionally not copied here. Docker still supplies the process, network, capability and
+    filesystem boundary; the agent receives only its workspace, bridge socket and read-only code.
+    """
+    prefix = Path(sys.prefix).resolve()
+    python = Path(sys.executable).resolve()
+    container_agent = Path("/agent")
+    container_repo = Path("/repo")
+    container_bridge = Path("/bridge")
+    container_params = container_agent / "params.json"
+    translated = dict(params)
+    for key in ("config_path", "prompt_path", "out_dir", "workspace"):
+        translated[key] = str(container_agent / Path(params[key]).relative_to(agent_dir))
+    translated["bridge"] = {**params["bridge"], "socket": "/bridge/m.sock"}
+    (agent_dir / "params.docker.json").write_text(json.dumps(translated))
+    params_file = agent_dir / "params.docker.json"
+    ro_mounts = [
+        (str(REPO), str(container_repo)),
+        (str(prefix), "/venv"),
+        (str(python.parent.parent), "/python"),
+        ("/usr", "/usr"),
+        ("/lib", "/lib"),
+    ]
+    if Path("/lib64").exists():
+        ro_mounts.append(("/lib64", "/lib64"))
+    command = [
+        "docker", "run", "--rm", "--pull", "never",
+        "--network", "none", "--ipc", "none", "--cap-drop", "ALL",
+        "--security-opt", "no-new-privileges", "--read-only",
+        "--user", f"{os.getuid()}:{os.getgid()}",
+        "--memory", "2g", "--memory-swap", "0", "--cpus", "2",
+        "--pids-limit", "256", "--ulimit", "nofile=1024:1024",
+        "--ulimit", "fsize=104857600", "--ulimit", "core=0",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=256m",
+        "-v", f"{agent_dir}:/agent:rw",
+        "-v", f"{bridge_dir}:/bridge:rw",
+    ]
+    for src, dst in ro_mounts:
+        command += ["-v", f"{src}:{dst}:ro"]
+    command += [
+        "-e", "HOME=/tmp", "-e", "PATH=/usr/bin:/bin", "-e", "PYTHONPATH=/repo/src",
+        "-e", "PYTHONNOUSERSITE=1", "-e", "PYTHONDONTWRITEBYTECODE=1",
+        "--entrypoint", "bash", image, "-c",
+        "exec /venv/bin/python /repo/experiments/coding_eval/rich3278_pilot.py "
+        "agent-child --params /agent/params.docker.json",
+    ]
+    return command
+
+
 # ---- one run --------------------------------------------------------------------------------------------------------------------
 def fetch_model_identity(base_url: str, model: str, timeout: float = 5.0, opener=None) -> dict:
     """Ask the Ollama server which model it holds under this tag (`GET /api/tags`: metadata only, no inference). Never raises. Environment proxies are ignored."""
@@ -923,6 +991,8 @@ class RunConfig:
     worker_timeout_s: float = 300
     agent_timeout_s: float = 1800
     keep_workspaces: bool = False
+    agent_sandbox: str = "bwrap"
+    agent_image: str = "redis:7"
     limits: ContainerLimits = ContainerLimits()
     sandbox_limits: SandboxLimits = SandboxLimits()
 
@@ -950,13 +1020,18 @@ def run_pilot(cfg: RunConfig, runner, *, agent_cmd: list[str] | None = None) -> 
                     "agent": None, "candidate": None, "evaluation": None, "resolved": False, "status": "started"}
     sandboxed = agent_cmd is None  # an injected command is for tests only; a real run is ALWAYS sandboxed, or refused
     try:
-        if sandboxed:
+        if sandboxed and cfg.agent_sandbox == "bwrap":
             problem = sandbox_problem(cfg.sandbox_limits)
             if problem:
                 raise PilotError(f"the agent sandbox is unavailable ({problem}); refusing to run the agent as the plain host user")
             endpoint = model_endpoint(cfg.base_url)
             record["sandbox"] = {"kind": "systemd scope + bubblewrap + prlimit", "network": f"none; a unix-socket bridge to {endpoint[0]}:{endpoint[1]} only", "limits": vars(cfg.sandbox_limits),
                                  "bwrap": subprocess.run(["bwrap", "--version"], capture_output=True, text=True).stdout.strip()}
+        elif sandboxed and cfg.agent_sandbox == "docker":
+            endpoint = model_endpoint(cfg.base_url)
+            record["sandbox"] = {"kind": "Docker", "network": f"none; a unix-socket bridge to {endpoint[0]}:{endpoint[1]} only"}
+        elif sandboxed:
+            raise PilotError(f"unknown agent sandbox {cfg.agent_sandbox!r}")
         else:
             record["sandbox"] = {"kind": "none (an injected agent command: tests only)"}
         agent_dir.mkdir(mode=0o700)
@@ -976,7 +1051,7 @@ def run_pilot(cfg: RunConfig, runner, *, agent_cmd: list[str] | None = None) -> 
             raise PilotError(f"the model identity could not be established, so the agent was not started: {record['model_identity']['reason']}")
         params = {"config_path": str(agent_dir / "harness.yaml"), "prompt_path": str(agent_dir / "prompt.txt"), "out_dir": str(agent_dir),
                   "max_tokens": cfg.max_tokens, "temperature": cfg.temperature, "seed": cfg.seed, "workspace": str(workspace)}
-        if sandboxed:
+        if sandboxed and cfg.agent_sandbox == "bwrap":
             bridge_dir = Path(tempfile.mkdtemp(prefix="cb-"))  # a short path: unix socket paths are limited to about 100 characters
             try:
                 with ModelBridge(bridge_dir, *endpoint):
@@ -985,7 +1060,22 @@ def run_pilot(cfg: RunConfig, runner, *, agent_cmd: list[str] | None = None) -> 
                     record["agent"] = run_agent_phase(agent_dir, params, cfg.agent_timeout_s, sandbox_command(agent_dir, inner, cfg.sandbox_limits, extra_binds=((str(bridge_dir), "/bridge"),)))
             finally:
                 shutil.rmtree(bridge_dir, ignore_errors=True)
+        elif sandboxed and cfg.agent_sandbox == "docker":
+            bridge_dir = Path(tempfile.mkdtemp(prefix="cb-"))
+            try:
+                harness_config = agent_dir / "harness.yaml"
+                harness_config.write_text(harness_config.read_text().replace(str(workspace), "/agent/workspace"))
+                with ModelBridge(bridge_dir, *endpoint):
+                    params["bridge"] = {"port": endpoint[1], "socket": "/bridge/m.sock"}
+                    record["sandbox"] = {"kind": "Docker", "network": "none; a unix-socket bridge to the configured model endpoint only",
+                                         "image": cfg.agent_image, "limits": vars(cfg.sandbox_limits)}
+                    command = docker_agent_command(agent_dir, bridge_dir, params, image=cfg.agent_image)
+                    record["agent"] = run_agent_phase(agent_dir, params, cfg.agent_timeout_s, command)
+            finally:
+                shutil.rmtree(bridge_dir, ignore_errors=True)
         else:
+            if sandboxed:
+                raise PilotError(f"unknown agent sandbox {cfg.agent_sandbox!r}")
             record["agent"] = run_agent_phase(agent_dir, params, cfg.agent_timeout_s, agent_cmd)
         result_path = agent_dir / "agent_result.json"
         record["agent"]["result"] = json.loads(result_path.read_text()) if result_path.exists() else None
@@ -1049,6 +1139,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--max-iterations", type=int, default=8)
     r.add_argument("--agent-timeout-s", type=float, default=1800)
     r.add_argument("--keep-workspaces", action="store_true")
+    r.add_argument("--agent-sandbox", choices=["bwrap", "docker"], default="bwrap")
+    r.add_argument("--agent-image", default="redis:7")
     r.add_argument("--allow-model-call", action="store_true", help="required: confirms a real model may be called")
     e = sub.add_parser("evaluate", parents=[common], help="evaluate an existing candidate patch (no agent, no model)")
     e.add_argument("--out", type=Path, required=True)
@@ -1079,7 +1171,8 @@ def main(argv: list[str] | None = None) -> int:
             if not args.allow_model_call:
                 raise PilotError("refusing to call a model without --allow-model-call")
             rec = run_pilot(RunConfig(out, args.dataset_dir, args.task_id, None, args.provider, args.model, args.context_length, args.base_url, args.max_tokens, args.temperature,
-                                      args.seed, args.max_iterations, 300, args.agent_timeout_s, args.keep_workspaces), runner)
+                                      args.seed, args.max_iterations, 300, args.agent_timeout_s, args.keep_workspaces,
+                                      agent_sandbox=args.agent_sandbox, agent_image=args.agent_image), runner)
             print(json.dumps({k: rec.get(k) for k in ("run_id", "status", "resolved")} | {"outcome": (rec.get("evaluation") or {}).get("outcome")}
                              | {k: (rec.get("classification") or {}).get(k) for k in ("attempt_outcome", "infrastructure_failure", "counts_as_coding_failure")}))
             return 0 if rec["status"] == "complete" else 1
