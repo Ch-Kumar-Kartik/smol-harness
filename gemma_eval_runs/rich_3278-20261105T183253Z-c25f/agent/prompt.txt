@@ -1,0 +1,32 @@
+You are evaluating a software engineering task for repository Textualize/rich.
+
+Problem Statement:
+Strip problematic private escape sequences
+
+## Type of changes
+
+- [x] Bug fix
+- [ ] New feature
+- [ ] Documentation / docstrings
+- [ ] Tests
+- [ ] Other
+
+## Checklist
+
+- [x] I've run the latest [black](https://github.com/psf/black) with default args on new code.
+- [x] I've updated CHANGELOG.md and CONTRIBUTORS.md where appropriate.
+- [x] I've added tests for new code.
+- [x] I accept that @willmcgugan may be pedantic in the code review.
+
+## Description
+
+["Private escape sequences"](https://en.wikipedia.org/wiki/ANSI_escape_code#Fp_Escape_sequences) are escape sequences that are reserved for private use, though `\x1b7` and `\x1b8` are commonly used for storing and restoring the current cursor position. When those escape codes are not stripped the cursor jumps around and causes Rich to write garbage output. An example of a program that uses this cursor store/restore functionality is the APK package manager in Alpine Linux:
+
+https://gitlab.alpinelinux.org/alpine/apk-tools/-/blob/48d91f482eb48a0a107b714ee183bb7e07782e14/src/print.c#L232-240
+
+This commit updates the ANSI parser to ignore the `\x1b0`-`\x1b?` escape sequences, thus preventing them from being printed and causing havoc.
+
+## Environment
+- The repository is your workspace. Delegate the change to your worker `coder` with the delegate tool: it reads files and changes them with small exact text replacements. You may read files yourself with file_operations.
+- You cannot run commands or tests. Do not modify tests or configuration files: such changes are discarded.
+- When the change is complete, reply with a short summary.

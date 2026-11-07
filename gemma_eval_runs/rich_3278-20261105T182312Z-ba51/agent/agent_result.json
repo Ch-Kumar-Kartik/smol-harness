@@ -1,0 +1,39 @@
+{
+ "agent_reported_success": true,
+ "error": null,
+ "finished": "2026-11-05T18:32:12Z",
+ "generation_overrides_requested": {
+  "max_tokens": 4096,
+  "seed": 0,
+  "temperature": 0.1
+ },
+ "history_dir": "/agent/history/20261105T182313Z-73a250dc",
+ "model_failure": null,
+ "note": "limits are what was REQUESTED; the server-enforced output limit was not verified (docs/new-session.md U17)",
+ "output": "The problematic private escape sequences have been stripped from the ANSI parser by updating the regular expression in `rich/ansi.py`.",
+ "seconds": 539.13,
+ "started": "2026-11-05T18:23:13Z",
+ "termination": "done",
+ "workers": [
+  {
+   "delegation_id": "d1",
+   "error_type": "WorkerTimeout",
+   "iterations": 0,
+   "status": "timeout",
+   "termination": null,
+   "tokens_used": 0,
+   "tool_calls": 0,
+   "worker": "coder"
+  },
+  {
+   "delegation_id": "d2",
+   "error_type": null,
+   "iterations": 5,
+   "status": "completed",
+   "termination": "done",
+   "tokens_used": 21581,
+   "tool_calls": 4,
+   "worker": "coder"
+  }
+ ]
+}

@@ -1,0 +1,13 @@
+{
+ "bridge": {
+  "port": 11434,
+  "socket": "/bridge/m.sock"
+ },
+ "config_path": "/tmp/rich-pilot-qwen38-20261105T183253Z/rich_3278-20261105T183253Z-c25f/agent/harness.yaml",
+ "max_tokens": 4096,
+ "out_dir": "/tmp/rich-pilot-qwen38-20261105T183253Z/rich_3278-20261105T183253Z-c25f/agent",
+ "prompt_path": "/tmp/rich-pilot-qwen38-20261105T183253Z/rich_3278-20261105T183253Z-c25f/agent/prompt.txt",
+ "seed": 0,
+ "temperature": 0.1,
+ "workspace": "/tmp/rich-pilot-qwen38-20261105T183253Z/rich_3278-20261105T183253Z-c25f/agent/workspace"
+}

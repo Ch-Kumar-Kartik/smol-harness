@@ -1,0 +1,25 @@
+{
+ "agent_reported_success": false,
+ "error": null,
+ "finished": "2026-11-05T18:47:09Z",
+ "generation_overrides_requested": {
+  "max_tokens": 4096,
+  "seed": 0,
+  "temperature": 0.1
+ },
+ "history_dir": "/agent/history/20261105T183254Z-05fe9050",
+ "model_failure": {
+  "category": "timeout",
+  "message": "OpenAI generation failed [will_retry]: Request timed out.. Request timed out \u2014 increase the adapter timeout or retry. The call was sent to http://127.0.0.1:11434/v1.",
+  "reason": "generation_failed",
+  "retryable": true,
+  "stop_reason": "generation_failed",
+  "type": "RuntimeError"
+ },
+ "note": "limits are what was REQUESTED; the server-enforced output limit was not verified (docs/new-session.md U17)",
+ "output": "Generation failed: OpenAI generation failed [will_retry]: Request timed out.. Request timed out \u2014 increase the adapter timeout or retry. The call was sent to http://127.0.0.1:11434/v1. Request timed out \u2014 increase the adapter timeout or retry.",
+ "seconds": 854.79,
+ "started": "2026-11-05T18:32:54Z",
+ "termination": "error",
+ "workers": []
+}

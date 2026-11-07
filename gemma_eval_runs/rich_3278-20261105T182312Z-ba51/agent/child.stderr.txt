@@ -1,0 +1,6 @@
+<unknown>:1: SyntaxWarning: invalid escape sequence '\]'
+<unknown>:1: SyntaxWarning: invalid escape sequence '\]'
+<unknown>:1: SyntaxWarning: invalid escape sequence '\]'
+<unknown>:1: SyntaxWarning: invalid escape sequence '\]'
+<unknown>:1: SyntaxWarning: invalid escape sequence '\]'
+<unknown>:1: SyntaxWarning: invalid escape sequence '\]'

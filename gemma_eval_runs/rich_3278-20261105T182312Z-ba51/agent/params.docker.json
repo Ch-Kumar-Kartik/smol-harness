@@ -1,0 +1,1 @@
+{"config_path": "/agent/harness.yaml", "prompt_path": "/agent/prompt.txt", "out_dir": "/agent", "max_tokens": 4096, "temperature": 0.1, "seed": 0, "workspace": "/agent/workspace", "bridge": {"port": 11434, "socket": "/bridge/m.sock"}}

@@ -1,0 +1,29 @@
+workspace: /agent/workspace
+limits:
+  worker_timeout_s: 300
+orchestrator:
+  model: &id001
+    provider: ollama
+    model: gemma4:e4b
+    context_length: 16384
+    base_url: http://127.0.0.1:11434/v1
+  tools:
+  - file_operations
+  max_iterations: 8
+  system_prompt: You coordinate one worker, coder. Delegate the code change to it
+    with the delegate tool, naming the file and the change, then answer from its report.
+workers:
+- name: coder
+  description: reads and edits files in the repository workspace
+  model: *id001
+  tools:
+  - file_operations
+  - edit_file
+  max_iterations: 8
+  system_prompt: 'You change code in a repository. Read the relevant file first with
+    file_operations, then change it with edit_file: copy a short piece of the file
+    exactly as old_text (it must occur once) and give its replacement as new_text.
+    In the JSON input write every backslash as two backslashes, in old_text and in
+    new_text (to match or write the text \x1b send \\x1b); new_text may not contain
+    control characters. Do not rewrite whole files. You cannot run tests. Report what
+    you changed.'

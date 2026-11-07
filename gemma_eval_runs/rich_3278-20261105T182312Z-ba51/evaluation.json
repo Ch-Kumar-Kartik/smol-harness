@@ -1,0 +1,24 @@
+{
+ "candidate_bytes": 0,
+ "candidate_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+ "finished": "2026-11-05T18:32:13Z",
+ "label": "candidate",
+ "outcome": "unresolved_empty_patch",
+ "problems": [
+  "the candidate patch is empty after protected files were removed"
+ ],
+ "required_tests": [
+  "test_strip_private_escape_sequences"
+ ],
+ "resolved": false,
+ "result": null,
+ "schema_version": 1,
+ "snapshot_sha256": "bda96e09e9e02fa372b2cf6c5f3f2760f97d292fb531cc631564632940d6a453",
+ "started": "2026-11-05T18:32:13Z",
+ "steps": {
+  "pristine": "extracted",
+  "protected_stripped": []
+ },
+ "task_id": "rich_3278",
+ "test_command": "cd /workspace || exit 2; echo \"python: $(/opt/python/bin/python3 --version 2>&1)\"; echo \"pytest: $(/opt/python/bin/python3 -m pytest --version 2>&1)\"; S=$(date +%s%N); timeout -k 5 120 /opt/python/bin/python3 -m pytest tests/test_ansi.py -q -rA -p no:cacheprovider; RC=$?; E=$(date +%s%N); echo \"pytest_exit=$RC wall_ms=$(( (E-S)/1000000 ))\"; exit $RC"
+}
