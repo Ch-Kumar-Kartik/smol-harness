@@ -28,6 +28,7 @@ from effgen.tools.base_tool import (
 )
 
 DELEGATE_TOOL_NAME = "delegate"
+STRUCTURED_TOOL_NAMES = frozenset({"edit_file", "file_operations", "shell"})
 
 # Class attribute on every tool whose repeated identical call must reach the tool (it changes the world: a command, a
 # write, a worker run). `harness.install_effgen_loop_compat` keys on it; unmarked tools keep effGen's behaviour.
@@ -109,11 +110,10 @@ def tool_input_size(tool_input: str) -> int:
 
 
 class DelegateInputGuard(AgentMiddleware):
-    """Refuse a `delegate` call whose input effGen would cut, instead of letting the JSON be truncated (see MAX_TOOL_INPUT_CHARS).
+    """Refuse malformed or oversized `delegate` inputs before effGen validates or cuts them.
 
     Answers the call itself (the documented `before_tool_call` short-circuit): the tool does not run, no worker starts, no delegation id is used and
-    `max_delegations` is not charged. The refusal text starts with "Error:" and states the measured size, so a model can shorten its call. Every other
-    tool, and a call at or under the limit, is untouched. It never edits the input.
+    `max_delegations` is not charged. Every other tool, and a valid call at or under the limit, is untouched. It never edits the input.
     """
 
     def before_tool_call(self, ctx: Any) -> str | None:
@@ -121,10 +121,32 @@ class DelegateInputGuard(AgentMiddleware):
             return None
         size = tool_input_size(ctx.tool_input)
         if size <= MAX_TOOL_INPUT_CHARS:
+            if ctx.tool_input.lstrip().startswith("{"):
+                try:
+                    json.loads(ctx.tool_input)
+                except json.JSONDecodeError:
+                    return ("Error: the delegate call was NOT run because its input was malformed JSON. No worker started and this was not counted as a "
+                            "delegation. Call delegate again with only a JSON object containing worker, task, and optional context.")
             return None
         return (f"Error: the delegate call was NOT run. Its input (the whole JSON object you wrote, counting the keys, quotes and escape characters) is {size} "
                 f"characters and the limit is {MAX_TOOL_INPUT_CHARS}; longer input would be cut in the middle and become invalid. No worker started and this "
                 "was not counted as a delegation. Call delegate again with a shorter task and context: send the worker only what it needs.")
+
+
+class StructuredToolInputGuard(AgentMiddleware):
+    """Reject concatenated or otherwise malformed JSON before structured tools validate it."""
+
+    def before_tool_call(self, ctx: Any) -> str | None:
+        if ctx.tool_name not in STRUCTURED_TOOL_NAMES or not isinstance(ctx.tool_input, str):
+            return None
+        if not ctx.tool_input.lstrip().startswith("{"):
+            return None
+        try:
+            json.loads(ctx.tool_input)
+        except json.JSONDecodeError:
+            return (f"Error: the {ctx.tool_name} call was NOT run because its input was malformed JSON. "
+                    "No file or command operation occurred. Retry with exactly one JSON object and no additional Action or Observation text.")
+        return None
 
 
 # The deadline of the worker run in progress, for tools that can bound themselves by it (ShellTool, review F8). Set by
@@ -323,7 +345,8 @@ class WorkerRegistry:
         # and the tools list must not be shared mutable state. The model instance
         # (and tool instances) are intentionally shared.
         # enable_sub_agents=False: workers never spawn (depth 1, architecture §6).
-        return Agent(replace(config, tools=list(config.tools), enable_sub_agents=False))
+        return Agent(replace(config, tools=list(config.tools), middleware=[*config.middleware, StructuredToolInputGuard()],
+                             enable_sub_agents=False))
 
 
 class DelegateTool(BaseTool):

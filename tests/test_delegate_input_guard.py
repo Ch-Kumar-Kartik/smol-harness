@@ -12,7 +12,7 @@ from conftest import ScriptedModel
 from effgen import Agent, AgentConfig
 from effgen.core.middleware import ToolCallContext
 
-from smol_harness.delegation import MAX_TOOL_INPUT_CHARS, DelegateInputGuard, tool_input_size
+from smol_harness.delegation import MAX_TOOL_INPUT_CHARS, DelegateInputGuard, StructuredToolInputGuard, tool_input_size
 from smol_harness.harness import build_harness
 from smol_harness.recorder import ExecutionRecorder
 
@@ -68,6 +68,22 @@ def test_escaping_overhead_counts_because_the_input_is_the_serialised_json():
 def test_control_characters_are_not_counted_because_effgen_removes_them_first():
     assert guard(text="x" * 9_999 + "\x01\x02") is None  # 10,001 raw, 9,999 as effGen counts
     assert guard(text="x" * 9_999 + "\n\t") is not None  # newline and tab stay
+
+
+def test_malformed_delegate_json_is_refused_before_parameter_validation():
+    message = guard(text='{"worker":"A","task":"t"} <channel|>Observation: {"status":"success"}')
+    assert message is not None
+    assert message.startswith("Error: the delegate call was NOT run")
+    assert "malformed JSON" in message
+
+
+def test_malformed_structured_worker_tool_json_is_refused_before_parameter_validation():
+    message = StructuredToolInputGuard().before_tool_call(
+        ToolCallContext(tool_name="edit_file", tool_input='{"path":"rich/ansi.py"} <channel|>Action: edit_file')
+    )
+    assert message is not None
+    assert "edit_file call was NOT run" in message
+    assert "exactly one JSON object" in message
 
 
 def test_other_tools_and_non_text_input_are_left_alone():

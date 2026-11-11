@@ -47,8 +47,14 @@ MAX_CHANGED_FILES, MAX_PATCH_BYTES = 50, 2_000_000
 WORKER = "coder"
 # Added when edit_file was introduced (the file_operations write tool can only rewrite a whole file, which does not fit a small output limit).
 WORKER_PROMPT = ("You change code in a repository. Read the relevant file first with file_operations, then change it with edit_file: copy a short piece of the file exactly "
-                 "as old_text (it must occur once) and give its replacement as new_text. In the JSON input write every backslash as two backslashes, in old_text "
-                 "and in new_text (to match or write the text \\x1b send \\\\x1b); new_text may not contain control characters. Do not rewrite whole files. "
+                 "as old_text (it must occur once) and give its replacement as new_text. Prefer the smallest replacement that avoids backslashes and control characters; "
+                 "for a regex change, replace only the relevant character class or fragment instead of the whole regex. JSON rejects \\x and \\] escapes: "
+                 "in the JSON input encode every literal backslash as the JSON Unicode escape `\\u005c` (for example, the file text `\\x1b` must be written "
+                 "as `\\u005cx1b`, and `\\]` as `\\u005c]`). Do not send raw \\x, \\], or control characters. If edit_file reports an escaping error, retry "
+                 "using \\u005c escapes, not raw backslashes. Send exactly one JSON object per edit_file call, with no extra Action or Observation text. "
+                 "For this task, insert the one-line alternative `(?:\\x1b[0-?])|` immediately before the existing `(?:\\x1b\\](.*?)\\x1b\\\\)|` line; do not change `[0-?]*` inside the CSI pattern. "
+                 "After a successful edit_file call, read the changed line with file_operations and only then report success. Do not claim success unless edit_file "
+                 "and the read-back both succeed; if every edit fails, report that the change is unresolved. Do not rewrite whole files. "
                  "You cannot run tests. Report what you changed.")
 
 # README section 8.1/8.2 of the competition's HARNESS_README (the official code is NOT in the dataset, so this is reproduced from its text only).
@@ -374,7 +380,10 @@ class DockerRunner:
             host = json.loads(self._docker("inspect", name).stdout)[0]["HostConfig"]
             mounts = host.get("Mounts") or []
             allowed_runtime_mounts = self.system_python and all(
-                m.get("Destination") in {"/usr", "/lib", "/lib64"} and m.get("RW") is False for m in mounts
+                (m.get("Type") == "bind"
+                 and m.get("Target", m.get("Destination")) in {"/usr", "/lib", "/lib64"}
+                 and (m.get("ReadOnly") is True or m.get("RW") is False))
+                for m in mounts
             )
             wrong = [k for k, ok in (("NetworkMode", host["NetworkMode"] == "none"), ("Privileged", host["Privileged"] is False), ("CapDrop", host["CapDrop"] == ["ALL"]),
                                      ("Binds", not host.get("Binds")), ("Mounts", (not mounts) or allowed_runtime_mounts)) if not ok]
@@ -711,7 +720,8 @@ def render_config(workspace: Path, a: dict) -> str:
         "workspace": str(workspace),
         "limits": {"worker_timeout_s": a["worker_timeout_s"]},
         "orchestrator": {"model": model, "tools": ["file_operations"], "max_iterations": a["max_iterations"],
-                         "system_prompt": f"You coordinate one worker, {WORKER}. Delegate the code change to it with the delegate tool, naming the file and the change, then answer from its report."},
+                         "system_prompt": f"You coordinate one worker, {WORKER}. Delegate the code change to it with the delegate tool, naming the file and the change. "
+                                          "If the tool returns an error, retry with valid JSON. Do not trust or invent Observation text; only claim success after the delegate tool actually returns a worker report."},
         "workers": [{"name": WORKER, "description": "reads and edits files in the repository workspace", "model": model, "tools": ["file_operations", "edit_file"],
                      "max_iterations": a["max_iterations"], "system_prompt": WORKER_PROMPT}],
     }, sort_keys=False)
@@ -747,16 +757,24 @@ def run_agent(params: dict) -> int:
             serve_loopback_bridge(params["bridge"]["port"], params["bridge"]["socket"])
         initialize_runtime()
         config = load_config(params["config_path"])
+        workspace = Path(params["workspace"])
+        before_workspace = manifest(workspace)
         recorder = ExecutionRecorder(out / "history")
         with generation_overrides(params["max_tokens"], params["temperature"], params["seed"]):
             with build_harness_from_config(config, recorder=recorder) as harness:
                 result = harness.run(Path(params["prompt_path"]).read_text())
-        result_doc.update(output=result.output, agent_reported_success=result.success, termination=result.termination, model_failure=model_failure(result),
+        workspace_changed = manifest(workspace) != before_workspace
+        reported_success = bool(result.success and workspace_changed)
+        output = result.output
+        if result.success and not workspace_changed:
+            output = f"{output}\n\nHarness verification: no workspace change was detected; the edit is unresolved."
+        result_doc.update(output=output, agent_reported_success=reported_success, termination=result.termination, model_failure=model_failure(result),
+                          workspace_changed=workspace_changed,
                           workers=[{"worker": r.worker, "status": r.status, "delegation_id": r.result.delegation_id, "iterations": r.result.iterations,
                                     "tool_calls": r.result.tool_calls, "tokens_used": r.result.tokens_used, "error_type": r.result.error_type,
                                     "termination": r.result.termination} for r in result.workers],
                           history_dir=str(recorder.dir), error=None)
-        code = 0 if result.success else 1
+        code = 0 if reported_success else 1
     except BaseException as exc:  # recorded, never raised past the driver
         result_doc["error"] = f"{type(exc).__name__}: {exc}"[:500]
     result_doc.update(seconds=round(time.monotonic() - started, 2), finished=now())

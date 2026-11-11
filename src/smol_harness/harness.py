@@ -24,6 +24,7 @@ from smol_harness.delegation import (
     STATEFUL_TOOL_MARKER,
     DelegateInputGuard,
     DelegateTool,
+    StructuredToolInputGuard,
     WorkerRecord,
     WorkerRegistry,
     validate_limits,
@@ -276,7 +277,8 @@ class Harness:
             max_delegations=self.max_delegations, max_report_chars=self.max_report_chars,
         )
         # The guard goes last, after the recorder if there is one: the recorder's hook runs first, so a refused call is still recorded (its result is the refusal).
-        config = replace(self._orchestrator, tools=[*self._orchestrator.tools, delegate], middleware=[*self._orchestrator.middleware, DelegateInputGuard()],
+        config = replace(self._orchestrator, tools=[*self._orchestrator.tools, delegate],
+                         middleware=[*self._orchestrator.middleware, StructuredToolInputGuard(), DelegateInputGuard()],
                          enable_sub_agents=False)
         if any(getattr(tool, STATEFUL_TOOL_MARKER, False) for tool in config.tools):
             _require_loop_compat()  # `delegate` is always marked, so this always applies

@@ -141,7 +141,7 @@ def test_only_the_worker_is_given_edit_file_and_the_prompts_describe_it(spec, tm
     cfg = yaml.safe_load(pilot.render_config(tmp_path / "ws", {"provider": "ollama", "model": "m:1", "context_length": 8192, "base_url": "http://127.0.0.1:11434/v1",
                                                                "worker_timeout_s": 300, "max_iterations": 8}))
     assert cfg["orchestrator"]["tools"] == ["file_operations"] and cfg["workers"][0]["tools"] == ["file_operations", "edit_file"]
-    assert "edit_file" in cfg["workers"][0]["system_prompt"] and "two backslashes" in cfg["workers"][0]["system_prompt"]
+    assert "edit_file" in cfg["workers"][0]["system_prompt"] and "\\u005c" in cfg["workers"][0]["system_prompt"]
     assert cfg["orchestrator"]["model"] == cfg["workers"][0]["model"]  # model, context length and the other settings are unchanged
     assert any("edit_file" in d for d in pilot.DEVIATIONS)
 
@@ -443,6 +443,22 @@ def test_the_docker_runner_copies_in_only_python_site_and_the_workspace_and_alwa
     assert [d.split(":", 1)[1] for d in copies] == ["/opt/python", "/opt/site", "/workspace"] and all(d.startswith("coding-eval-rid1-cand:") for d in copies)
     assert fake.verbs()[-1] == "rm" and fake.calls[-1][-1] == "coding-eval-rid1-cand" and fake.calls[-1][2:4] == ["-f", "-v"]
     assert (tmp_path / "logs" / "cand.stdout.txt").exists()
+
+
+def test_system_python_allows_only_readonly_runtime_binds(tmp_path, monkeypatch):
+    fake = FakeDocker(host_config={
+        "NetworkMode": "none", "Privileged": False, "CapDrop": ["ALL"],
+        "Binds": None,
+        "Mounts": [
+            {"Type": "bind", "Target": "/usr", "ReadOnly": True},
+            {"Type": "bind", "Target": "/lib", "ReadOnly": True},
+        ],
+        "Memory": 1073741824, "PidsLimit": 256, "NanoCpus": 2000000000,
+    })
+    monkeypatch.setattr(pilot.subprocess, "run", fake)
+    runner = pilot.DockerRunner(Path("/usr"), tmp_path / "site", "rid1", image="img:1")
+    out = runner.run(tmp_path / "ws", "true", "cand", tmp_path / "logs")
+    assert out["exit_code"] == 0
 
 
 @pytest.mark.parametrize("field,value", [("NetworkMode", "bridge"), ("Privileged", True), ("CapDrop", None), ("Binds", ["/home:/h"]), ("Mounts", [{"Source": "/"}])])
@@ -1380,10 +1396,12 @@ def test_the_agent_phase_runs_the_real_harness_with_a_scripted_model_and_records
     (agent_dir / "prompt.txt").write_text(pilot.build_prompt(spec))
     (agent_dir / "harness.yaml").write_text(pilot.render_config(ws, {"provider": "ollama", "model": BIG, "context_length": 8192, "base_url": "http://127.0.0.1:11434/v1",
                                                                       "worker_timeout_s": 60, "max_iterations": 6}))
-    params = {"config_path": str(agent_dir / "harness.yaml"), "prompt_path": str(agent_dir / "prompt.txt"), "out_dir": str(agent_dir), "max_tokens": 321, "temperature": 0.2, "seed": 7}
+    params = {"config_path": str(agent_dir / "harness.yaml"), "prompt_path": str(agent_dir / "prompt.txt"), "out_dir": str(agent_dir),
+              "max_tokens": 321, "temperature": 0.2, "seed": 7, "workspace": str(ws)}
     assert pilot.run_agent(params) == 0
     assert (ws / "mini/core.py").read_text() == CORE_NEW  # the worker edited the agent workspace through edit_file
-    assert any("edit_file" in str(c.prompt) and "exactly once" in str(c.prompt) for c in fake.instances[BIG].calls)  # and was offered it, with its contract
+    assert any("edit_file" in str(c.prompt) and "exactly once" in str(c.prompt) and "\\u005c" in str(c.prompt)
+               for c in fake.instances[BIG].calls)  # and was offered it, with its contract
     result = json.loads((agent_dir / "agent_result.json").read_text())
     assert result["agent_reported_success"] is True and result["workers"][0]["worker"] == "coder" and result["workers"][0]["status"] == "completed"
     assert result["generation_overrides_requested"] == {"max_tokens": 321, "temperature": 0.2, "seed": 7} and "U17" in result["note"]
