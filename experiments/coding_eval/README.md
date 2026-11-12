@@ -5,8 +5,7 @@
 
 **Colleague runbook:** [`../../instructions.md`](../../instructions.md) has the step-by-step procedure for running this pilot against a model served by a DGX Spark (controller machine plus DGX, SSH tunnel, evidence collection, failure handling).
 
-**Status: ready for one explicitly authorized real attempt, with the limitations below; no real agent run has happened.** The tests (`tests/test_coding_eval_pilot.py`) use a fake container, scripted agents and stand-in HTTP servers (not models). No real model has run through the sandbox, so
-the driver is **not** end-to-end validated.
+**Status: two real runs were completed on 2026-11-05 and are committed under [`../../gemma_eval_runs/`](../../gemma_eval_runs/) (see [Real runs on record](#real-runs-on-record-2026-11-05)); neither produced a candidate patch or resolved the task.** `gemma4:e4b` completed the agent phase with an empty patch (`attempt_outcome: indeterminate`), and `qwen3.8:27b` hit a model-call timeout (`infrastructure_failure`). Both ran on a DGX Spark in the Docker agent sandbox. The default tests (`tests/test_coding_eval_pilot.py`) use a fake container, scripted agents and stand-in HTTP servers (not models).
 
 ## How a run works
 
@@ -47,6 +46,12 @@ uv run python experiments/coding_eval/rich3278_pilot.py evaluate --out /tmp/rich
 # 4. a real run: CALLS THE CONFIGURED MODEL, needs explicit permission on the command line
 uv run python experiments/coding_eval/rich3278_pilot.py run --out /tmp/rich-pilot --model <ollama tag> --context-length 8192 \
     --max-tokens 768 --temperature 0.1 --seed 0 --agent-timeout-s 1800 --allow-model-call
+
+# 4b. the same run with the Docker agent sandbox (used on the DGX Spark, where unprivileged
+#     user namespaces are unavailable); --agent-image must already exist locally
+uv run python experiments/coding_eval/rich3278_pilot.py run --out /tmp/rich-pilot --model <ollama tag> --context-length 8192 \
+    --max-tokens 768 --temperature 0.1 --seed 0 --agent-timeout-s 1800 \
+    --agent-sandbox docker --agent-image redis:7 --allow-model-call
 ```
 
 `--out` must be outside the repository and the dataset. Each run gets `<out>/<run id>/` with `run.json` (configuration, deviations, agent and candidate metadata,
@@ -60,6 +65,17 @@ only, `--model`, `--context-length`, `--base-url`), generation limits (`--max-to
 
 **Tests:** `uv run pytest tests/test_coding_eval_pilot.py -q` (no Docker, no model). The container tests are opt-in: `SMOL_RUN_DOCKER_TESTS=1 uv run pytest
 tests/test_coding_eval_pilot.py -q -k real_container` (needs the dataset and a local Docker image; the image is never pulled).
+
+## Real runs on record (2026-11-05)
+
+Both runs used the Docker agent sandbox (`--agent-sandbox docker`, image `redis:7`) on a DGX Spark (`aarch64`), with the repository at commit `fda9dfb` and an uncommitted working tree (the recorded `provenance.driver_sha256` and `repo_status` describe it). Generation settings were `--context-length 16384 --max-tokens 4096 --temperature 0.1 --seed 0 --max-iterations 8 --agent-timeout-s 1800`; the requested `max_tokens` is not a verified server cap.
+
+| Run directory | Model | Agent phase | Candidate | `attempt_outcome` |
+|---|---|---|---|---|
+| `rich_3278-20261105T182312Z-ba51` | `gemma4:e4b` (8.0B, Q4_K_M) | `completed` after 540 s: worker `d1` timed out with 0 iterations, worker `d2` completed (5 iterations, 4 tool calls, 21,581 tokens) | empty (0 bytes, no changed files) | `indeterminate` — the worker timeout's cause is not established; not counted as a coding failure |
+| `rich_3278-20261105T183253Z-c25f` | `qwen3.8:27b` (27.3B, Q4_K_M) | `termination: error` after 855 s: the first model call timed out (`RuntimeError`, category `timeout`); no workers | empty (0 bytes, no changed files) | `infrastructure_failure` — transport/server, not a coding result |
+
+Neither run changed a file, so the evaluator short-circuited as `unresolved_empty_patch` and no test ran. The Gemma run is the first Gemma model to drive the harness. It does not establish that the model cannot do the task: one worker timed out and a second completed without editing. The Qwen run exercises the timeout/classification path only.
 
 ## Outcome classes (`run.json` → `classification`)
 
@@ -125,6 +141,8 @@ confirms the layers below; it never falls back to unsandboxed execution. Layers,
    (`PATH`, `HOME=/tmp`, `LANG`, `VIRTUAL_ENV`, `PYTHONDONTWRITEBYTECODE`, `PYTHONNOUSERSITE`).
 3. `prlimit`: per-file size 100 MiB, 1024 open files, core dumps 0.
 
+**Docker agent sandbox (added 2026-11-06; used by both 2026-11-05 runs).** On a host where unprivileged user namespaces are unavailable (the DGX Spark), `--agent-sandbox docker` replaces the three layers above with one container: `docker run --rm --pull never --network none --ipc none --cap-drop ALL --security-opt no-new-privileges --read-only --user <uid>:<gid> --memory 2g --memory-swap 0 --cpus 2 --pids-limit 256`, a 256 MB `noexec` `/tmp`, and `nofile`/`fsize`/`core` limits. Only the run's `agent/` directory and the bridge directory are writable; the repository, venv, host Python and `/usr`/`/lib`/`/lib64` are mounted read-only. The model is reached through the same unix-socket bridge (`/bridge/m.sock`), and the child is still one `agent-child` process. The image must already exist locally (`--agent-image`, default `redis:7`); the driver never pulls, and it does not preflight Docker the way `sandbox_problem()` preflights bubblewrap. **This path is exercised only by the two real runs above, not by the default tests**; read their `run.json` → `sandbox` and `agent.command` for the exact boundary.
+
 **Writable locations inside the sandbox:** `<run>/agent` (the only bind of host storage, which holds the workspace), the bridge directory (`/bridge`), and ephemeral memory-backed `/tmp`, `/dev/shm` and the root tmpfs (charged to the 2 GiB cgroup, gone at exit). Everything else is read-only or absent.
 
 **Network policy.** The sandbox has only `lo`. The model endpoint is reached through a unix-socket bridge: a host-side `ModelBridge` forwards one socket to exactly one `host:port` (from
@@ -144,7 +162,7 @@ directory's total disk use is **not capped** (only per-file size and cgroup memo
 coding failure. The evaluator container is unchanged, so the reference check was not re-run. Still true: the tools themselves can only read and edit files in the workspace, and the
 ordinary-character escaping limitation of `edit_file` is unchanged. This is a single-pilot boundary, not a claim of safety against a determined hostile program.
 
-## First real attempt: preconditions (nothing here is started by the driver without you)
+## Running another attempt: preconditions (nothing here is started by the driver without you)
 
 1. The model server must be reachable at `--base-url` (the DGX model is only reachable through an SSH tunnel you open; nothing local serves it) and list the tag.
 2. `prepare-env --out <out>` (offline) and then `reference-check --out <out>` must reproduce 16 failed / 7 passed and 23 passed in the container (reproduced on 2026-11-04 with this code).
@@ -178,16 +196,17 @@ ordinary-character escaping limitation of `edit_file` is unchanged. This is a si
 ## Known limits and unverified
 
 * Verified outside the suite (not in the default tests): `prepare-env` and `reference-check` through the real `DockerRunner` and Docker Desktop (baseline 16 failed / 7 passed, gold 23 passed,
-  repeated on 2026-11-03 and 2026-11-04; the suite itself only tests the isolation checks and the command construction with a fake `docker`). Not verified: the `run` path with a real
-  model, the child process against a real Ollama endpoint, and `fetch_model_identity` against a real server (it is tested with a fake opener and against a closed local port).
+  repeated on 2026-11-03 and 2026-11-04; the suite itself only tests the isolation checks and the command construction with a fake `docker`). Also outside the suite: the two real `run`s above
+  (agent sandbox, model identity, empty-patch classification). `fetch_model_identity` has since been exercised against a real Ollama server by both runs. **Not verified:** a non-empty agent-produced candidate through the evaluator, a task that resolves, an evaluator reference check on
+  ARM64, and a real-model tool call that changes a file.
 * **Backslashes at the tool-call boundary.** The model reads files as raw text, but a tool call is JSON: a backslash copied as it reads (`\x1b`) is not valid JSON, and
   effGen then falls back to `ast.literal_eval`, which turns it into a real ESC character. `edit_file` refuses an `old_text` that fails to match and holds such a control
   character, and refuses a `new_text` that holds one (other than TAB, LF and CR), both with the instruction to double every backslash in BOTH fields (`\x1b` is sent as
   `\\x1b`); the tool description and the worker prompt say so too. Not guarded: escapes that decode to ordinary characters (for example `\x41` becomes `A`, a single-backslash
   `\t` or `\n` becomes TAB or LF) cannot be told apart from intended text after parsing and are written silently; tests pin this limit. The tool therefore also cannot insert a control character on purpose.
-  Whether a real 14B model gets this right is exactly the kind of thing the first real attempt will show.
+  Whether a real model gets this right is still unobserved: the first real runs produced no edit at all.
 * Generation limits are the values REQUESTED. The server-enforced output limit on Ollama is unresolved (docs/new-session.md U17); do not quote `--max-tokens` as an
   enforced cap.
 * The patch splitter treats a removed line that starts with `-- ` directly followed by an added line starting with `++ ` as a file header. Not relevant to the
   rich_3278 inputs; fail-closed handling of such a patch is not implemented.
-* Single run, single task, no batch runner, no repeat-run statistics.
+* Single task, and the two runs on record are single attempts with different models, not repeat-run statistics.

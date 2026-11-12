@@ -10,7 +10,7 @@ Every command block is labelled with the machine it runs on:
 
 Values in `<ANGLE_BRACKETS>` are placeholders you must supply. Facts marked **Known** come from the repository's source and docs, as of commit `a08941c`. Facts marked **Observed earlier** were seen on a previous, different experiment (a Qwen3 model, not Gemma) and are given only for comparison; do not assume them.
 
-**No Gemma run has been executed on a DGX or anywhere else. Nothing in this document claims a Gemma result.** Earlier DGX runs used `smol-qwen3-14b:8k`.
+> **Update 2026-11-12 — the runbook has now been used.** Two real `rich_3278` runs were executed on 2026-11-05 and are committed under [`gemma_eval_runs/`](gemma_eval_runs/): `gemma4:e4b` completed the agent phase but produced an empty candidate patch (`attempt_outcome: indeterminate`; one worker timed out), and `qwen3.8:27b` hit a model-call timeout (`infrastructure_failure`). Neither changed a file, so no test ran. Both used the driver's **Docker agent sandbox** (`--agent-sandbox docker --agent-image redis:7`) on the DGX Spark itself, because unprivileged user namespaces are unavailable there; the run directories were `/tmp/rich-pilot-gemma-20261105T182312Z` and `/tmp/rich-pilot-qwen38-20261105T183253Z`. Generation settings were `--context-length 16384 --max-tokens 4096 --temperature 0.1 --seed 0 --max-iterations 8 --agent-timeout-s 1800`; the requested `max-tokens` is not a verified server cap. The procedure below remains valid, but sections that require bubblewrap apply only to the default agent sandbox, and the "do not run the pilot on the DGX" reasoning in section 2 is superseded for the Docker path (see the note there).
 
 ---
 
@@ -44,9 +44,10 @@ Values in `<ANGLE_BRACKETS>` are placeholders you must supply. Facts marked **Kn
         CONTROLLER machine (Linux x86_64)                          DGX Spark (Linux ARM64)
   ┌─────────────────────────────────────────┐                ┌──────────────────────────────┐
   │ pilot driver  (rich3278_pilot.py)       │                │ Ollama (listens on 127.0.0.1  │
-  │ ├─ sandbox: systemd scope + bubblewrap  │                │   :11434 only)                │
-  │ │   + prlimit  ── agent child process   │                │ Gemma model (weights, GPU)    │
-  │ │       │ no network; unix-socket       │                │ inference                     │
+  │ ├─ sandbox: systemd + bubblewrap        │                │   :11434 only)                │
+  │ │   + prlimit (default), or Docker      │                │ Gemma model (weights, GPU)    │
+  │ │   (--agent-sandbox docker)            │                │ inference                     │
+  │ │       │ no network; unix-socket       │                │                               │
   │ │       ▼ bridge to ONE host:port       │   SSH local    │                               │
   │ ├─ ModelBridge ── 127.0.0.1:11434 ──────┼── forwarding ──┼─► 127.0.0.1:11434             │
   │ ├─ evaluator (local Docker container)   │  ssh -N -L ... │                               │
@@ -63,7 +64,7 @@ Values in `<ANGLE_BRACKETS>` are placeholders you must supply. Facts marked **Kn
 
 **Known:** the pilot was built and validated on an **x86_64 laptop** (Linux 6.18 LTS, Docker Desktop, bubblewrap 0.13.0, a systemd user session). The DGX is **ARM64**. Three things make the DGX an unverified place to run the controller, so do not run the pilot there:
 
-1. **The agent sandbox is unverified on the DGX.** It needs unprivileged user namespaces. On the DGX, the earlier shell-sandbox probe did not pass its guarantees: **Observed earlier** (E0, 2026-10-30): the sandbox check failed and the notes record an AppArmor restriction on unprivileged user namespaces (Ubuntu-based DGX OS). The pilot's bubblewrap sandbox would be blocked by the same mechanism. The driver refuses to start without its sandbox and never falls back, so the run would simply be refused.
+1. **The agent sandbox is unverified on the DGX.** It needs unprivileged user namespaces. On the DGX, the earlier shell-sandbox probe did not pass its guarantees: **Observed earlier** (E0, 2026-10-30): the sandbox check failed and the notes record an AppArmor restriction on unprivileged user namespaces (Ubuntu-based DGX OS). The pilot's bubblewrap sandbox would be blocked by the same mechanism. The driver refuses to start without its sandbox and never falls back, so the run would simply be refused. **Superseded for the Docker path:** since 2026-11-06 `--agent-sandbox docker` supplies a container boundary instead, and the two 2026-11-05 runs used it successfully on the DGX. Points 2 and 3 (the evaluator's architecture-specific Python and an ARM64 reference check) still apply: neither run produced a candidate, so the evaluator's tests did not execute on ARM64.
 2. **The evaluator's Python is architecture-specific.** The driver's default `--python-dir` is `~/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu` (x86_64). That interpreter is copied into the evaluator container, whose image architecture must match.
 3. **ARM64 Docker evaluation was never run.** The baseline (16 failed / 7 passed) and gold (23 passed) reference results were reproduced only on the x86_64 laptop.
 
@@ -90,19 +91,19 @@ The previous `experiments/dgx/dgx_diag.py` tool is **not used** in this runbook.
 
 | Need | Detail |
 |---|---|
-| OS and architecture | **Validated:** Linux x86_64 only. |
+| OS and architecture | **Validated:** Linux x86_64 (default sandbox) and Linux aarch64 on a DGX Spark (Docker agent sandbox, 2026-11-05). |
 | `uv` and Python 3.12 | The project pins Python `>=3.12,<3.13` (`pyproject.toml`, `.python-version`). `uv` 0.11.29 was used. |
 | Project environment | `uv sync --locked` (multi-gigabyte download: it installs PyTorch and NVIDIA wheels because the lock file includes them; the pilot itself does not use a GPU on the controller). |
 | `git` | To check out the right revision. |
-| `bubblewrap` (`bwrap`) | **Validated:** 0.13.0. |
-| `systemd-run` with a user session | `systemd-run --user --scope` must work. The driver passes `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` to it. **Validated:** systemd 262. |
-| cgroup v2 with `cpu`, `memory` and `pids` delegated to your user | **Validated:** the user manager's `cgroup.controllers` listed `cpu memory pids`. |
-| `prlimit` (util-linux) | **Validated:** 2.42.4. |
+| `bubblewrap` (`bwrap`) | **Validated:** 0.13.0. Needed only for the default (`--agent-sandbox bwrap`) agent sandbox. |
+| `systemd-run` with a user session | `systemd-run --user --scope` must work. The driver passes `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` to it. **Validated:** systemd 262. Default sandbox only. |
+| cgroup v2 with `cpu`, `memory` and `pids` delegated to your user | **Validated:** the user manager's `cgroup.controllers` listed `cpu memory pids`. Default sandbox only. |
+| `prlimit` (util-linux) | **Validated:** 2.42.4. Default sandbox only. |
 | GNU `patch` | **Validated:** 2.8. |
-| Unprivileged user namespaces allowed | Section 5 tests this with the real sandbox. |
-| Docker engine usable by your user | The evaluator runs in a container started with `docker`. **Validated:** Docker 29.8.1 (Docker Desktop, x86_64). |
-| A **local** Docker image `redis:7` | Used only because it provides `bash` and `timeout`. **The driver never pulls an image.** `--image` can name another local Debian-based image, but only `redis:7` was validated. |
-| A standalone CPython 3.12 matching the controller's architecture | Default location `~/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu`. |
+| Unprivileged user namespaces allowed | Section 5 tests this with the real sandbox. Default sandbox only; the Docker path exists for hosts where namespaces are blocked. |
+| Docker engine usable by your user | The evaluator runs in a container started with `docker`. **Validated:** Docker 29.8.1 (Docker Desktop, x86_64); the Docker **agent** sandbox also ran on the DGX (aarch64) in 2026-11-05, but the evaluator container did not (empty patches). |
+| A **local** Docker image `redis:7` | Used only because it provides `bash` and `timeout`. **The driver never pulls an image.** `--image` can name another local Debian-based image, but only `redis:7` was validated. The Docker agent sandbox uses `--agent-image` (same default). |
+| A standalone CPython 3.12 matching the controller's architecture | Default location `~/.local/share/uv/python/cpython-3.12-linux-x86_64-gnu`. On a host with a usable system Python, `--python-dir /usr` mounts `/usr` (and `/lib`, `/lib64`) read-only instead of copying a standalone interpreter. This system-Python mode has not been exercised by a run. |
 | The dataset (below) | `dataset/` in the repository root (git-ignored), or `--dataset-dir`. |
 | SSH access to the DGX | A user account on the DGX you can log in with. |
 | Free disk | The dataset is about 21 GiB (per the note in `.gitignore`). The run itself needs far less: the extracted `rich` tree is small, and a scratch extraction measured about 94 MB with its `.git` directory. As an unmeasured margin, keep a few GiB free in the output directory's filesystem and in Docker's storage. |
@@ -129,7 +130,7 @@ All commands in this section run **on the DGX**.
 
 ### 4.1 Required pre-run decisions (fill these in; do not guess)
 
-The repository contains **no** decided Gemma tag. Decide the following with us before starting, and write the answers in the handoff record (section 11):
+The repository contains **no** fixed Gemma tag for a new run (the 2026-11-05 run used `gemma4:e4b`). Decide the following with us before starting, and write the answers in the handoff record (section 11):
 
 | Decision | Value (fill in) | Notes |
 |---|---|---|
@@ -139,6 +140,8 @@ The repository contains **no** decided Gemma tag. Decide the following with us b
 | Context window | `8192` | Must equal `--context-length` and the server's own `num_ctx` (4.2). |
 | Output-token cap in the Modelfile (`num_predict`), if any | `<NUM_PREDICT or "none">` | **Unresolved on our side:** the harness requests `--max-tokens 768`, but which limit Ollama really applies is not verified (U17). The earlier Qwen3 tag set `num_predict 1024`. Record what you set. |
 | Is the Gemma base model already installed on the DGX? | yes / no | If **no**, pulling it is a download that we have not decided or approved. Ask us first. |
+
+The 2026-11-05 runs used `gemma4:e4b` (8.0B, Q4_K_M, digest `c6eb396d…`) and `qwen3.8:27b` (27.3B, Q4_K_M, digest `22130167…`), both with `--context-length 16384 --max-tokens 4096`, not the 8192/768 in the examples below. They are data points, not a recommendation.
 
 ### 4.2 Create or confirm a tag with a fixed context window
 
@@ -267,6 +270,8 @@ uv run python -c "import sys; sys.path.insert(0,'experiments/coding_eval'); impo
 ```
 
 If it prints anything else, **stop** (section 10). Do not edit the driver and do not run the agent outside the sandbox.
+
+**If you use `--agent-sandbox docker` instead, this preflight does not apply** (the driver does not preflight Docker either). Verify the engine and the local image yourself, for example `docker run --rm redis:7 true`, and read the `sandbox` block in `run.json` afterwards.
 
 Optional but recommended: run the driver's own tests. They use stand-in servers (no model, no real dataset) and include the real-sandbox tests. **Observed on the original laptop, 2026-11-05:** `161 passed, 1 skipped` (the skip is the opt-in Docker test). Any sandbox failure on your machine is a stop.
 
@@ -435,6 +440,8 @@ date -u +%Y-%m-%dT%H:%M:%SZ | tee "$OUT/console/run-end-utc.txt"
 ```
 
 All flags were checked against the driver's `--help` and `build_parser()`. Defaults, **Known:** `--provider` is `ollama` (the only choice), `--base-url` defaults to `http://127.0.0.1:11434/v1`, `--max-iterations` to 8, `--task-id` to `rich_3278`, `--image` to `redis:7`, `--site-dir` to `<out>/env/site`. The per-worker timeout is fixed at 300 s in the driver. `--keep-workspaces` keeps the agent's workspace and the pristine copy under the run directory, which you want for the first run. `--allow-model-call` is required; without it the driver refuses.
+
+**Agent sandbox choice.** The default is the systemd + bubblewrap + prlimit sandbox (section 5.3). Add `--agent-sandbox docker` (optionally `--agent-image <local image>`, default `redis:7`) on a host where unprivileged user namespaces are unavailable; this is what the two 2026-11-05 runs used. The Docker path was exercised only by those runs, not by the default tests. The evaluator's `--image` is separate and unchanged.
 
 - Run it **once**. Do not add retries, loops or a second seed.
 - It can take up to the agent timeout (30 minutes) plus evaluation (up to 5 minutes). Do not interrupt it. If you must, press `Ctrl-C` once and record it.
@@ -659,4 +666,4 @@ Send us the archive and its hash. **Do not include `dataset/`, the gold patch or
 
 **Verified against the source and `--help` output:** every driver flag and default in sections 6 and 8; the `--out` rules; the `$OUT/env/site` coupling; the run directory layout in 9.1; the outcome classes; the pinned snapshot hash; the driver's SHA-256 at `a08941c`; the sandbox preflight one-liner (it printed `sandbox OK` on the original laptop); the controller tool versions listed as "Validated".
 
-**Not verified here:** every DGX command in section 4 (they are standard `nvidia-smi`, `ollama` and `curl` calls that were not run for this document); the SSH tunnel commands; any Gemma model's behavior, memory footprint or tool-use quality; any controller other than the original x86_64 laptop; the commands in 5.4 for installing Python or the Docker image (they download); the artifact transfer commands.
+**Not verified here:** every DGX command in section 4 (they are standard `nvidia-smi`, `ollama` and `curl` calls that were not run for this document); the SSH tunnel commands; the commands in 5.4 for installing Python or the Docker image (they download); the artifact transfer commands; any model's coding ability. **Since this text was written:** the driver has run for real twice on a DGX Spark (2026-11-05; `gemma4:e4b` and `qwen3.8:27b`, Docker agent sandbox, both empty patches; see the update at the top). The SSH tunnel, the DGX Ollama contact, model identity and the Docker agent sandbox are therefore exercised; the evaluator's ARM64 baseline/gold check and any non-empty candidate remain unverified.
