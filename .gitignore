@@ -16,3 +16,7 @@ AGENTS.md
 
 # downloaded coding-benchmark dataset (about 21 GB, untrusted third-party repositories, holds reference patches): never commit
 /dataset/
+
+# Gemma pilot run artifacts: run directories hold agent workspaces and local absolute paths; keep them out of Git
+/gemma_eval_runs/
+/new_gemma_eval_runs/
