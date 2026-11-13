@@ -364,14 +364,13 @@ class EditFileTool(BaseTool):
     MAX_FILE_BYTES = FileOperations.DEFAULT_MAX_FILE_SIZE  # the limit `file_operations` applies to reads
     MAX_TEXT_CHARS = 10_000  # effGen cuts any tool input at 10,000 characters anyway (audit Part 3, 2026-10-28)
     MAX_SHOWN_LINES = 5
-    # effGen reads a tool call's JSON input leniently: text that is not valid JSON (a file's `\x1b` copied with ONE backslash) is
-    # re-read with `ast.literal_eval` (core/agent_tool_execution.py), which turns it into a real control character. So a model that
-    # copies backslashes from a file verbatim sends text that cannot match; the refusal explains the doubling (review P1-1).
+    # A tool call's JSON input that is not valid JSON (a file's `\x1b` copied with ONE backslash) never reaches this tool in a harness run:
+    # `StructuredToolInputGuard` (delegation.py) refuses it first. Called directly, a text with a real control character is refused below, and
+    # the refusal states what was found; how to write the call is the worker prompt's business, not this tool's (review P1-1).
     _CONTROL_NAMES = {0x07: "BEL", 0x08: "BS", 0x0B: "VT", 0x0C: "FF", 0x1B: "ESC"}
     # The same mistake in `new_text` is worse than in `old_text`: the call would MATCH and the control character would be written into the
     # file, so `new_text` may not contain C0 control characters other than TAB, LF and CR. Escapes that decode to ordinary characters
-    # (`\x41` -> `A`, a naive `\t` -> TAB, `\n` -> LF) cannot be told apart from intended text after parsing and are NOT detected.
-    _ESCAPE_RULE = ' In the JSON input write every backslash as two backslashes, in old_text and in new_text: to match or write the text \\x1b send "\\\\x1b"'
+    # (a JSON unicode escape for `A`, a single-backslash `\t` -> TAB, `\n` -> LF) cannot be told apart from intended text after parsing and are NOT detected.
 
     def __init__(self, workspace: Path | str) -> None:
         if not (hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and os.open in os.supports_dir_fd and os.rename in os.supports_dir_fd and os.unlink in os.supports_dir_fd):
@@ -385,8 +384,7 @@ class EditFileTool(BaseTool):
                 "included) and new_text (what replaces it; an empty new_text deletes old_text). old_text must occur exactly once in "
                 "the file. If it is missing or occurs more than once, nothing is changed and you are told why: copy a few more "
                 "neighbouring lines into old_text to make it unique. Read the file first. Prefer this over file_operations write "
-                "for changing an existing file. Line endings and whitespace are never altered. In the JSON input write every backslash as two "
-                "backslashes, in old_text and in new_text: to match or write the text \\x1b send \\\\x1b. new_text may not contain control "
+                "for changing an existing file. Line endings and whitespace are never altered. new_text may not contain control "
                 "characters other than tab, line feed and carriage return."),
             category=ToolCategory.FILE_OPERATIONS,
             parameters=[
@@ -475,12 +473,11 @@ class EditFileTool(BaseTool):
         shown = "/".join(parts)[:200]
         for label, value in (("old_text", old_text), ("new_text", new_text)):
             if not isinstance(value, str) or "\x00" in value:
-                raise _Refused(f"{label} must be text without NUL characters." + (self._ESCAPE_RULE if isinstance(value, str) else ""))
+                raise _Refused(f"{label} must be text without NUL characters.")
             if len(value) > self.MAX_TEXT_CHARS:
                 raise _Refused(f"{label} is longer than {self.MAX_TEXT_CHARS} characters")
             if label == "new_text" and (names := self._control_names(value)):  # checked before the filesystem is touched, like the other argument checks
-                raise _Refused(f"new_text contains the control character(s) {names}, which edit_file never writes: a backslash sequence was probably read as an escape."
-                               + self._ESCAPE_RULE)
+                raise _Refused(f"new_text contains the control character(s) {names}, which edit_file never writes.")
         if not old_text:
             raise _Refused("old_text must not be empty")
         if old_text == new_text:
@@ -520,8 +517,7 @@ class EditFileTool(BaseTool):
             if not at:
                 hint = " The file uses CRLF line endings: write them (\\r\\n) in old_text." if "\r\n" in text and "\n" in old_text and "\r\n" not in old_text else ""
                 raise _Refused(f"old_text was not found in '{shown}'. It must match the file exactly, indentation and line breaks included.{hint}"
-                               + (f" old_text contains the control character(s) {names}: a backslash sequence was probably read as an escape.{self._ESCAPE_RULE}"
-                                  if (names := self._control_names(old_text)) else ""))
+                               + (f" old_text contains the control character(s) {names}." if (names := self._control_names(old_text)) else ""))
             if len(at) > 1:
                 lines = ", ".join(str(text.count("\n", 0, i) + 1) for i in at[:self.MAX_SHOWN_LINES])
                 more = "more than " if len(at) > self.MAX_SHOWN_LINES else ""

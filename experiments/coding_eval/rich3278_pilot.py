@@ -45,6 +45,8 @@ SNAPSHOT_SHA256 = {"rich_3278": "bda96e09e9e02fa372b2cf6c5f3f2760f97d292fb531cc6
 EVAL_PACKAGES = ("pytest==8.3.4", "pygments", "markdown-it-py")  # what rich_3278's tests need; installed offline from the dataset's wheels
 MAX_CHANGED_FILES, MAX_PATCH_BYTES = 50, 2_000_000
 WORKER = "coder"
+# effGen's `AgentConfig.tool_calling_mode` values (smol_harness.harness.TOOL_CALLING_MODES; a test pins that they agree). "react" is the default and the only mode any recorded run used.
+TOOL_CALLING_MODES = ("auto", "native", "react", "hybrid")
 # Added when edit_file was introduced (the file_operations write tool can only rewrite a whole file, which does not fit a small output limit).
 WORKER_PROMPT = ("You change code in a repository. Read the relevant file first with file_operations, then change it with edit_file: copy a short piece of the file exactly "
                  "as old_text (it must occur once) and give its replacement as new_text. Prefer the smallest replacement that avoids backslashes and control characters; "
@@ -52,7 +54,6 @@ WORKER_PROMPT = ("You change code in a repository. Read the relevant file first 
                  "in the JSON input encode every literal backslash as the JSON Unicode escape `\\u005c` (for example, the file text `\\x1b` must be written "
                  "as `\\u005cx1b`, and `\\]` as `\\u005c]`). Do not send raw \\x, \\], or control characters. If edit_file reports an escaping error, retry "
                  "using \\u005c escapes, not raw backslashes. Send exactly one JSON object per edit_file call, with no extra Action or Observation text. "
-                 "For this task, insert the one-line alternative `(?:\\x1b[0-?])|` immediately before the existing `(?:\\x1b\\](.*?)\\x1b\\\\)|` line; do not change `[0-?]*` inside the CSI pattern. "
                  "After a successful edit_file call, read the changed line with file_operations and only then report success. Do not claim success unless edit_file "
                  "and the read-back both succeed; if every edit fails, report that the change is unresolved. Do not rewrite whole files. "
                  "You cannot run tests. Report what you changed.")
@@ -749,7 +750,8 @@ def run_agent(params: dict) -> int:
     from smol_harness.recorder import ExecutionRecorder
 
     out = Path(params["out_dir"])
-    started, result_doc = time.monotonic(), {"started": now(), "generation_overrides_requested": {k: params[k] for k in ("max_tokens", "temperature", "seed")},
+    mode = params.get("tool_calling_mode", "react")  # the same key every other run setting travels in; absent means the harness's own default
+    started, result_doc = time.monotonic(), {"started": now(), "generation_overrides_requested": {k: params[k] for k in ("max_tokens", "temperature", "seed")}, "tool_calling_mode": mode,
                                              "note": "limits are what was REQUESTED; the server-enforced output limit was not verified (docs/new-session.md U17)"}
     code = 3
     try:
@@ -761,7 +763,7 @@ def run_agent(params: dict) -> int:
         before_workspace = manifest(workspace)
         recorder = ExecutionRecorder(out / "history")
         with generation_overrides(params["max_tokens"], params["temperature"], params["seed"]):
-            with build_harness_from_config(config, recorder=recorder) as harness:
+            with build_harness_from_config(config, tool_calling_mode=mode, recorder=recorder) as harness:
                 result = harness.run(Path(params["prompt_path"]).read_text())
         workspace_changed = manifest(workspace) != before_workspace
         reported_success = bool(result.success and workspace_changed)
@@ -807,56 +809,218 @@ def run_agent_phase(agent_dir: Path, params: dict, timeout_s: float, cmd: list[s
     return {"command": cmd, "exit_code": code, "timed_out": timed_out, "seconds": round(time.monotonic() - start, 2)}
 
 
-def docker_agent_command(agent_dir: Path, bridge_dir: Path, params: dict, *, image: str = "redis:7") -> list[str]:
-    """Run the agent in Docker for hosts where unprivileged user namespaces are unavailable.
+def check_mount_sources(mounts: list[tuple[str, str]], protected: tuple[Path, ...]) -> None:
+    """Fail closed: no mount source (host path) may equal, contain or lie inside a protected directory (the dataset, the evaluator directory, the pristine copy).
 
-    The host Python/runtime is mounted read-only because the evaluator's standalone Python is
-    intentionally not copied here. Docker still supplies the process, network, capability and
-    filesystem boundary; the agent receives only its workspace, bridge socket and read-only code.
-    """
+    Paths are resolved first, so a symlink cannot hide the relation. `mounts` is [(host source, container target)]."""
+    for source, target in mounts:
+        src = Path(source).resolve()
+        for guarded in protected:
+            p = Path(guarded).resolve()
+            if src == p or src in p.parents or p in src.parents:
+                raise PilotError(f"refusing to mount {source!r} at {target!r} into the agent container: it equals, contains or lies inside the protected directory {str(guarded)!r}")
+
+
+# The environment and the one command of the agent container. The `docker create` argument list and the expectations its read-back is checked against
+# (`docker_agent_plan`) are both built from these and from the same limits dict, so the two cannot drift apart.
+AGENT_CONTAINER_ENV = (("HOME", "/tmp"), ("PATH", "/usr/bin:/bin"), ("PYTHONPATH", "/repo/src"), ("PYTHONNOUSERSITE", "1"), ("PYTHONDONTWRITEBYTECODE", "1"))
+AGENT_CONTAINER_SCRIPT = "exec /venv/bin/python /repo/experiments/coding_eval/rich3278_pilot.py agent-child --params /agent/params.docker.json"
+
+
+def docker_limits(limits: SandboxLimits) -> dict:
+    """The agent container's resource limits exactly as the `docker create` flags carry them.
+
+    The SAME dict builds the command and is recorded in run.json (`sandbox.limits`), so the record cannot disagree with what was passed. The memory limit and the
+    memory-and-swap limit are equal: Docker reads `--memory-swap 0` as "unset" (swap stays available), as the evaluator's container already knows."""
+    if not limits.cpu_quota.endswith("%"):
+        raise PilotError(f"cpu_quota must be a percentage such as '200%', got {limits.cpu_quota!r}")
+    memory = limits.memory_max.lower()
+    return {"memory": memory, "memory_swap": memory, "cpus": f"{int(limits.cpu_quota[:-1]) / 100:g}", "pids_limit": limits.tasks_max, "nofile": limits.nofile,
+            "fsize_bytes": limits.fsize_bytes, "core": 0, "tmp_tmpfs": "rw,noexec,nosuid,nodev,size=256m", "data_tmpfs": "rw,noexec,nosuid,nodev,size=16m"}
+
+
+def docker_agent_plan(agent_dir: Path, bridge_dir: Path, params: dict, *, protected: tuple[Path, ...], name: str, run_id: str, limits: dict, image: str = "redis:7") -> dict:
+    """The `docker create` argument list for the agent container and what `docker inspect` must show of it (`{"argv": [...], "expected": {...}}`).
+
+    The container gets exactly: the run's agent directory and the bridge directory (writable), and read-only `src/`, this driver file, the venv, `/usr`, `/lib` and
+    `/lib64`. The repository root is NOT mounted (it holds `dataset/`), and `protected` (required: the dataset, the evaluator directory, the pristine copy) is checked
+    against every mount source before anything is written or built; a conflict raises `PilotError`. The image's `VOLUME /data` is masked by a tmpfs and the working
+    directory is `/agent`, as in the evaluator's container. The container is created (not run): `run_agent_container` reads it back before it is started."""
     prefix = Path(sys.prefix).resolve()
-    python = Path(sys.executable).resolve()
     container_agent = Path("/agent")
-    container_repo = Path("/repo")
-    container_bridge = Path("/bridge")
-    container_params = container_agent / "params.json"
-    translated = dict(params)
-    for key in ("config_path", "prompt_path", "out_dir", "workspace"):
-        translated[key] = str(container_agent / Path(params[key]).relative_to(agent_dir))
-    translated["bridge"] = {**params["bridge"], "socket": "/bridge/m.sock"}
-    (agent_dir / "params.docker.json").write_text(json.dumps(translated))
-    params_file = agent_dir / "params.docker.json"
+    rw_mounts = [(str(agent_dir), "/agent"), (str(bridge_dir), "/bridge")]
     ro_mounts = [
-        (str(REPO), str(container_repo)),
+        (str(REPO / "src"), "/repo/src"),
+        (str(Path(__file__).resolve()), "/repo/experiments/coding_eval/rich3278_pilot.py"),
         (str(prefix), "/venv"),
-        (str(python.parent.parent), "/python"),
         ("/usr", "/usr"),
         ("/lib", "/lib"),
     ]
     if Path("/lib64").exists():
         ro_mounts.append(("/lib64", "/lib64"))
-    command = [
-        "docker", "run", "--rm", "--pull", "never",
+    check_mount_sources([*rw_mounts, *ro_mounts], protected)
+    translated = dict(params)
+    for key in ("config_path", "prompt_path", "out_dir", "workspace"):
+        translated[key] = str(container_agent / Path(params[key]).relative_to(agent_dir))
+    translated["bridge"] = {**params["bridge"], "socket": "/bridge/m.sock"}
+    (agent_dir / "params.docker.json").write_text(json.dumps(translated))
+    user = f"{os.getuid()}:{os.getgid()}"
+    binds = [f"{src}:{dst}:rw" for src, dst in rw_mounts] + [f"{src}:{dst}:ro" for src, dst in ro_mounts]
+    argv = [
+        "docker", "create", "--pull", "never", "--name", name, "--label", "purpose=coding-eval-agent", "--label", f"run={run_id}", "--init",
         "--network", "none", "--ipc", "none", "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges", "--read-only",
-        "--user", f"{os.getuid()}:{os.getgid()}",
-        "--memory", "2g", "--memory-swap", "0", "--cpus", "2",
-        "--pids-limit", "256", "--ulimit", "nofile=1024:1024",
-        "--ulimit", "fsize=104857600", "--ulimit", "core=0",
-        "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=256m",
-        "-v", f"{agent_dir}:/agent:rw",
-        "-v", f"{bridge_dir}:/bridge:rw",
+        "--user", user,
+        "--memory", limits["memory"], "--memory-swap", limits["memory_swap"], "--cpus", limits["cpus"],
+        "--pids-limit", str(limits["pids_limit"]), "--ulimit", f"nofile={limits['nofile']}:{limits['nofile']}",
+        "--ulimit", f"fsize={limits['fsize_bytes']}", "--ulimit", f"core={limits['core']}",
+        "--tmpfs", f"/tmp:{limits['tmp_tmpfs']}", "--tmpfs", f"/data:{limits['data_tmpfs']}", "-w", "/agent",
     ]
-    for src, dst in ro_mounts:
-        command += ["-v", f"{src}:{dst}:ro"]
-    command += [
-        "-e", "HOME=/tmp", "-e", "PATH=/usr/bin:/bin", "-e", "PYTHONPATH=/repo/src",
-        "-e", "PYTHONNOUSERSITE=1", "-e", "PYTHONDONTWRITEBYTECODE=1",
-        "--entrypoint", "bash", image, "-c",
-        "exec /venv/bin/python /repo/experiments/coding_eval/rich3278_pilot.py "
-        "agent-child --params /agent/params.docker.json",
-    ]
-    return command
+    for bind in binds:
+        argv += ["-v", bind]
+    for key, value in AGENT_CONTAINER_ENV:
+        argv += ["-e", f"{key}={value}"]
+    argv += ["--entrypoint", "bash", image, "-c", AGENT_CONTAINER_SCRIPT]
+    expected = {
+        "user": user, "workdir": "/agent", "entrypoint": ["bash"], "cmd": ["-c", AGENT_CONTAINER_SCRIPT],
+        "memory": _bytes(limits["memory"].upper()), "memory_swap": _bytes(limits["memory_swap"].upper()), "pids_limit": limits["pids_limit"],
+        "nano_cpus": round(float(limits["cpus"]) * 1_000_000_000),
+        "ulimits": {"nofile": limits["nofile"], "fsize": limits["fsize_bytes"], "core": limits["core"]},
+        "tmpfs": {"/tmp": limits["tmp_tmpfs"], "/data": limits["data_tmpfs"]},
+        "binds": sorted(binds),
+        "mounts": sorted([(dst, "bind", True) for _, dst in rw_mounts] + [(dst, "bind", False) for _, dst in ro_mounts]),
+    }
+    return {"argv": argv, "expected": expected}
+
+
+def docker_agent_command(agent_dir: Path, bridge_dir: Path, params: dict, *, protected: tuple[Path, ...], name: str, run_id: str, limits: dict, image: str = "redis:7") -> list[str]:
+    """The `docker create` command of the agent container (see `docker_agent_plan`)."""
+    return docker_agent_plan(agent_dir, bridge_dir, params, protected=protected, name=name, run_id=run_id, limits=limits, image=image)["argv"]
+
+
+def verify_agent_container(info: dict, expected: dict) -> list[str]:
+    """What differs between `docker inspect` of the created agent container and what the create command asked for (empty list = as configured).
+
+    Checked: network and ipc none, not privileged, read-only root, all capabilities dropped, no-new-privileges, init, memory AND memory-swap (swap unset is a mismatch),
+    pids, cpus, ulimits, the tmpfs mounts, user, working directory, entrypoint and command, no devices or published ports, and the EXACT mount list (binds and mounts)."""
+    hc, cfg = info.get("HostConfig") or {}, info.get("Config") or {}
+    bad: list[str] = []
+
+    def check(label: str, got, want) -> None:
+        if got != want:
+            bad.append(f"{label}: expected {want!r}, found {got!r}")
+
+    check("NetworkMode", hc.get("NetworkMode"), "none")
+    check("IpcMode", hc.get("IpcMode"), "none")
+    check("Privileged", hc.get("Privileged"), False)
+    check("ReadonlyRootfs", hc.get("ReadonlyRootfs"), True)
+    check("CapDrop", hc.get("CapDrop"), ["ALL"])
+    if not any(str(o).startswith("no-new-privileges") and not str(o).endswith("false") for o in hc.get("SecurityOpt") or []):
+        bad.append(f"SecurityOpt: no-new-privileges is not set (found {hc.get('SecurityOpt')!r})")
+    check("Init", hc.get("Init"), True)
+    check("Memory", hc.get("Memory"), expected["memory"])
+    check("MemorySwap", hc.get("MemorySwap"), expected["memory_swap"])
+    check("PidsLimit", hc.get("PidsLimit"), expected["pids_limit"])
+    check("NanoCpus", hc.get("NanoCpus"), expected["nano_cpus"])
+    check("Ulimits", {u.get("Name"): (u.get("Soft"), u.get("Hard")) for u in hc.get("Ulimits") or []}, {k: (v, v) for k, v in expected["ulimits"].items()})
+    tmpfs = hc.get("Tmpfs") or {}
+    check("Tmpfs mounts", sorted(tmpfs), sorted(expected["tmpfs"]))
+    for target, options in expected["tmpfs"].items():
+        got = set(str(tmpfs.get(target, "")).split(","))
+        if not set(options.split(",")) <= got:
+            bad.append(f"Tmpfs {target}: expected options {options!r}, found {tmpfs.get(target)!r}")
+    check("Binds", sorted(hc.get("Binds") or []), expected["binds"])
+    check("Mounts", sorted((m.get("Destination"), m.get("Type"), bool(m.get("RW"))) for m in info.get("Mounts") or []), expected["mounts"])
+    if hc.get("Devices") or hc.get("DeviceRequests"):
+        bad.append(f"Devices: expected none, found {hc.get('Devices') or hc.get('DeviceRequests')!r}")
+    if hc.get("PortBindings"):
+        bad.append(f"PortBindings: expected none, found {hc.get('PortBindings')!r}")
+    check("User", cfg.get("User"), expected["user"])
+    check("WorkingDir", cfg.get("WorkingDir"), expected["workdir"])
+    check("Entrypoint", cfg.get("Entrypoint"), expected["entrypoint"])
+    check("Cmd", cfg.get("Cmd"), expected["cmd"])
+    return bad
+
+
+class ContainerCleanupError(PilotError):
+    """The agent container could not be shown to be stopped and gone: whatever it did to the workspace cannot be trusted, so the candidate is not collected.
+    `agent_result` is what `run_agent_phase` returned, when it got that far."""
+
+    def __init__(self, message: str, agent_result: dict | None = None) -> None:
+        super().__init__(message)
+        self.agent_result = agent_result
+
+
+def _docker_cli(*args: str) -> subprocess.CompletedProcess:
+    """One `docker` call; a missing binary or a timeout is reported as a failed call (returncode 127) rather than raised."""
+    try:
+        return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return subprocess.CompletedProcess(["docker", *args], 127, "", f"{type(exc).__name__}: {exc}")
+
+
+def remove_agent_container(name: str) -> dict:
+    """`docker kill`, then `docker rm -f`, then confirm the container is gone (`docker inspect` says there is no such container).
+
+    A kill that fails for any reason other than "already stopped" or "no such container" is an error even if the removal then succeeds, and so is a container that
+    still exists afterwards: both raise `ContainerCleanupError`. Otherwise returns what each step answered."""
+    killed = _docker_cli("kill", name)
+    removed = _docker_cli("rm", "-f", "-v", name)
+    seen = _docker_cli("inspect", name)
+    steps = {"kill": {"returncode": killed.returncode, "stderr": killed.stderr.strip()[-300:]},
+             "rm": {"returncode": removed.returncode, "stderr": removed.stderr.strip()[-300:]},
+             "inspect_after": {"returncode": seen.returncode, "stderr": seen.stderr.strip()[-300:]}}
+    benign = ("is not running", "no such container")
+    problems = []
+    if killed.returncode != 0 and not any(s in killed.stderr.lower() for s in benign):
+        problems.append(f"docker kill failed ({killed.stderr.strip()[-200:] or 'no message'})")
+    steps["gone"] = seen.returncode != 0 and "no such" in seen.stderr.lower()
+    if not steps["gone"]:
+        problems.append(f"the container is not confirmed gone after docker rm -f (docker inspect: returncode {seen.returncode}, {seen.stderr.strip()[-200:] or 'it still exists'})")
+    if problems:
+        raise ContainerCleanupError(f"agent container {name!r} could not be stopped and removed: " + "; ".join(problems) + "; the candidate is not collected", None)
+    return steps
+
+
+def run_agent_container(agent_dir: Path, bridge_dir: Path, params: dict, timeout_s: float, *, name: str, run_id: str, protected: tuple[Path, ...], image: str, limits: dict,
+                        inspect_path: Path) -> dict:
+    """Create the agent container, read it back, start it, and ALWAYS stop and remove it before returning (or raising).
+
+    create -> `docker inspect` -> verify (`verify_agent_container`; any mismatch refuses to start) -> `docker start -a` under the wall-clock limit of `run_agent_phase`.
+    Killing the `docker start` client does not stop a container, so the `finally` path kills and removes it by name (`remove_agent_container`) on every exit: normal,
+    timeout, refusal and exception. A cleanup that cannot be confirmed raises `ContainerCleanupError`, which keeps the candidate from being collected. The full
+    inspect result is written to `inspect_path` (outside the agent directory) before it is judged."""
+    plan = docker_agent_plan(agent_dir, bridge_dir, params, protected=protected, name=name, run_id=run_id, limits=limits, image=image)
+    start = ["docker", "start", "-a", name]
+    result: dict | None = None
+    isolation: dict = {}
+    try:
+        created = _docker_cli(*plan["argv"][1:])
+        if created.returncode != 0:
+            raise PilotError(f"docker create failed: {created.stderr.strip()}")
+        shown = _docker_cli("inspect", name)
+        if shown.returncode != 0:
+            raise PilotError(f"docker inspect of the created agent container failed: {shown.stderr.strip()}")
+        try:
+            info = json.loads(shown.stdout)[0]
+        except (ValueError, IndexError, TypeError) as exc:
+            raise PilotError(f"docker inspect did not return a container description: {type(exc).__name__}: {exc}") from exc
+        write_json(inspect_path, info)  # the evidence first, then the verdict
+        problems = verify_agent_container(info, plan["expected"])
+        if problems:
+            raise PilotError("agent container isolation not as configured; refusing to start it: " + "; ".join(problems))
+        hc, cfg = info["HostConfig"], info.get("Config") or {}
+        isolation = {**{k: hc.get(k) for k in ("NetworkMode", "IpcMode", "Privileged", "ReadonlyRootfs", "CapDrop", "SecurityOpt", "Init", "Memory", "MemorySwap", "PidsLimit", "NanoCpus", "Tmpfs")},
+                     "Binds": sorted(hc.get("Binds") or []), "User": cfg.get("User"), "WorkingDir": cfg.get("WorkingDir")}
+        result = run_agent_phase(agent_dir, params, timeout_s, start)
+    finally:
+        try:
+            cleanup = remove_agent_container(name)
+        except ContainerCleanupError as exc:
+            exc.agent_result = result
+            raise
+    result.update(command=plan["argv"], start_command=start, container={"name": name, "inspect_file": inspect_path.name, "isolation": isolation, "cleanup": cleanup})
+    return result
 
 
 # ---- one run --------------------------------------------------------------------------------------------------------------------
@@ -1011,6 +1175,7 @@ class RunConfig:
     keep_workspaces: bool = False
     agent_sandbox: str = "bwrap"
     agent_image: str = "redis:7"
+    tool_calling_mode: str = "react"  # how the agents' tool calls are read; recorded in run.json (config and provenance)
     limits: ContainerLimits = ContainerLimits()
     sandbox_limits: SandboxLimits = SandboxLimits()
 
@@ -1034,10 +1199,12 @@ def run_pilot(cfg: RunConfig, runner, *, agent_cmd: list[str] | None = None) -> 
     created = [agent_dir / "workspace", eval_dir / "pristine"]
     record: dict = {"schema_version": SCHEMA_VERSION, "run_id": run_id, "task_id": spec.task_id, "started": now(), "snapshot_sha256": spec.snapshot_sha256,
                     "declared_base_commit": spec.base_commit, "deviations": list(DEVIATIONS), "config": {k: str(v) if isinstance(v, Path) else v for k, v in vars(cfg).items() if k not in ("limits", "sandbox_limits")},
-                    "container_limits": vars(cfg.limits), "basis": BASIS.get(cfg.task_id), "provenance": collect_provenance(), "model_identity": None, "sandbox": None,
+                    "container_limits": vars(cfg.limits), "basis": BASIS.get(cfg.task_id), "provenance": {**collect_provenance(), "tool_calling_mode": cfg.tool_calling_mode}, "model_identity": None, "sandbox": None,
                     "agent": None, "candidate": None, "evaluation": None, "resolved": False, "status": "started"}
     sandboxed = agent_cmd is None  # an injected command is for tests only; a real run is ALWAYS sandboxed, or refused
     try:
+        if cfg.tool_calling_mode not in TOOL_CALLING_MODES:  # refused here, not as a harness error after the agent was started
+            raise PilotError(f"unknown tool calling mode {cfg.tool_calling_mode!r}; choose one of {', '.join(TOOL_CALLING_MODES)}")
         if sandboxed and cfg.agent_sandbox == "bwrap":
             problem = sandbox_problem(cfg.sandbox_limits)
             if problem:
@@ -1068,7 +1235,7 @@ def run_pilot(cfg: RunConfig, runner, *, agent_cmd: list[str] | None = None) -> 
         if not record["model_identity"]["available"]:  # an unreachable endpoint or an unknown tag is an infrastructure failure, not a coding result
             raise PilotError(f"the model identity could not be established, so the agent was not started: {record['model_identity']['reason']}")
         params = {"config_path": str(agent_dir / "harness.yaml"), "prompt_path": str(agent_dir / "prompt.txt"), "out_dir": str(agent_dir),
-                  "max_tokens": cfg.max_tokens, "temperature": cfg.temperature, "seed": cfg.seed, "workspace": str(workspace)}
+                  "max_tokens": cfg.max_tokens, "temperature": cfg.temperature, "seed": cfg.seed, "workspace": str(workspace), "tool_calling_mode": cfg.tool_calling_mode}
         if sandboxed and cfg.agent_sandbox == "bwrap":
             bridge_dir = Path(tempfile.mkdtemp(prefix="cb-"))  # a short path: unix socket paths are limited to about 100 characters
             try:
@@ -1085,10 +1252,17 @@ def run_pilot(cfg: RunConfig, runner, *, agent_cmd: list[str] | None = None) -> 
                 harness_config.write_text(harness_config.read_text().replace(str(workspace), "/agent/workspace"))
                 with ModelBridge(bridge_dir, *endpoint):
                     params["bridge"] = {"port": endpoint[1], "socket": "/bridge/m.sock"}
+                    limits = docker_limits(cfg.sandbox_limits)  # builds the docker command AND is what run.json records
                     record["sandbox"] = {"kind": "Docker", "network": "none; a unix-socket bridge to the configured model endpoint only",
-                                         "image": cfg.agent_image, "limits": vars(cfg.sandbox_limits)}
-                    command = docker_agent_command(agent_dir, bridge_dir, params, image=cfg.agent_image)
-                    record["agent"] = run_agent_phase(agent_dir, params, cfg.agent_timeout_s, command)
+                                         "image": cfg.agent_image, "limits": limits, "container": f"smol-agent-{run_id}"}
+                    try:
+                        record["agent"] = run_agent_container(agent_dir, bridge_dir, params, cfg.agent_timeout_s, name=record["sandbox"]["container"], run_id=run_id,
+                                                              protected=(cfg.dataset_dir, eval_dir, pristine), image=cfg.agent_image, limits=limits,
+                                                              inspect_path=run_dir / "agent_container_inspect.json")
+                    except ContainerCleanupError as exc:  # the candidate is NOT collected; what is known about the agent phase is kept
+                        record["agent"] = exc.agent_result
+                        raise
+                    record["sandbox"]["isolation"] = record["agent"]["container"]["isolation"]
             finally:
                 shutil.rmtree(bridge_dir, ignore_errors=True)
         else:
@@ -1159,6 +1333,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--keep-workspaces", action="store_true")
     r.add_argument("--agent-sandbox", choices=["bwrap", "docker"], default="bwrap")
     r.add_argument("--agent-image", default="redis:7")
+    r.add_argument("--tool-calling-mode", choices=list(TOOL_CALLING_MODES), default="react",
+                   help="how the agents' tool calls are read (effGen tool_calling_mode); react is the default and the only mode any recorded run used")
     r.add_argument("--allow-model-call", action="store_true", help="required: confirms a real model may be called")
     e = sub.add_parser("evaluate", parents=[common], help="evaluate an existing candidate patch (no agent, no model)")
     e.add_argument("--out", type=Path, required=True)
@@ -1190,7 +1366,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise PilotError("refusing to call a model without --allow-model-call")
             rec = run_pilot(RunConfig(out, args.dataset_dir, args.task_id, None, args.provider, args.model, args.context_length, args.base_url, args.max_tokens, args.temperature,
                                       args.seed, args.max_iterations, 300, args.agent_timeout_s, args.keep_workspaces,
-                                      agent_sandbox=args.agent_sandbox, agent_image=args.agent_image), runner)
+                                      agent_sandbox=args.agent_sandbox, agent_image=args.agent_image, tool_calling_mode=args.tool_calling_mode), runner)
             print(json.dumps({k: rec.get(k) for k in ("run_id", "status", "resolved")} | {"outcome": (rec.get("evaluation") or {}).get("outcome")}
                              | {k: (rec.get("classification") or {}).get(k) for k in ("attempt_outcome", "infrastructure_failure", "counts_as_coding_failure")}))
             return 0 if rec["status"] == "complete" else 1
