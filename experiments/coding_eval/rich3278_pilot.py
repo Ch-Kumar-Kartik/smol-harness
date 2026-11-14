@@ -959,14 +959,15 @@ def _docker_cli(*args: str) -> subprocess.CompletedProcess:
         return subprocess.CompletedProcess(["docker", *args], 127, "", f"{type(exc).__name__}: {exc}")
 
 
-def remove_agent_container(name: str) -> dict:
+def remove_agent_container(target: str) -> dict:
     """`docker kill`, then `docker rm -f`, then confirm the container is gone (`docker inspect` says there is no such container).
 
+    `target` is the container ID that this run's `docker create` printed (never a name that something else might hold).
     A kill that fails for any reason other than "already stopped" or "no such container" is an error even if the removal then succeeds, and so is a container that
     still exists afterwards: both raise `ContainerCleanupError`. Otherwise returns what each step answered."""
-    killed = _docker_cli("kill", name)
-    removed = _docker_cli("rm", "-f", "-v", name)
-    seen = _docker_cli("inspect", name)
+    killed = _docker_cli("kill", target)
+    removed = _docker_cli("rm", "-f", "-v", target)
+    seen = _docker_cli("inspect", target)
     steps = {"kill": {"returncode": killed.returncode, "stderr": killed.stderr.strip()[-300:]},
              "rm": {"returncode": removed.returncode, "stderr": removed.stderr.strip()[-300:]},
              "inspect_after": {"returncode": seen.returncode, "stderr": seen.stderr.strip()[-300:]}}
@@ -978,27 +979,30 @@ def remove_agent_container(name: str) -> dict:
     if not steps["gone"]:
         problems.append(f"the container is not confirmed gone after docker rm -f (docker inspect: returncode {seen.returncode}, {seen.stderr.strip()[-200:] or 'it still exists'})")
     if problems:
-        raise ContainerCleanupError(f"agent container {name!r} could not be stopped and removed: " + "; ".join(problems) + "; the candidate is not collected", None)
+        raise ContainerCleanupError(f"agent container {target!r} could not be stopped and removed: " + "; ".join(problems) + "; the candidate is not collected", None)
     return steps
 
 
 def run_agent_container(agent_dir: Path, bridge_dir: Path, params: dict, timeout_s: float, *, name: str, run_id: str, protected: tuple[Path, ...], image: str, limits: dict,
                         inspect_path: Path) -> dict:
-    """Create the agent container, read it back, start it, and ALWAYS stop and remove it before returning (or raising).
+    """Create the agent container, read it back, start it, and ALWAYS stop and remove it before returning (or raising), once this run has created it.
 
     create -> `docker inspect` -> verify (`verify_agent_container`; any mismatch refuses to start) -> `docker start -a` under the wall-clock limit of `run_agent_phase`.
-    Killing the `docker start` client does not stop a container, so the `finally` path kills and removes it by name (`remove_agent_container`) on every exit: normal,
-    timeout, refusal and exception. A cleanup that cannot be confirmed raises `ContainerCleanupError`, which keeps the candidate from being collected. The full
-    inspect result is written to `inspect_path` (outside the agent directory) before it is judged."""
+    Killing the `docker start` client does not stop a container, so once `docker create` has succeeded the `finally` path kills and removes the container, addressed by
+    the ID that create printed (`remove_agent_container`), on every exit: normal, timeout, refusal and exception. A cleanup that cannot be confirmed raises
+    `ContainerCleanupError`, which keeps the candidate from being collected. If `docker create` fails (an unknown image, or a name that something else already holds),
+    nothing is killed, removed or inspected: the container that holds the name is not ours. The full inspect result is written to `inspect_path` (outside the agent
+    directory) before it is judged. Known limit: a create that errors after the daemon made the container (the client died) leaves that container behind."""
     plan = docker_agent_plan(agent_dir, bridge_dir, params, protected=protected, name=name, run_id=run_id, limits=limits, image=image)
     start = ["docker", "start", "-a", name]
+    created = _docker_cli(*plan["argv"][1:])
+    if created.returncode != 0:
+        raise PilotError(f"docker create failed: {created.stderr.strip()}")
+    cid = created.stdout.strip().splitlines()[-1].strip() if created.stdout.strip() else name  # a successful create made `name`, so it is ours even if no ID was printed
     result: dict | None = None
     isolation: dict = {}
     try:
-        created = _docker_cli(*plan["argv"][1:])
-        if created.returncode != 0:
-            raise PilotError(f"docker create failed: {created.stderr.strip()}")
-        shown = _docker_cli("inspect", name)
+        shown = _docker_cli("inspect", cid)
         if shown.returncode != 0:
             raise PilotError(f"docker inspect of the created agent container failed: {shown.stderr.strip()}")
         try:
@@ -1015,11 +1019,11 @@ def run_agent_container(agent_dir: Path, bridge_dir: Path, params: dict, timeout
         result = run_agent_phase(agent_dir, params, timeout_s, start)
     finally:
         try:
-            cleanup = remove_agent_container(name)
+            cleanup = remove_agent_container(cid)
         except ContainerCleanupError as exc:
             exc.agent_result = result
             raise
-    result.update(command=plan["argv"], start_command=start, container={"name": name, "inspect_file": inspect_path.name, "isolation": isolation, "cleanup": cleanup})
+    result.update(command=plan["argv"], start_command=start, container={"name": name, "id": cid, "inspect_file": inspect_path.name, "isolation": isolation, "cleanup": cleanup})
     return result
 
 

@@ -1539,29 +1539,38 @@ def inspect_from_create(argv: list[str]) -> dict:
 class AgentDocker:
     """A stand-in for the docker CLI, patched over subprocess.run (every non-docker command runs for real). Appends each docker verb to `events`.
 
-    `edit(info)` changes what `docker inspect` reports; `kill` / `rm` / `create` are (returncode, stderr); `survives=True` makes `docker rm` succeed while the container stays."""
+    `edit(info)` changes what `docker inspect` reports; `kill` / `rm` / `create` are (returncode, stderr); `survives=True` makes `docker rm` succeed while the container stays.
+    `create` prints a container ID (`id-<name>`); kill, rm and inspect only know that ID. `targets` records (verb, argument) for every call; `touched_other` is set when
+    kill or rm is aimed at anything that is not this run's container (for example the name that a stale container holds)."""
 
-    def __init__(self, events, *, edit=None, kill=(0, ""), rm=(0, ""), create=(0, ""), survives=False):
-        self.events, self.edit, self.kill, self.rm, self.create, self.survives = events, edit, kill, rm, create, survives
-        self.argv, self.removed = None, False
+    def __init__(self, events, *, edit=None, kill=(0, ""), rm=(0, ""), create=(0, ""), survives=False, create_stdout=None):
+        self.events, self.edit, self.kill, self.rm, self.create, self.survives, self.create_stdout = events, edit, kill, rm, create, survives, create_stdout
+        self.argv, self.removed, self.cid, self.targets, self.touched_other = None, False, None, [], False
 
     def __call__(self, args, **kw):
         if args[0] != "docker":
             return REAL_RUN(args, **kw)
         verb = args[1]
         self.events.append(verb)
+        self.targets.append((verb, args[-1]))
         done = lambda code=0, out="", err="": pilot.subprocess.CompletedProcess(args, code, out, err)  # noqa: E731
         if verb == "create":
             if self.create[0] == 0:
                 self.argv = list(args)
-            return done(self.create[0], "cid\n" if self.create[0] == 0 else "", self.create[1])
+                name = args[args.index("--name") + 1]
+                self.cid = name if self.create_stdout == "" else "id-" + name  # no ID printed: the driver falls back to the name its own successful create made
+            return done(self.create[0], (self.create_stdout if self.create_stdout is not None else self.cid + "\n") if self.create[0] == 0 else "", self.create[1])
+        if verb in ("kill", "rm") and args[-1] != self.cid:
+            self.touched_other = True
         if verb == "inspect":
-            if self.argv is None or self.removed:
+            if self.argv is None or self.removed or args[-1] != self.cid:
                 return done(1, "", f"Error: No such object: {args[-1]}")
             info = inspect_from_create(self.argv)
             if self.edit:
                 self.edit(info)
             return done(0, json.dumps([info]))
+        if verb in ("kill", "rm") and args[-1] != self.cid:
+            return done(1, "", f"Error: No such container: {args[-1]}")
         if verb == "kill":
             return done(self.kill[0], "", self.kill[1])
         if verb == "rm":
@@ -1717,11 +1726,57 @@ def test_an_inspect_read_back_that_differs_from_the_configuration_refuses_to_sta
     assert inspect_path.exists()  # the evidence is kept even for a refusal
 
 
-def test_a_failed_docker_create_never_starts_anything(tmp_path, monkeypatch):
-    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch, create=(125, "Error: image not found locally"), kill=(1, "Error: No such container: smol-agent-t"))
-    with pytest.raises(pilot.PilotError, match="docker create failed"):
+def test_a_failed_docker_create_never_starts_anything_and_cleans_nothing_up(tmp_path, monkeypatch):
+    # The earlier version of this test asserted ["create", "kill", "rm", "inspect"]: cleanup BY NAME after a failed create, which is the bug
+    # (it would kill and remove whichever other container held the name).
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch, create=(125, "Error: image not found locally"))
+    with pytest.raises(pilot.PilotError, match="docker create failed: Error: image not found locally"):
         run()
-    assert events == ["create", "kill", "rm", "inspect"] and not inspect_path.exists()  # nothing to read back or start; the cleanup still runs and confirms there is nothing left
+    assert events == ["create"] and not inspect_path.exists() and not docker.touched_other
+
+
+def test_a_name_conflict_on_create_leaves_the_other_container_untouched(tmp_path, monkeypatch):
+    conflict = 'docker: Error response from daemon: Conflict. The container name "/smol-agent-t" is already in use by container "9f3c". You have to remove (or rename) that container to be able to reuse that name.'
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch, create=(125, conflict))
+    with pytest.raises(pilot.PilotError, match="docker create failed: .*already in use"):
+        run()
+    assert events == ["create"] and "kill" not in events and "rm" not in events and "inspect" not in events
+    assert docker.touched_other is False and docker.removed is False and not inspect_path.exists()  # the stale container that holds the name was neither killed nor removed
+
+
+def test_after_a_successful_create_inspect_kill_and_rm_address_the_printed_id_in_order(tmp_path, monkeypatch):
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch)
+    result = run()
+    assert docker.cid == "id-smol-agent-t" and result["container"]["id"] == docker.cid and result["container"]["name"] == "smol-agent-t"
+    assert events == ["create", "inspect", "start", "kill", "rm", "inspect"]
+    assert [t for t in docker.targets if t[0] != "create"] == [("inspect", docker.cid), ("kill", docker.cid), ("rm", docker.cid), ("inspect", docker.cid)]
+    assert docker.removed and not docker.touched_other
+
+
+def test_a_successful_create_that_prints_no_id_is_cleaned_up_by_the_name_it_created(tmp_path, monkeypatch):
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch, create_stdout="")
+    run()
+    assert docker.cid == "smol-agent-t" and [t for t in docker.targets if t[0] in ("kill", "rm")] == [("kill", "smol-agent-t"), ("rm", "smol-agent-t")] and docker.removed
+
+
+@pytest.mark.parametrize("how", ["timeout", "raises", "refused"])
+def test_cleanup_after_a_created_container_uses_the_id_and_keeps_its_order_on_every_exit(tmp_path, monkeypatch, how):
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch, edit=(lambda i: i["HostConfig"].update(NetworkMode="bridge")) if how == "refused" else None)
+    if how == "timeout":
+        monkeypatch.setattr(pilot, "run_agent_phase", lambda agent_dir, params, timeout_s, cmd=None: (events.append("start"), {"command": cmd, "exit_code": None, "timed_out": True, "seconds": 5.0})[1])
+    if how == "raises":
+        def boom(*a, **k):
+            events.append("start")
+            raise RuntimeError("boom")
+        monkeypatch.setattr(pilot, "run_agent_phase", boom)
+    if how == "timeout":
+        assert run()["timed_out"] is True
+    else:
+        with pytest.raises((RuntimeError, pilot.PilotError)):
+            run()
+    tail = events[events.index("start") + 1:] if "start" in events else events[2:]
+    assert tail == ["kill", "rm", "inspect"] and docker.removed and not docker.touched_other
+    assert [t for t in docker.targets if t[0] in ("kill", "rm")] == [("kill", docker.cid), ("rm", docker.cid)]
 
 
 def test_run_json_limits_equal_the_values_passed_to_docker_and_the_inspect_evidence_is_recorded(dataset, tmp_path, monkeypatch):
