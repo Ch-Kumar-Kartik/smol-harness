@@ -1421,7 +1421,40 @@ def docker_mounts(command: list[str]) -> list[tuple[str, str, str]]:
     return out
 
 
-def test_the_docker_agent_gets_exactly_the_mounts_it_needs_and_never_the_repo_root_or_the_dataset(tmp_path):
+def fake_interpreters(tmp_path):
+    """Two fake venvs. `system`: the venv's python links to an interpreter under a fake /usr. `managed`: uv-style, the link goes through an ALIAS directory
+    (cpython-3.12) that is itself a link to the versioned base prefix (cpython-3.12.1), as `~/.local/share/uv/python` does."""
+    root = tmp_path / "fakepy"
+    usr = root / "usr"
+    (usr / "bin").mkdir(parents=True)
+    (usr / "bin" / "python3.12").write_text("#!/bin/sh\n")
+    (usr / "bin" / "python3.12").chmod(0o755)
+    managed = root / "managed"
+    base = managed / "cpython-3.12.1"
+    (base / "bin").mkdir(parents=True)
+    (base / "bin" / "python3.12").write_text("#!/bin/sh\n")
+    (base / "bin" / "python3.12").chmod(0o755)
+    alias = managed / "cpython-3.12"
+    alias.symlink_to(base.name)
+    venvs = {}
+    for kind, target, home in (("system", usr / "bin" / "python3.12", usr / "bin"), ("managed", alias / "bin" / "python3.12", alias / "bin")):
+        venv = root / f"venv-{kind}"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin" / "python").symlink_to(target)
+        (venv / "pyvenv.cfg").write_text(f"home = {home}\nimplementation = CPython\n")
+        venvs[kind] = venv
+    return SimpleNamespace(root=root, usr=usr, base=base, alias=alias, venvs=venvs)
+
+
+def use_env(monkeypatch, env, kind):
+    """Make the driver see the fake `system` or `managed` venv as its own (sys.prefix, sys.base_prefix and the system roots)."""
+    monkeypatch.setattr(sys, "prefix", str(env.venvs[kind]))
+    monkeypatch.setattr(sys, "base_prefix", str(env.usr if kind == "system" else env.base))
+    monkeypatch.setattr(pilot, "SYSTEM_RUNTIME_ROOTS", (str(env.usr),))
+
+
+def test_the_docker_agent_gets_exactly_the_mounts_it_needs_and_never_the_repo_root_or_the_dataset(tmp_path, monkeypatch):
+    use_env(monkeypatch, fake_interpreters(tmp_path), "system")  # an interpreter under the system roots: the mount list is the fixed one, whatever the host's venv is
     run = tmp_path / "run"
     agent_dir, bridge_dir = run / "agent", tmp_path / "cb-x"
     bridge_dir.mkdir()
@@ -1445,6 +1478,192 @@ def test_the_docker_agent_gets_exactly_the_mounts_it_needs_and_never_the_repo_ro
         assert resolved != real_dataset and resolved not in real_dataset.parents and real_dataset not in resolved.parents, (src, dst)
     assert "PYTHONPATH=/repo/src" in command and command[-1].startswith("exec /venv/bin/python /repo/experiments/coding_eval/rich3278_pilot.py agent-child")
     assert json.loads((agent_dir / "params.docker.json").read_text())["workspace"] == "/agent/workspace"
+
+
+def plan_for(tmp_path, protected=None):
+    run = tmp_path / "run"
+    agent_dir, bridge_dir = run / "agent", tmp_path / "cb-x"
+    bridge_dir.mkdir(exist_ok=True)
+    protected = protected or (tmp_path / "ds", run / "evaluator", run / "evaluator" / "pristine")
+    return pilot.docker_agent_plan(agent_dir, bridge_dir, docker_params(agent_dir), protected=protected, **create_kwargs())
+
+
+def test_an_interpreter_under_the_system_roots_adds_no_mount(tmp_path, monkeypatch):
+    env = fake_interpreters(tmp_path)
+    use_env(monkeypatch, env, "system")
+    plan = plan_for(tmp_path)
+    targets = sorted(dst for _, dst, _ in docker_mounts(plan["argv"]))
+    assert targets == sorted(["/agent", "/bridge", "/repo/src", "/repo/experiments/coding_eval/rich3278_pilot.py", "/venv", "/usr", "/lib"] + (["/lib64"] if Path("/lib64").exists() else []))
+    assert not any(str(env.base) in b for b in plan["expected"]["binds"])
+    assert pilot.agent_interpreter_mount(env.venvs["system"], env.usr, system_roots=(str(env.usr),)) is None
+    own = tmp_path / "own"  # a venv that holds its own interpreter needs nothing either
+    (own / "bin").mkdir(parents=True)
+    (own / "bin" / "python").write_text("x")
+    assert pilot.agent_interpreter_mount(own, tmp_path, system_roots=(str(env.usr),)) is None
+
+
+def test_an_interpreter_outside_the_system_roots_adds_exactly_one_read_only_mount_at_the_path_the_venv_uses(tmp_path, monkeypatch):
+    env = fake_interpreters(tmp_path)
+    use_env(monkeypatch, env, "system")
+    fixed = sorted(dst for _, dst, _ in docker_mounts(plan_for(tmp_path)["argv"]))
+    use_env(monkeypatch, env, "managed")
+    plan = plan_for(tmp_path)
+    mounts = docker_mounts(plan["argv"])
+    assert sorted(dst for _, dst, _ in mounts) == sorted([*fixed, str(env.alias)])  # exactly one more target
+    extra = [(src, dst, mode) for src, dst, mode in mounts if dst == str(env.alias)]
+    assert extra == [(str(env.base), str(env.alias), "ro")]  # the resolved base prefix, read-only, at the alias path the venv's link and pyvenv.cfg name
+    assert f"{env.base}:{env.alias}:ro" in plan["expected"]["binds"] and (str(env.alias), "bind", False) in plan["expected"]["mounts"]  # what verify expects of the real inspect
+    assert inspect_from_create(plan["argv"])["HostConfig"]["Binds"].count(f"{env.base}:{env.alias}:ro") == 1
+    assert pilot.verify_agent_container(inspect_from_create(plan["argv"]), plan["expected"]) == []
+
+
+def test_an_interpreter_outside_the_system_roots_without_an_alias_is_mounted_at_its_own_path(tmp_path, monkeypatch):
+    env = fake_interpreters(tmp_path)
+    venv = tmp_path / "plainvenv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(env.base / "bin" / "python3.12")
+    assert pilot.agent_interpreter_mount(venv, env.base, system_roots=(str(env.usr),)) == (str(env.base), str(env.base))
+
+
+def test_the_extra_mount_is_in_run_json_and_in_the_inspect_read_back(dataset, tmp_path, monkeypatch):
+    env = fake_interpreters(tmp_path)
+    use_env(monkeypatch, env, "managed")
+    events, docker, cfg = docker_pilot(dataset, tmp_path, monkeypatch)
+    record = pilot.run_pilot(cfg, FakeRunner())
+    bind = f"{env.base}:{env.alias}:ro"
+    assert record["status"] == "complete" and bind in record["sandbox"]["isolation"]["Binds"] and bind in [a for a in record["agent"]["command"]]
+
+
+@pytest.mark.parametrize("label,edit", [
+    ("the extra mount missing from the inspect", lambda i, env: (i["HostConfig"].update(Binds=[b for b in i["HostConfig"]["Binds"] if str(env.alias) not in b]),
+                                                                 i.update(Mounts=[m for m in i["Mounts"] if m["Destination"] != str(env.alias)]))),
+    ("an extra mount beyond it", lambda i, env: (i["HostConfig"]["Binds"].append("/home/x:/h:ro"), i["Mounts"].append({"Type": "bind", "Source": "/home/x", "Destination": "/h", "Mode": "ro", "RW": False}))),
+    ("the extra mount writable", lambda i, env: (i["HostConfig"].update(Binds=[b[:-3] + ":rw" if str(env.alias) in b else b for b in i["HostConfig"]["Binds"]]),
+                                                 [m.update(RW=True) for m in i["Mounts"] if m["Destination"] == str(env.alias)])),
+])
+def test_verify_agent_container_refuses_a_read_back_that_differs_in_the_interpreter_mount(tmp_path, monkeypatch, label, edit):
+    env = fake_interpreters(tmp_path)
+    use_env(monkeypatch, env, "managed")
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch, edit=lambda info: edit(info, env))
+    with pytest.raises(pilot.PilotError, match="refusing to start"):
+        run()
+    assert "start" not in events and events[2:] == ["kill", "rm", "inspect"], label
+
+
+def _early_case(tmp_path, name):
+    """A venv whose python links to <tmp>/<name>/bin/python3 (a real executable), plus the directories the checks compare against."""
+    base = tmp_path / name
+    (base / "bin").mkdir(parents=True, exist_ok=True)
+    exe = base / "bin" / "python3"
+    exe.write_text("x")
+    exe.chmod(0o755)
+    venv = tmp_path / f"venv-{name}"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(exe)
+    return venv, base
+
+
+def test_early_check_a_the_interpreter_must_be_under_a_mounted_location(tmp_path):
+    venv, base = _early_case(tmp_path, "py")
+    elsewhere = tmp_path / "other-base"
+    elsewhere.mkdir()
+    with pytest.raises(pilot.PilotError, match="not under any location mounted") as caught:
+        pilot.agent_interpreter_mount(venv, elsewhere, system_roots=("/nonexistent",), home=tmp_path / "h", repo=tmp_path / "r")
+    assert str(base / "bin" / "python3") in str(caught.value)
+    dangling = tmp_path / "venv-dangling"
+    (dangling / "bin").mkdir(parents=True)
+    (dangling / "bin" / "python").symlink_to(tmp_path / "gone" / "python3")
+    with pytest.raises(pilot.PilotError, match="does not exist") as caught:
+        pilot.agent_interpreter_mount(dangling, base, system_roots=("/nonexistent",))
+    assert str(dangling / "bin" / "python") in str(caught.value)
+    host_path = tmp_path / "venv-hostlink"  # an absolute link to the venv's own host path would not exist inside the container (/venv)
+    (host_path / "bin").mkdir(parents=True)
+    (host_path / "bin" / "real").write_text("x")
+    (host_path / "bin" / "python").symlink_to(host_path / "bin" / "real")
+    with pytest.raises(pilot.PilotError, match="host path of the venv"):
+        pilot.agent_interpreter_mount(host_path, base, system_roots=("/nonexistent",))
+
+
+@pytest.mark.parametrize("label,base_of,home_of,repo_of", [
+    ("the filesystem root", lambda t, b: Path("/"), lambda t, b: t / "home" / "u", lambda t, b: t / "repo"),
+    ("the home directory", lambda t, b: b, lambda t, b: b, lambda t, b: t / "repo"),
+    ("a parent of the home directory (such as /home)", lambda t, b: b, lambda t, b: b / "sub" / "u", lambda t, b: t / "repo"),
+    ("the repository root", lambda t, b: b, lambda t, b: t / "home" / "u", lambda t, b: b),
+    ("a directory that contains the repository", lambda t, b: b, lambda t, b: t / "home" / "u", lambda t, b: b / "work" / "repo"),
+])
+def test_early_check_b_the_base_prefix_is_never_the_root_home_a_parent_of_home_or_the_repository(tmp_path, label, base_of, home_of, repo_of):
+    venv, base = _early_case(tmp_path, "py")
+    with pytest.raises(pilot.PilotError, match="refusing to mount the base prefix") as caught:
+        pilot.agent_interpreter_mount(venv, base_of(tmp_path, base), system_roots=("/nonexistent",), home=home_of(tmp_path, base), repo=repo_of(tmp_path, base))
+    assert str(base_of(tmp_path, base).resolve()) in str(caught.value), label
+
+
+@pytest.mark.parametrize("guarded", ["equals", "inside"])
+def test_early_check_b_the_base_prefix_never_equals_or_contains_a_protected_directory(tmp_path, guarded):
+    venv, base = _early_case(tmp_path, "py")
+    protected = base if guarded == "equals" else base / "ds"
+    with pytest.raises(pilot.PilotError, match="protected directory"):
+        pilot.agent_interpreter_mount(venv, base, protected=(protected,), system_roots=("/nonexistent",), home=tmp_path / "h", repo=tmp_path / "r")
+
+
+def test_early_check_c_the_base_prefix_must_hold_a_python_executable(tmp_path):
+    base = tmp_path / "nobin"
+    (base / "lib").mkdir(parents=True)
+    exe = base / "lib" / "python3"
+    exe.write_text("x")
+    exe.chmod(0o755)
+    venv = tmp_path / "venv-nobin"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(exe)
+    with pytest.raises(pilot.PilotError, match="not a directory with a python executable") as caught:
+        pilot.agent_interpreter_mount(venv, base, system_roots=("/nonexistent",), home=tmp_path / "h", repo=tmp_path / "r")
+    assert str(base) in str(caught.value)
+    (base / "bin").mkdir()
+    (base / "bin" / "python3").write_text("x")  # present but not executable
+    with pytest.raises(pilot.PilotError, match="not a directory with a python executable"):
+        pilot.agent_interpreter_mount(venv, base, system_roots=("/nonexistent",), home=tmp_path / "h", repo=tmp_path / "r")
+
+
+def test_the_early_checks_fire_before_any_docker_call_and_before_anything_is_written(tmp_path, monkeypatch):
+    env = fake_interpreters(tmp_path)
+    use_env(monkeypatch, env, "managed")
+    monkeypatch.setattr(pilot.os.path, "expanduser", lambda p: str(env.base) if p == "~" else p)  # the base prefix IS the home directory
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch)
+    with pytest.raises(pilot.PilotError, match="refusing to mount the base prefix"):
+        run()
+    assert events == [] and not (tmp_path / "run" / "agent" / "params.docker.json").exists()
+
+
+def test_a_refused_run_prints_the_reason_on_stderr_and_keeps_the_exit_code_and_the_json_line(tmp_path, monkeypatch, capsys):
+    record = {"run_id": "r", "status": "refused", "error": "the agent sandbox is unavailable (bwrap not found); refusing to run the agent as the plain host user", "resolved": False}
+    monkeypatch.setattr(pilot, "run_pilot", lambda cfg, runner, **kw: record)
+    code = pilot.main(["run", "--out", str(tmp_path / "out"), "--dataset-dir", str(tmp_path / "ds"), "--model", "m:1", "--allow-model-call"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.err.strip() == f"refused: {record['error']}"
+    assert json.loads(captured.out.strip().splitlines()[-1])["status"] == "refused" and "refused:" not in captured.out
+    record.update(status="complete", error=None)
+    assert pilot.main(["run", "--out", str(tmp_path / "out"), "--dataset-dir", str(tmp_path / "ds"), "--model", "m:1", "--allow-model-call"]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_a_missing_python_dir_error_names_the_flag_and_the_unverified_system_python_alternative(tmp_path, monkeypatch):
+    with pytest.raises(pilot.PilotError, match="--python-dir") as caught:
+        pilot.prepare_env(tmp_path / "nope", tmp_path / "wheels", tmp_path / "out" / "site")
+    assert "--python-dir /usr" in str(caught.value) and "unverified" in str(caught.value) and str(tmp_path / "nope") in str(caught.value)
+
+    class CopyFails(FakeDocker):
+        def __call__(self, args, **kw):
+            import subprocess
+
+            if args[1] == "cp" and args[-1].endswith(":/opt/python"):
+                self.calls.append(list(args))
+                return subprocess.CompletedProcess(args, 1, "", "no such file or directory")
+            return super().__call__(args, **kw)
+
+    monkeypatch.setattr(pilot.subprocess, "run", CopyFails())
+    with pytest.raises(pilot.PilotError, match=r"docker cp to /opt/python failed.*--python-dir .*--python-dir /usr"):
+        docker_runner(tmp_path).run(tmp_path / "ws", "true", "cand", tmp_path / "logs")
 
 
 def test_a_mount_source_that_equals_contains_or_lies_inside_a_protected_directory_is_refused(tmp_path):

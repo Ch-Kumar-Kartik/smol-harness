@@ -377,7 +377,8 @@ class DockerRunner:
             for src, dst in copies:
                 cp = self._docker("cp", "-q", str(src), f"{name}:{dst}", timeout=300)
                 if cp.returncode != 0:
-                    raise PilotError(f"docker cp to {dst} failed: {cp.stderr.strip()}")
+                    hint = f"; if --python-dir {self.python_dir} is not a standalone CPython 3.12 of this machine's architecture, pass --python-dir with one (`--python-dir /usr` uses the system Python; that mode is unverified)" if dst == "/opt/python" else ""
+                    raise PilotError(f"docker cp to {dst} failed: {cp.stderr.strip()}{hint}")
             host = json.loads(self._docker("inspect", name).stdout)[0]["HostConfig"]
             mounts = host.get("Mounts") or []
             allowed_runtime_mounts = self.system_python and all(
@@ -821,6 +822,74 @@ def check_mount_sources(mounts: list[tuple[str, str]], protected: tuple[Path, ..
                 raise PilotError(f"refusing to mount {source!r} at {target!r} into the agent container: it equals, contains or lies inside the protected directory {str(guarded)!r}")
 
 
+SYSTEM_RUNTIME_ROOTS = ("/usr", "/lib", "/lib64")  # always mounted read-only, at the same path, in the agent container
+
+
+def _inside(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def agent_interpreter_mount(prefix: Path, base_prefix: Path, *, protected: tuple[Path, ...] = (), repo: Path | None = None, home: Path | None = None,
+                            system_roots: tuple[str, ...] = SYSTEM_RUNTIME_ROOTS) -> tuple[str, str] | None:
+    """The ONE extra read-only mount `/venv/bin/python` needs, or None.
+
+    The container runs `/venv/bin/python`, which for a uv-managed or otherwise non-system venv is a symlink to an interpreter outside `/venv`, `/usr`, `/lib` and
+    `/lib64`; that link would dangle in the container. If the interpreter's real path is under `system_roots`, or the venv holds the interpreter itself, nothing is added.
+    Otherwise the base prefix (`base_prefix`, resolved, read-only) is mounted at the path the venv's link and `pyvenv.cfg` use (the same path unless that path is an
+    alias of the resolved one). Returns `(host source, container path)`. Every refusal is a `PilotError` that names the path, raised before any docker call."""
+    prefix, repo = Path(prefix), Path(repo or REPO).resolve()
+    home = Path(home if home is not None else os.path.expanduser("~")).resolve()
+    roots = [Path(r) for r in system_roots]
+    python = prefix / "bin" / "python"
+    if not python.exists():
+        raise PilotError(f"the venv's interpreter {python} does not exist (or is a dangling link), so /venv/bin/python cannot start in the agent container")
+    outside, link = None, python
+    for _ in range(40):
+        if not link.is_symlink():
+            break
+        raw = Path(os.readlink(link))
+        target = Path(os.path.normpath(raw if raw.is_absolute() else link.parent / raw))
+        if raw.is_absolute() and _inside(target, prefix):
+            raise PilotError(f"the venv's interpreter link {link} points at {target}, the host path of the venv itself; that path does not exist inside the agent container (the venv is at /venv)")
+        if not _inside(target, prefix):
+            outside = target
+            break
+        link = target
+    else:
+        raise PilotError(f"the venv's interpreter {python} is a chain of more than 40 symlinks")
+    real = python.resolve()
+    if outside is None:
+        return None  # the venv holds its own interpreter: it is inside the /venv mount
+    if any(_inside(real, root) for root in roots):
+        return None
+    base = Path(base_prefix).resolve()
+    if not _inside(real, base):
+        raise PilotError(f"the interpreter's real path {real} is not under any location mounted in the agent container: it is outside {', '.join(system_roots)}, /venv and the base prefix {base}")
+    dest = Path(os.path.dirname(os.path.dirname(outside)))
+    if dest.resolve() != base:
+        dest = base
+    if not _inside(outside, dest):
+        raise PilotError(f"the venv's interpreter link {python} -> {outside} is not under the base prefix {dest} that would be mounted, so it would dangle in the agent container")
+    cfg = prefix / "pyvenv.cfg"
+    if cfg.exists():
+        for line in cfg.read_text().splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "home" and value.strip() and not _inside(Path(os.path.normpath(value.strip())), dest):
+                raise PilotError(f"pyvenv.cfg of {prefix} says home = {value.strip()}, which is not under the base prefix {dest} that would be mounted in the agent container")
+    if base == Path("/") or base == home or base in home.parents or base == Path("/home"):
+        raise PilotError(f"refusing to mount the base prefix {base} into the agent container: it is the root, the home directory or one of its parents")
+    if base == repo or base in repo.parents:
+        raise PilotError(f"refusing to mount the base prefix {base} into the agent container: it equals or contains the repository root {repo}")
+    for guarded in protected:
+        p = Path(guarded).resolve()
+        if base == p or base in p.parents:
+            raise PilotError(f"refusing to mount the base prefix {base} into the agent container: it equals or contains the protected directory {str(guarded)!r}")
+    bindir = base / "bin"
+    if not bindir.is_dir() or not any(f.name.startswith("python") and f.is_file() and os.access(f, os.X_OK) for f in bindir.iterdir()):
+        raise PilotError(f"the base prefix {base} to be mounted is not a directory with a python executable in {bindir}")
+    return str(base), str(dest)
+
+
 # The environment and the one command of the agent container. The `docker create` argument list and the expectations its read-back is checked against
 # (`docker_agent_plan`) are both built from these and from the same limits dict, so the two cannot drift apart.
 AGENT_CONTAINER_ENV = (("HOME", "/tmp"), ("PATH", "/usr/bin:/bin"), ("PYTHONPATH", "/repo/src"), ("PYTHONNOUSERSITE", "1"), ("PYTHONDONTWRITEBYTECODE", "1"))
@@ -843,7 +912,7 @@ def docker_agent_plan(agent_dir: Path, bridge_dir: Path, params: dict, *, protec
     """The `docker create` argument list for the agent container and what `docker inspect` must show of it (`{"argv": [...], "expected": {...}}`).
 
     The container gets exactly: the run's agent directory and the bridge directory (writable), and read-only `src/`, this driver file, the venv, `/usr`, `/lib` and
-    `/lib64`. The repository root is NOT mounted (it holds `dataset/`), and `protected` (required: the dataset, the evaluator directory, the pristine copy) is checked
+    `/lib64`, plus ONE more read-only mount, the venv interpreter's base prefix, when the interpreter is outside those (`agent_interpreter_mount`). The repository root is NOT mounted (it holds `dataset/`), and `protected` (required: the dataset, the evaluator directory, the pristine copy) is checked
     against every mount source before anything is written or built; a conflict raises `PilotError`. The image's `VOLUME /data` is masked by a tmpfs and the working
     directory is `/agent`, as in the evaluator's container. The container is created (not run): `run_agent_container` reads it back before it is started."""
     prefix = Path(sys.prefix).resolve()
@@ -858,6 +927,11 @@ def docker_agent_plan(agent_dir: Path, bridge_dir: Path, params: dict, *, protec
     ]
     if Path("/lib64").exists():
         ro_mounts.append(("/lib64", "/lib64"))
+    extra = agent_interpreter_mount(prefix, Path(sys.base_prefix), protected=protected, system_roots=SYSTEM_RUNTIME_ROOTS)  # None when the interpreter is under /usr, /lib or /lib64
+    if extra:
+        if extra[1] in {dst for _, dst in [*rw_mounts, *ro_mounts]}:
+            raise PilotError(f"the base prefix mount target {extra[1]!r} collides with another mount of the agent container")
+        ro_mounts.append(extra)
     check_mount_sources([*rw_mounts, *ro_mounts], protected)
     translated = dict(params)
     for key in ("config_path", "prompt_path", "out_dir", "workspace"):
@@ -1304,6 +1378,9 @@ def run_pilot(cfg: RunConfig, runner, *, agent_cmd: list[str] | None = None) -> 
 # ---- command line ---------------------------------------------------------------------------------------------------------------
 def prepare_env(python_dir: Path, wheels_dir: Path, site_dir: Path) -> dict:
     """Offline install of the task's test dependencies from the dataset's wheels (wheels are unpacked, never built or executed)."""
+    if not (Path(python_dir).resolve() / "bin" / "python3").exists():
+        raise PilotError(f"--python-dir {python_dir} has no bin/python3: pass --python-dir with a standalone CPython 3.12 of this machine's architecture "
+                         "(the default is an x86_64 uv-managed one); `--python-dir /usr` uses the system Python, which is unverified")
     site_dir.parent.mkdir(parents=True, exist_ok=True)
     cache = site_dir.parent / "uvcache"
     cmd = ["uv", "--no-config", "pip", "install", "--offline", "--no-index", "--find-links", str(wheels_dir), "--only-binary", ":all:", "--no-compile",
@@ -1373,6 +1450,8 @@ def main(argv: list[str] | None = None) -> int:
                                       agent_sandbox=args.agent_sandbox, agent_image=args.agent_image, tool_calling_mode=args.tool_calling_mode), runner)
             print(json.dumps({k: rec.get(k) for k in ("run_id", "status", "resolved")} | {"outcome": (rec.get("evaluation") or {}).get("outcome")}
                              | {k: (rec.get("classification") or {}).get(k) for k in ("attempt_outcome", "infrastructure_failure", "counts_as_coding_failure")}))
+            if rec["status"] != "complete":
+                print(f"refused: {rec.get('error')}", file=sys.stderr)  # the reason is also in run.json; the JSON line above stays unchanged
             return 0 if rec["status"] == "complete" else 1
         spec = load_task(tasks, snap, args.task_id)
         if args.command == "evaluate":
