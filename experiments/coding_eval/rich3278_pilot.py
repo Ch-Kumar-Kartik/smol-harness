@@ -908,7 +908,8 @@ def docker_limits(limits: SandboxLimits) -> dict:
             "fsize_bytes": limits.fsize_bytes, "core": 0, "tmp_tmpfs": "rw,noexec,nosuid,nodev,size=256m", "data_tmpfs": "rw,noexec,nosuid,nodev,size=16m"}
 
 
-def docker_agent_plan(agent_dir: Path, bridge_dir: Path, params: dict, *, protected: tuple[Path, ...], name: str, run_id: str, limits: dict, image: str = "redis:7") -> dict:
+def docker_agent_plan(agent_dir: Path, bridge_dir: Path, params: dict | None, *, protected: tuple[Path, ...], name: str, run_id: str, limits: dict, image: str = "redis:7",
+                      script: str = AGENT_CONTAINER_SCRIPT) -> dict:
     """The `docker create` argument list for the agent container and what `docker inspect` must show of it (`{"argv": [...], "expected": {...}}`).
 
     The container gets exactly: the run's agent directory and the bridge directory (writable), and read-only `src/`, this driver file, the venv, `/usr`, `/lib` and
@@ -933,11 +934,12 @@ def docker_agent_plan(agent_dir: Path, bridge_dir: Path, params: dict, *, protec
             raise PilotError(f"the base prefix mount target {extra[1]!r} collides with another mount of the agent container")
         ro_mounts.append(extra)
     check_mount_sources([*rw_mounts, *ro_mounts], protected)
-    translated = dict(params)
-    for key in ("config_path", "prompt_path", "out_dir", "workspace"):
-        translated[key] = str(container_agent / Path(params[key]).relative_to(agent_dir))
-    translated["bridge"] = {**params["bridge"], "socket": "/bridge/m.sock"}
-    (agent_dir / "params.docker.json").write_text(json.dumps(translated))
+    if params is not None:  # None: the no-model `sandbox-check`, which has no agent parameters to translate
+        translated = dict(params)
+        for key in ("config_path", "prompt_path", "out_dir", "workspace"):
+            translated[key] = str(container_agent / Path(params[key]).relative_to(agent_dir))
+        translated["bridge"] = {**params["bridge"], "socket": "/bridge/m.sock"}
+        (agent_dir / "params.docker.json").write_text(json.dumps(translated))
     user = f"{os.getuid()}:{os.getgid()}"
     binds = [f"{src}:{dst}:rw" for src, dst in rw_mounts] + [f"{src}:{dst}:ro" for src, dst in ro_mounts]
     argv = [
@@ -954,9 +956,9 @@ def docker_agent_plan(agent_dir: Path, bridge_dir: Path, params: dict, *, protec
         argv += ["-v", bind]
     for key, value in AGENT_CONTAINER_ENV:
         argv += ["-e", f"{key}={value}"]
-    argv += ["--entrypoint", "bash", image, "-c", AGENT_CONTAINER_SCRIPT]
+    argv += ["--entrypoint", "bash", image, "-c", script]
     expected = {
-        "user": user, "workdir": "/agent", "entrypoint": ["bash"], "cmd": ["-c", AGENT_CONTAINER_SCRIPT],
+        "user": user, "workdir": "/agent", "entrypoint": ["bash"], "cmd": ["-c", script],
         "memory": _bytes(limits["memory"].upper()), "memory_swap": _bytes(limits["memory_swap"].upper()), "pids_limit": limits["pids_limit"],
         "nano_cpus": round(float(limits["cpus"]) * 1_000_000_000),
         "ulimits": {"nofile": limits["nofile"], "fsize": limits["fsize_bytes"], "core": limits["core"]},
@@ -1057,8 +1059,8 @@ def remove_agent_container(target: str) -> dict:
     return steps
 
 
-def run_agent_container(agent_dir: Path, bridge_dir: Path, params: dict, timeout_s: float, *, name: str, run_id: str, protected: tuple[Path, ...], image: str, limits: dict,
-                        inspect_path: Path) -> dict:
+def run_agent_container(agent_dir: Path, bridge_dir: Path, params: dict | None, timeout_s: float, *, name: str, run_id: str, protected: tuple[Path, ...], image: str, limits: dict,
+                        inspect_path: Path, script: str = AGENT_CONTAINER_SCRIPT) -> dict:
     """Create the agent container, read it back, start it, and ALWAYS stop and remove it before returning (or raising), once this run has created it.
 
     create -> `docker inspect` -> verify (`verify_agent_container`; any mismatch refuses to start) -> `docker start -a` under the wall-clock limit of `run_agent_phase`.
@@ -1066,8 +1068,10 @@ def run_agent_container(agent_dir: Path, bridge_dir: Path, params: dict, timeout
     the ID that create printed (`remove_agent_container`), on every exit: normal, timeout, refusal and exception. A cleanup that cannot be confirmed raises
     `ContainerCleanupError`, which keeps the candidate from being collected. If `docker create` fails (an unknown image, or a name that something else already holds),
     nothing is killed, removed or inspected: the container that holds the name is not ours. The full inspect result is written to `inspect_path` (outside the agent
-    directory) before it is judged. Known limit: a create that errors after the daemon made the container (the client died) leaves that container behind."""
-    plan = docker_agent_plan(agent_dir, bridge_dir, params, protected=protected, name=name, run_id=run_id, limits=limits, image=image)
+    directory) before it is judged. Known limit: a create that errors after the daemon made the container (the client died) leaves that container behind.
+
+    `params=None` and `script` are for the no-model `sandbox-check` only (no agent parameters, another command in the same container); the mounts and every check are the same."""
+    plan = docker_agent_plan(agent_dir, bridge_dir, params, protected=protected, name=name, run_id=run_id, limits=limits, image=image, script=script)
     start = ["docker", "start", "-a", name]
     created = _docker_cli(*plan["argv"][1:])
     if created.returncode != 0:
@@ -1090,7 +1094,7 @@ def run_agent_container(agent_dir: Path, bridge_dir: Path, params: dict, timeout
         hc, cfg = info["HostConfig"], info.get("Config") or {}
         isolation = {**{k: hc.get(k) for k in ("NetworkMode", "IpcMode", "Privileged", "ReadonlyRootfs", "CapDrop", "SecurityOpt", "Init", "Memory", "MemorySwap", "PidsLimit", "NanoCpus", "Tmpfs")},
                      "Binds": sorted(hc.get("Binds") or []), "User": cfg.get("User"), "WorkingDir": cfg.get("WorkingDir")}
-        result = run_agent_phase(agent_dir, params, timeout_s, start)
+        result = run_agent_phase(agent_dir, params if params is not None else {}, timeout_s, start)
     finally:
         try:
             cleanup = remove_agent_container(cid)
@@ -1099,6 +1103,265 @@ def run_agent_container(agent_dir: Path, bridge_dir: Path, params: dict, timeout
             raise
     result.update(command=plan["argv"], start_command=start, container={"name": name, "id": cid, "inspect_file": inspect_path.name, "isolation": isolation, "cleanup": cleanup})
     return result
+
+
+# ---- sandbox-check: the agent container with its real mounts and no model -------------------------------------------------------
+# The diagnostic below runs INSIDE the container, under the venv's python and the environment of the real agent child (PYTHONPATH=/repo/src). It only observes and
+# writes /agent/sandbox_check.json; the driver judges that file on the host (`evaluate_sandbox_check`). Arguments (all optional, defaults are the in-container paths):
+# output path, plan path, and the host:port of the connect probe (192.0.2.1 is TEST-NET-1: no route may exist to it).
+SANDBOX_CHECK_SCRIPT = r"""
+import importlib, importlib.metadata, importlib.util, json, os, platform, socket, sys, time
+out = sys.argv[1] if len(sys.argv) > 1 else "/agent/sandbox_check.json"
+plan_path = sys.argv[2] if len(sys.argv) > 2 else "/agent/sandbox_check_plan.json"
+host, _, port = (sys.argv[3] if len(sys.argv) > 3 else "192.0.2.1:9").rpartition(":")
+r = {}
+
+
+def step(name, fn):
+    try:
+        r[name] = fn()
+    except BaseException as exc:
+        r[name] = {"error": type(exc).__name__ + ": " + str(exc)}
+
+
+def mountinfo():
+    rows = []
+    for line in open("/proc/self/mountinfo").read().splitlines():
+        left, _, right = line.partition(" - ")
+        f, g = left.split(), right.split()
+        rows.append({"mount_point": f[4].replace("\\040", " "), "options": f[5].split(","), "fstype": g[0], "source": g[1] if len(g) > 1 else None})
+    return rows
+
+
+def last_mount(point):
+    rows = [m for m in mountinfo() if m["mount_point"] == point]
+    return rows[-1] if rows else None
+
+
+def writable(path):
+    probe = os.path.join(path, ".sbx_probe_" + str(os.getpid()))
+    try:
+        fd = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        os.unlink(probe)
+        return {"writable": True}
+    except OSError as exc:
+        return {"writable": False, "errno": exc.errno, "error": exc.strerror}
+
+
+def try_import(statement):
+    try:
+        exec(statement, {})
+        return {"ok": True}
+    except BaseException as exc:
+        return {"ok": False, "error": type(exc).__name__ + ": " + str(exc)}
+
+
+def package(name):
+    res = try_import("import " + name)
+    if res["ok"]:
+        mod = importlib.import_module(name)
+        version = getattr(mod, "__version__", None)
+        if version is None:
+            try:
+                version = importlib.metadata.version(name.replace("_", "-"))
+            except Exception:
+                version = None
+        res["version"] = version
+    return res
+
+
+def driver_import():
+    path = "/repo/experiments/coding_eval/rich3278_pilot.py"
+    spec = importlib.util.spec_from_file_location("rich3278_pilot_in_container", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return {"ok": True}
+
+
+def interpreter():
+    real = os.path.realpath("/venv/bin/python")
+    return {"venv_python": "/venv/bin/python", "realpath": real, "exists": os.path.exists(real), "executable": os.access(real, os.X_OK)}
+
+
+def interpreter_mount():
+    plan = json.load(open(plan_path)) if os.path.exists(plan_path) else {}
+    mount = plan.get("interpreter_mount")
+    if not mount:
+        return {"added": False}
+    dest = mount["destination"]
+    row = last_mount(dest)
+    return {"added": True, "source": mount["source"], "destination": dest, "exists": os.path.isdir(dest), "mounted": row is not None,
+            "read_only": bool(row) and "ro" in row["options"], "write_probe": writable(dest) if os.path.isdir(dest) else None}
+
+
+def network():
+    route = open("/proc/net/route").read().splitlines()
+    t0 = time.monotonic()
+    s = socket.socket()
+    s.settimeout(3)
+    try:
+        s.connect((host, int(port)))
+        connected, error = True, None
+    except OSError as exc:
+        connected, error = False, type(exc).__name__ + ": " + str(exc)
+    finally:
+        s.close()
+    return {"route_table": route, "route_entries": len([line for line in route[1:] if line.strip()]), "connected": connected, "connect_error": error,
+            "connect_seconds": round(time.monotonic() - t0, 2), "target": host + ":" + port}
+
+
+step("machine", platform.machine)
+step("python", lambda: {"executable": sys.executable, "prefix": sys.prefix, "base_prefix": sys.base_prefix, "version": sys.version.split()[0]})
+step("interpreter", interpreter)
+step("interpreter_mount", interpreter_mount)
+step("stdlib", lambda: try_import("import sys, encodings, ssl, json"))
+step("ssl", lambda: __import__("ssl").OPENSSL_VERSION)
+step("smol_harness", lambda: package("smol_harness"))
+step("effgen", lambda: package("effgen"))
+step("driver", driver_import)
+step("repo", lambda: sorted(os.listdir("/repo")))
+step("repo_src", lambda: sorted(os.listdir("/repo/src")))
+step("absent_paths", lambda: {p: os.path.lexists(p) for p in ("/repo/dataset", "/repo/.git", "/repo/gemma_eval_runs", "/repo/new_gemma_eval_runs", "/repo/docs")})
+step("cwd", os.getcwd)
+step("data_mount", lambda: last_mount("/data"))
+step("writable", lambda: {p: writable(p) for p in ("/agent", "/repo", "/venv", "/usr")})
+step("network", network)
+step("env_names", lambda: sorted(os.environ))
+step("ids", lambda: str(os.getuid()) + ":" + str(os.getgid()))
+tmp = out + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(r, fh, indent=1)
+os.replace(tmp, out)
+"""
+SANDBOX_CHECK_COMMAND = "exec /venv/bin/python /agent/sandbox_check_diag.py"  # the venv python and the environment of AGENT_CONTAINER_ENV; no mount is added for it
+SANDBOX_CHECK_TIMEOUT_S = 120.0
+_FIXED_AGENT_TARGETS = frozenset({"/agent", "/bridge", "/repo/src", "/repo/experiments/coding_eval/rich3278_pilot.py", "/venv", "/usr", "/lib", "/lib64"})
+
+
+def plan_interpreter_mount(plan: dict) -> dict | None:
+    """The mount of the plan that is not one of the fixed ones (the interpreter's base prefix, if `agent_interpreter_mount` added it): read from the plan itself, so the
+    check observes exactly what `docker_agent_plan` decided and has no logic of its own for it."""
+    extra = [t for t, _, _ in plan["expected"]["mounts"] if t not in _FIXED_AGENT_TARGETS]
+    if not extra:
+        return None
+    if len(extra) != 1:
+        raise PilotError(f"the agent plan has more than one mount beyond the fixed set: {extra}")
+    bind = next(b for b in plan["expected"]["binds"] if b.split(":")[1] == extra[0])
+    return {"source": bind.split(":")[0], "destination": extra[0], "mode": bind.split(":")[2]}
+
+
+def evaluate_sandbox_check(observed: dict, interpreter_mount: dict | None) -> list[dict]:
+    """Compare the in-container observations with what the sandbox is configured to give (one dict per check: name, expected, observed, ok)."""
+    checks: list[dict] = []
+
+    def add(name: str, expected, seen, ok: bool) -> None:
+        checks.append({"name": name, "expected": expected, "observed": seen, "ok": bool(ok)})
+
+    def get(*path, default=None):
+        node = observed
+        for key in path:
+            if not isinstance(node, dict) or key not in node:
+                return default
+            node = node[key]
+        return node
+
+    interp = get("interpreter", default={})
+    add("interpreter resolves inside the container", "realpath of /venv/bin/python exists and is executable",
+        {k: interp.get(k) for k in ("realpath", "exists", "executable")} if isinstance(interp, dict) else interp, isinstance(interp, dict) and interp.get("exists") is True and interp.get("executable") is True)
+    add("standard library imports (sys, encodings, ssl, json)", {"ok": True}, get("stdlib"), get("stdlib", "ok") is True)
+    for name, key in (("smol_harness imports", "smol_harness"), ("effgen imports", "effgen"), ("the driver imports from /repo", "driver")):
+        add(name, {"ok": True}, get(key), get(key, "ok") is True)
+    absent = get("absent_paths", default=None)
+    add("expected-absent paths are absent", "none of /repo/dataset, .git, gemma_eval_runs, new_gemma_eval_runs, docs exists", absent,
+        isinstance(absent, dict) and len(absent) == 5 and not any(absent.values()))
+    repo = get("repo")
+    add("/repo holds only src and experiments", ["experiments", "src"], repo, repo == ["experiments", "src"])
+    add("working directory is /agent", "/agent", get("cwd"), get("cwd") == "/agent")
+    add("/data is a tmpfs", "tmpfs", get("data_mount", "fstype"), get("data_mount", "fstype") == "tmpfs")
+    for path, want in (("/agent", True), ("/repo", False), ("/venv", False), ("/usr", False)):
+        got = get("writable", path, "writable")
+        add(f"{path} is {'writable' if want else 'not writable'}", want, got, got is want)
+    seen = get("interpreter_mount", default={})
+    if interpreter_mount is None:
+        add("no interpreter mount is needed", {"added": False}, seen, isinstance(seen, dict) and seen.get("added") is False)
+    else:
+        ok = (isinstance(seen, dict) and seen.get("added") is True and seen.get("destination") == interpreter_mount["destination"] and seen.get("exists") is True
+              and seen.get("mounted") is True and seen.get("read_only") is True and interpreter_mount["mode"] == "ro" and (seen.get("write_probe") or {}).get("writable") is False)
+        add("the interpreter mount exists inside the container and is read-only", interpreter_mount, seen, ok)
+    net = get("network", default={})
+    add("no route out (empty route table)", 0, net.get("route_entries") if isinstance(net, dict) else net, isinstance(net, dict) and net.get("route_entries") == 0)
+    add("a TCP connect to the TEST-NET address fails within 3 seconds", {"connected": False, "seconds_at_most": 3.5},
+        {k: net.get(k) for k in ("connected", "connect_error", "connect_seconds")} if isinstance(net, dict) else net,
+        isinstance(net, dict) and net.get("connected") is False and isinstance(net.get("connect_seconds"), (int, float)) and net["connect_seconds"] <= 3.5)
+    return checks
+
+
+def sandbox_check(out: Path, dataset_dir: Path, agent_image: str) -> int:
+    """`sandbox-check`: build the real agent plan (same mounts, same verify, same create/inspect/start/kill/rm/gone path as a run) with a fixed diagnostic command and
+    no model, bridge or snapshot; judge what the diagnostic saw. Exit 0 only if every check, the read-back verification and the cleanup passed."""
+    run_id = f"sandbox-check-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}-{secrets.token_hex(2)}"
+    run_dir = out / run_id
+    run_dir.mkdir(parents=True, mode=0o700)
+    agent_dir, eval_dir = run_dir / "agent", run_dir / "evaluator"
+    agent_dir.mkdir(mode=0o700)
+    prefix = Path(sys.prefix)
+    record: dict = {"schema_version": 1, "kind": "sandbox-check", "run_id": run_id, "started": now(), "image": agent_image, "status": "started",
+                    "host": {"uname_m": platform.machine(), "interpreter": str(prefix / "bin" / "python"), "interpreter_realpath": str((prefix / "bin" / "python").resolve()),
+                             "sys_prefix": sys.prefix, "sys_base_prefix": sys.base_prefix, "docker_version": None},
+                    "diagnostic_sha256": sha256_bytes(SANDBOX_CHECK_SCRIPT.encode()), "inspect_file": "agent_container_inspect.json", "verify": None, "cleanup": None,
+                    "interpreter_mount": None, "checks": [], "overall": None, "error": None}
+    bridge_dir = Path(tempfile.mkdtemp(prefix="cb-"))  # the bridge directory is mounted as in a run; nothing listens on it
+    try:
+        shown = _docker_cli("version")
+        record["host"]["docker_version"] = (shown.stdout or shown.stderr).strip()[-2000:]
+        limits = docker_limits(SandboxLimits())
+        name = f"smol-agent-{run_id}"
+        protected = (Path(dataset_dir), eval_dir, eval_dir / "pristine")
+        plan = docker_agent_plan(agent_dir, bridge_dir, None, protected=protected, name=name, run_id=run_id, limits=limits, image=agent_image, script=SANDBOX_CHECK_COMMAND)
+        record["interpreter_mount"] = plan_interpreter_mount(plan)
+        (agent_dir / "sandbox_check_diag.py").write_text(SANDBOX_CHECK_SCRIPT)
+        (agent_dir / "sandbox_check_plan.json").write_text(json.dumps({"interpreter_mount": record["interpreter_mount"]}))
+        try:
+            result = run_agent_container(agent_dir, bridge_dir, None, SANDBOX_CHECK_TIMEOUT_S, name=name, run_id=run_id, protected=protected, image=agent_image, limits=limits,
+                                         inspect_path=run_dir / "agent_container_inspect.json", script=SANDBOX_CHECK_COMMAND)
+        except ContainerCleanupError as exc:
+            record["cleanup"] = {"error": str(exc)}
+            raise
+        record["verify"] = "passed"
+        record["cleanup"] = result["container"]["cleanup"]
+        record["container"] = {"name": name, "id": result["container"]["id"], "exit_code": result.get("exit_code"), "timed_out": result.get("timed_out"), "isolation": result["container"]["isolation"]}
+        produced = agent_dir / "sandbox_check.json"
+        observed = json.loads(produced.read_text()) if produced.exists() else None
+        record["observed"] = observed
+        if observed is None:
+            record["checks"] = [{"name": "the diagnostic produced its result", "expected": "agent/sandbox_check.json", "ok": False,
+                                 "observed": f"no file; exit code {result.get('exit_code')}, timed_out {result.get('timed_out')}; see agent/child.stderr.txt"}]
+        else:
+            record["checks"] = evaluate_sandbox_check(observed, record["interpreter_mount"])
+        if result.get("exit_code") != 0 or result.get("timed_out"):
+            record["checks"].append({"name": "the diagnostic exited cleanly", "expected": "exit code 0, no timeout", "ok": False,
+                                     "observed": {"exit_code": result.get("exit_code"), "timed_out": result.get("timed_out")}})
+        record["status"] = "complete"
+    except PilotError as exc:
+        record.update(status="refused", error=str(exc))
+        if record["verify"] is None and "isolation not as configured" in str(exc):
+            record["verify"] = {"failed": str(exc)}
+    except BaseException as exc:
+        record.update(status="failed", error=f"{type(exc).__name__}: {exc}")
+        raise
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+        record["finished"] = now()
+        record["overall"] = "PASS" if record["status"] == "complete" and record["checks"] and all(c["ok"] for c in record["checks"]) else "FAIL"
+        write_json(run_dir / "sandbox_check.json", record)
+    for c in record["checks"]:
+        print(f"{'PASS' if c['ok'] else 'FAIL'}  {c['name']}: expected {json.dumps(c['expected'])}; observed {json.dumps(c['observed'])[:300]}")
+    if record["error"]:
+        print(f"FAIL  the sandbox could not be checked: {record['error']}")
+    print(f"OVERALL: {record['overall']}  (details: {run_dir / 'sandbox_check.json'})")
+    return 0 if record["overall"] == "PASS" else 1
 
 
 # ---- one run --------------------------------------------------------------------------------------------------------------------
@@ -1424,6 +1687,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--out", type=Path, required=True)
     pe = sub.add_parser("prepare-env", parents=[common], help="install the test dependencies offline from the dataset wheels")
     pe.add_argument("--out", type=Path, required=True)
+    sc = sub.add_parser("sandbox-check", parents=[common], help="the agent container with its real mounts and the venv's python, NO model: observe the container and judge it (no --allow-model-call, no dataset needed)")
+    sc.add_argument("--out", type=Path, required=True)
+    sc.add_argument("--agent-image", default="redis:7")
     ch = sub.add_parser("agent-child", help=argparse.SUPPRESS)
     ch.add_argument("--params", type=Path, required=True)
     return p
@@ -1440,6 +1706,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "prepare-env":
             print(json.dumps(prepare_env(args.python_dir, args.dataset_dir / "wheels", site), indent=1))
             return 0
+        if args.command == "sandbox-check":
+            return sandbox_check(out, args.dataset_dir, args.agent_image)
         runner = DockerRunner(args.python_dir, site, secrets.token_hex(3), image=args.image)
         tasks, snap = args.dataset_dir / "tasks.jsonl", args.dataset_dir / "snapshots" / f"{args.task_id}.tgz"
         if args.command == "run":
