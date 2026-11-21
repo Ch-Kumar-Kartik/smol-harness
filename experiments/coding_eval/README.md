@@ -35,18 +35,27 @@ snapshot.tgz --(sha256 pinned)--> agent workspace (no .git)      evaluator prist
 ## Usage
 
 ```bash
+# Use the same Python directory for every command; /usr is suitable when the host
+# provides Python 3.12 there (including ARM64 hosts).
+PYTHON_DIR=/usr
+
 # 1. once: the test dependencies, installed OFFLINE from the dataset wheels into <out>/env/site (wheels are unpacked, nothing is built or run)
-uv run python experiments/coding_eval/rich3278_pilot.py prepare-env --out /tmp/rich-pilot
+uv run python experiments/coding_eval/rich3278_pilot.py prepare-env --out /tmp/rich-pilot --python-dir "$PYTHON_DIR"
 
 # 2. no agent, no model: the baseline and the gold patch through the evaluator (expect 16 failed/7 passed, then 23 passed)
-uv run python experiments/coding_eval/rich3278_pilot.py reference-check --out /tmp/rich-pilot
+uv run python experiments/coding_eval/rich3278_pilot.py reference-check --out /tmp/rich-pilot --python-dir "$PYTHON_DIR"
 
 # 3. no agent, no model: evaluate any candidate patch file
-uv run python experiments/coding_eval/rich3278_pilot.py evaluate --out /tmp/rich-pilot --patch candidate.patch
+uv run python experiments/coding_eval/rich3278_pilot.py evaluate --out /tmp/rich-pilot --python-dir "$PYTHON_DIR" --patch candidate.patch
 
-# 4. a real run: CALLS THE CONFIGURED MODEL, needs explicit permission on the command line
+# 4. a real run on a host with working bubblewrap: CALLS THE CONFIGURED MODEL, needs explicit permission on the command line
 uv run python experiments/coding_eval/rich3278_pilot.py run --out /tmp/rich-pilot --model <ollama tag> --context-length 8192 \
     --max-tokens 768 --temperature 0.1 --seed 0 --agent-timeout-s 1800 --allow-model-call
+
+# 5. a real run on hosts where unprivileged user/network namespaces are blocked (for example DGX)
+uv run python experiments/coding_eval/rich3278_pilot.py run --out /tmp/rich-pilot --model <ollama tag> \
+    --context-length 8192 --max-tokens 768 --temperature 0.1 --seed 0 --agent-timeout-s 1800 \
+    --agent-sandbox docker --allow-model-call
 ```
 
 `--out` must be outside the repository and the dataset. Each run gets `<out>/<run id>/` with `run.json` (configuration, deviations, agent and candidate metadata,

@@ -327,10 +327,11 @@ Installs the test dependencies (`pytest==8.3.4`, `pygments`, `markdown-it-py`) f
 
 ```bash
 # [CONTROLLER]
-uv run python experiments/coding_eval/rich3278_pilot.py prepare-env --out "$OUT" 2>&1 | tee "$OUT/console/prepare-env.txt"
+uv run python experiments/coding_eval/rich3278_pilot.py prepare-env --out "$OUT" --python-dir /usr 2>&1 | tee "$OUT/console/prepare-env.txt"
 ```
 
 It prints JSON with a `packages` list. A non-zero exit or "offline dependency install failed" means stop.
+Use the same `--python-dir /usr` on `reference-check` and `run`; all three commands must share both `--out` and the Python directory.
 
 ### 6.2 `reference-check` (Docker evaluator)
 
@@ -410,6 +411,12 @@ nvidia-smi
 
 Prerequisites: sections 4.4, 5.3, 5.5 and 6 passed; the tunnel (7.1) is up and 7.3 passed; 7.5 confirmed. Set the model tag you decided in 4.1:
 
+On a DGX Spark where the unprivileged bubblewrap network namespace is blocked, use the
+Docker-backed agent sandbox instead of the default bubblewrap sandbox. Docker must be
+available to the invoking user, and the local evaluator image must be present. This mode
+keeps the agent networkless, drops all capabilities, uses `no-new-privileges`, and mounts
+the host Python/runtime read-only; it does not require `bwrap` or `systemd-run`.
+
 ```bash
 # [CONTROLLER] same terminal where $OUT is set
 export MODEL_TAG="<MODEL_TAG>"
@@ -429,6 +436,7 @@ uv run python experiments/coding_eval/rich3278_pilot.py run \
   --max-iterations 8 \
   --agent-timeout-s 1800 \
   --keep-workspaces \
+  --agent-sandbox docker \
   --allow-model-call 2>&1 | tee "$OUT/console/run.txt"
 echo "driver exit status: ${PIPESTATUS[0]}" | tee "$OUT/console/run-exit.txt"
 date -u +%Y-%m-%dT%H:%M:%SZ | tee "$OUT/console/run-end-utc.txt"

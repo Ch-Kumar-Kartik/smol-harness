@@ -16,3 +16,5 @@ AGENTS.md
 
 # downloaded coding-benchmark dataset (about 21 GB, untrusted third-party repositories, holds reference patches): never commit
 /dataset/
+/embeddings
+/pilot-results/
