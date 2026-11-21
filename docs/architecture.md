@@ -1,7 +1,6 @@
 # Architecture
 
-> **Status:** proposed. **No component below is implemented yet.**
-> Mark a component *Implemented* only after its task in `docs/implementation-plan.md` is Completed.
+> **Status:** implemented, with the as-built notes below and in `docs/implementation-plan.md`. This document began as a design proposal and keeps some of that wording; where it disagrees with the source or the plan, treat the source and the plan as authoritative. See `docs/new-session.md` for the current state.
 > Facts about effGen and the source references behind them are in `docs/effgen-api-audit.md`.
 
 ## 1. Analysis of the smolagents reference diagram
@@ -87,7 +86,7 @@ flowchart TD
 
 Each box is effGen's code unless it names one of our modules: `cli.py`, `harness.py`, `config.py`, `models.py`, `tools.py`, `delegation.py`. The custom code target is **≤ ~600 lines of Python**, excluding tests.
 
-### Proposed package layout (not yet created)
+### Package layout
 
 ```
 pyproject.toml                 # uv project; pins effgen==1.3.0 (or the audited commit)
@@ -112,7 +111,7 @@ tests/           # unit tests use scripted effGen BaseModel fakes (no GPU / netw
 | `config.py` | Parse and validate one YAML file into frozen dataclasses (T3.1, built): `ModelSpec(provider, model, quantization, base_url, context_length, dtype)`, `AgentSpec(name, model, tools, max_iterations, description, system_prompt)`, `Limits(max_delegations, max_report_chars, worker_timeout_s, max_depth)`, `HarnessConfig(workspace, orchestrator, workers, limits)`. Errors are `ConfigError` with a dotted path. Rejects unknown tools / web-browser tools / `delegate` on workers, unsupported or cross-provider quantization, duplicate names (also duplicate YAML keys), non-finite or out-of-range limits. See §8 for the schema decisions. | Load models, construct agents or tools, touch the filesystem or network |
 | `models.py` | `build_model(spec) -> effgen BaseModel` via `effgen.models.load_model` (T3.2, built): `loader_args(spec)` is the pure spec→kwargs mapping, `ModelLoadError` wraps failures (cause preserved), `ModelCache` (explicit, spec-keyed, owns and unloads its models). Maps our quantization to `quantization_bits` (always passed for hf), passes `require_gpu=True`, refuses effGen-rewritten Ollama ids, and verifies the returned model's kind and quantization. | Implement inference, a provider base class, quantization, retries or fallbacks |
 | `tools.py` | `build_tools(names, workspace) -> list[BaseTool]` from a fixed registry: `file_operations`, `shell`, `edit_file` (T4.3). | Register web or network tools; implement path checks effGen already does |
-| `delegation.py` | `DelegateTool` (an effGen `BaseTool`), `WorkerResult` / `WorkerRecord`, `WorkerRegistry` (in-memory lifecycle: `pending → running → completed / failed / timeout`), `DeadlineMiddleware`, `DelegateInputGuard` (refuses a `delegate` call over effGen's 10,000-character tool-input limit instead of letting its JSON be cut). | Run its own reasoning loop; merge histories |
+| `delegation.py` | `DelegateTool` (an effGen `BaseTool`), `WorkerResult` / `WorkerRecord`, `WorkerRegistry` (in-memory lifecycle: `pending → running → completed / failed / timeout`), `DeadlineMiddleware`, `DelegateInputGuard` (refuses a `delegate` call over effGen's 10,000-character tool-input limit, or one whose JSON is malformed, instead of letting it fail after truncation) and `StructuredToolInputGuard` (refuses malformed JSON before `file_operations`, `edit_file` and `shell`). | Run its own reasoning loop; merge histories |
 | `harness.py` | Build the orchestrator and worker factories from config (`build_harness_from_config`, T5.0: tools first, then models via one `ModelCache`, then `AgentConfig`s with the effGen settings stated explicitly). `Harness.run(task) -> HarnessResult(output, success, termination, workers=[WorkerRecord...])`; `Harness.close()` unloads only a cache it created. `initialize_runtime()` installs the explicit, process-wide effGen loop patch (F1) that the builder and `run` require. | Re-implement `Agent.run`; install the patch implicitly; close a caller's cache |
 | `recorder.py` | Optional (`--history-dir`): `ExecutionRecorder`, an `AgentMiddleware` on every agent plus `begin/finish/abort` called by `Harness.run`. Writes `trace.jsonl` / `attempts.jsonl` (and opt-in private `prompts.local.jsonl`) that `experiments/history/history.py` imports into SQLite. Worker events are attributed to their `delegate` call through a `ContextVar`; per-run state lives on `RunContext.metadata`. Any recorder error disables it and never reaches the run. | Change a prompt, argument, result or return value; predict delegation ids; claim a tool succeeded; implement tracing beyond JSONL lines |
 | `redaction.py` | `redact`, `redact_obj`: credentials and personal paths removed from anything shared. Stdlib only; `experiments/rtx4070/rtx4070.py` loads it by path. | Be weakened for one caller |

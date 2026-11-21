@@ -379,6 +379,10 @@ NAIVE_INPUT = r'{"path": "rich/ansi.py", "old_text": "(?:\x1b\](.*?)", "new_text
 NAIVE_OLD_INPUT = r'{"path": "rich/ansi.py", "old_text": "(?:\x1b\](.*?)", "new_text": "REPLACEMENT"}'  # only old_text is naive; new_text has no backslash
 ESCAPED_INPUT = r'{"path": "rich/ansi.py", "old_text": "(?:\\x1b\\](.*?)", "new_text": "(?:\\x1b[0-?])|\n(?:\\x1b\\](.*?)"}'  # every file backslash doubled
 OLD_ON_DISK, NEW_ON_DISK = r"(?:\x1b\](.*?)", "(?:\\x1b[0-?])|\n(?:\\x1b\\](.*?)"
+# `StructuredToolInputGuard` (delegation.py) answers a call whose input starts with `{` but is not valid JSON BEFORE effGen parses it, so such a call never reaches
+# the tool: no ESC character is built by ast.literal_eval and `EditFileTool._edit` is never entered. This is its refusal text, verbatim.
+GUARD_REFUSAL = ("Error: the edit_file call was NOT run because its input was malformed JSON. No file or command operation occurred. "
+                 "Retry with exactly one JSON object and no additional Action or Observation text.")
 
 
 def worker_edit(tmp_path, ws, monkeypatch, capsys, action_input):
@@ -402,26 +406,36 @@ def worker_edit(tmp_path, ws, monkeypatch, capsys, action_input):
     return received, [str(c.prompt) for c in fake.instances[SMALL].calls]
 
 
-def test_a_naively_copied_backslash_call_is_refused_with_an_explanation_and_changes_nothing(tmp_path, ws, monkeypatch, capsys):
-    before = listing(ws)
-    received, prompts = worker_edit(tmp_path, ws, monkeypatch, capsys, NAIVE_OLD_INPUT)
-    # What the real parser handed to the tool: `\x1b` became a real ESC character (json.loads rejected the input, literal_eval accepted it).
-    assert received == [("rich/ansi.py", "(?:\x1b\\](.*?)", "REPLACEMENT")]
+def assert_guard_refused(received, prompts, ws, before):
+    """The call never reached the tool, the guard's verbatim refusal is what the worker saw, and nothing in the workspace changed."""
+    assert received == []  # EditFileTool._edit was never entered
     assert (ws / "rich" / "ansi.py").read_bytes() == ANSI_SRC.encode() and (ws / "rich" / "other.py").read_text() == "untouched\n"
     assert listing(ws) == sorted([*before, "rich", "rich/ansi.py", "rich/other.py"]) and not [p for p in listing(ws) if ".edit-" in p]
     observation = prompts[1].rsplit("Observation:", 1)[1]
-    assert "old_text was not found" in observation and "Nothing was changed" in observation
-    assert "ESC (U+001B)" in observation and "every backslash as two backslashes, in old_text and in new_text" in observation
-    assert 'to match or write the text \\x1b send "\\\\x1b"' in observation  # the example the model is shown, literally
+    assert GUARD_REFUSAL in observation
     assert "ZZ_FILE_ONLY_TOKEN" not in observation and "re_ansi" not in observation and len(observation) < 900  # no file content, bounded
 
 
-def test_when_both_fields_are_naive_the_new_text_rule_answers_first(tmp_path, ws, monkeypatch, capsys):
-    received, prompts = worker_edit(tmp_path, ws, monkeypatch, capsys, NAIVE_INPUT)
-    assert received == [("rich/ansi.py", "(?:\x1b\\](.*?)", "(?:\x1b[0-?])|\n(?:\x1b\\](.*?)")]  # ESC in both fields
-    assert (ws / "rich" / "ansi.py").read_bytes() == ANSI_SRC.encode()
-    observation = prompts[1].rsplit("Observation:", 1)[1]
-    assert "new_text contains the control character(s) ESC" in observation and "old_text was not found" not in observation  # arguments are checked before the file is read
+def test_a_naively_copied_backslash_call_is_refused_by_the_json_guard_before_the_tool_runs_and_changes_nothing(tmp_path, ws, monkeypatch, capsys):
+    before = listing(ws)
+    # `\x1b` and `\]` are not JSON escapes, so this input is malformed JSON (before the guard, effGen's literal_eval turned `\x1b` into a real ESC character and the tool refused it).
+    received, prompts = worker_edit(tmp_path, ws, monkeypatch, capsys, NAIVE_OLD_INPUT)
+    assert_guard_refused(received, prompts, ws, before)
+
+
+def test_when_both_fields_are_naive_the_json_guard_refuses_the_call_and_changes_nothing(tmp_path, ws, monkeypatch, capsys):
+    before = listing(ws)
+    received, prompts = worker_edit(tmp_path, ws, monkeypatch, capsys, NAIVE_INPUT)  # the single-backslash escapes are in BOTH fields
+    assert_guard_refused(received, prompts, ws, before)
+
+
+def test_when_old_text_is_not_found_and_new_text_has_a_control_character_the_tools_new_text_rule_answers_first(ws, edit):
+    # What the CLI test above used to pin, now at the tool level (the guard keeps such a call from arriving through the harness): arguments are checked before the file is read.
+    (ws / "rich").mkdir()
+    (ws / "rich" / "ansi.py").write_bytes(ANSI_SRC.encode())
+    r = edit("rich/ansi.py", "(?:\x1b\\](.*?)", "(?:\x1b[0-?])|\n(?:\x1b\\](.*?)")  # ESC in both fields; old_text matches nothing in the file
+    assert_refused(r, "new_text contains the control character(s) ESC (U+001B)", "never writes")
+    assert "was not found" not in r.error and (ws / "rich" / "ansi.py").read_bytes() == ANSI_SRC.encode()
 
 
 def test_the_doubled_backslash_call_edits_the_file_exactly_through_the_same_path(tmp_path, ws, monkeypatch, capsys):
@@ -435,31 +449,44 @@ def test_the_doubled_backslash_call_edits_the_file_exactly_through_the_same_path
     assert "edited rich/ansi.py: replaced 1 occurrence at line 3 (1 -> 2 lines)" in prompts[1].rsplit("Observation:", 1)[1]
 
 
-def test_the_guidance_about_doubling_backslashes_is_in_the_tool_description_and_the_worker_prompt(ws):
+def test_the_tool_description_gives_no_escaping_instruction_and_keeps_the_control_character_rule(ws):
+    text = build_tools(["edit_file"], ws)[0].metadata.description
+    # The worker prompt is the single source of escaping guidance (it applies in react mode); the tool's own text carries none.
+    assert "two backslashes" not in text and "every backslash" not in text and "backslash" not in text.lower() and "\\x1b" not in text
+    assert "new_text may not contain control characters other than tab, line feed and carriage return" in text
+
+
+def test_the_worker_prompt_gives_the_current_u005c_escaping_guidance():
     import sys as _sys
 
     _sys.path.insert(0, str(ROOT / "experiments" / "coding_eval"))
     import rich3278_pilot as pilot
 
-    for text in (build_tools(["edit_file"], ws)[0].metadata.description, pilot.WORKER_PROMPT):
-        assert "every backslash as two backslashes, in old_text and in new_text" in text and "\\x1b" in text and "\\\\x1b" in text
-        assert "new_text may not contain control characters" in text or "new_text may not contain control" in text
+    prompt = pilot.WORKER_PROMPT
+    assert "JSON rejects \\x and \\] escapes" in prompt  # why raw backslashes fail
+    assert "encode every literal backslash as the JSON Unicode escape `\\u005c`" in prompt
+    assert "`\\x1b` must be written as `\\u005cx1b`, and `\\]` as `\\u005c]`" in prompt  # the worked examples
+    assert "Do not send raw \\x, \\], or control characters" in prompt and "retry using \\u005c escapes, not raw backslashes" in prompt
+    assert "Send exactly one JSON object per edit_file call" in prompt
+    assert "Prefer the smallest replacement that avoids backslashes and control characters" in prompt
+    assert "two backslashes" not in prompt  # the old instruction was replaced, not kept beside the new one
 
 
 @pytest.mark.parametrize("old,name", [("a\x08b", "BS (U+0008)"), ("a\x0cb", "FF (U+000C)"), ("a\x07b", "BEL (U+0007)"), ("a\x01b", "control (U+0001)")])
 def test_the_diagnostic_names_the_control_characters_but_never_quotes_the_file(ws, edit, old, name):
     (ws / "f.txt").write_text("SECRET-FILE-CONTENT plain\n")
     r = edit("f.txt", old, "x")
-    assert_refused(r, "was not found", name, "two backslashes")
+    assert_refused(r, "was not found", name)
+    assert "backslash" not in r.error.lower()  # states what was found, gives no escaping advice
     assert "SECRET-FILE-CONTENT" not in r.error and len(r.error) < 700
 
 
-def test_allowed_whitespace_controls_get_no_escape_hint_and_a_nul_gets_one(ws, edit):
+def test_allowed_whitespace_controls_get_no_control_note_and_a_nul_is_refused_plainly(ws, edit):
     (ws / "f.txt").write_text("plain\n")
     r = edit("f.txt", "tab\there\nnew\r", "x")
     assert "was not found" in r.error and "control character" not in r.error
     r = edit("f.txt", "a\x00b", "x")
-    assert "NUL" in r.error and "two backslashes" in r.error
+    assert "NUL" in r.error and "backslash" not in r.error.lower()
 
 
 # ---- new_text: the same escaping mistake would be WRITTEN into the file (review follow-up) --------------------------------------------
@@ -468,20 +495,37 @@ def test_allowed_whitespace_controls_get_no_escape_hint_and_a_nul_gets_one(ws, e
 NAIVE_NEW_INPUT = r'{"path": "rich/ansi.py", "old_text": "(?:\\x1b\\](.*?)", "new_text": "(?:\x1b[0-?])|\n(?:\\x1b\\](.*?)"}'  # old_text doubled, new_text's \x1b NOT
 
 
-def test_a_correct_old_text_with_a_naive_new_text_is_refused_before_anything_is_written(tmp_path, ws, monkeypatch, capsys):
+def test_a_correct_old_text_with_a_naive_new_text_is_refused_by_the_json_guard_before_anything_is_written(tmp_path, ws, monkeypatch, capsys):
     before = listing(ws)
+    # ACTION INPUT: old_text is doubled (valid), new_text's `\x1b` is not (`\x` is not a JSON escape): malformed JSON, so the guard refuses the whole call.
     received, prompts = worker_edit(tmp_path, ws, monkeypatch, capsys, NAIVE_NEW_INPUT)
-    # RECEIVED: json.loads rejects the input (`\x` in new_text), ast.literal_eval accepts it; old_text keeps its literal backslashes and new_text holds a real ESC.
-    assert received == [("rich/ansi.py", OLD_ON_DISK, "(?:\x1b[0-?])|\n(?:\\x1b\\](.*?)")]
-    assert b"\x1b" in received[0][2].encode() and b"\x1b" not in received[0][1].encode()
-    # BYTES: the file is exactly what it was; no other file changed or appeared, and no temporary file exists.
-    assert (ws / "rich" / "ansi.py").read_bytes() == ANSI_SRC.encode() and (ws / "rich" / "other.py").read_bytes() == b"untouched\n"
-    assert listing(ws) == sorted([*before, "rich", "rich/ansi.py", "rich/other.py"]) and not [p for p in listing(ws) if ".edit-" in p]
-    # OUTCOME: refused, with a bounded message that names the character and shows the rule, without quoting the file.
-    observation = prompts[1].rsplit("Observation:", 1)[1]
-    assert "new_text contains the control character(s) ESC (U+001B), which edit_file never writes" in observation and "Nothing was changed" in observation
-    assert 'to match or write the text \\x1b send "\\\\x1b"' in observation and "every backslash as two backslashes, in old_text and in new_text" in observation
-    assert "ZZ_FILE_ONLY_TOKEN" not in observation and "re_ansi" not in observation and "old_text was not found" not in observation and len(observation) < 900
+    # RECEIVED: nothing. BYTES: the file is exactly what it was; no other file changed or appeared, and no temporary file exists. OUTCOME: the guard's refusal, no file content quoted.
+    assert_guard_refused(received, prompts, ws, before)
+
+
+def test_a_naive_new_text_that_reaches_the_tool_as_an_esc_character_is_refused_before_anything_is_written(ws, edit):
+    # The tool-level rule behind the case above, for an ESC that arrives without the guard (valid JSON `\u001b`, or a direct call): refused, file untouched.
+    (ws / "rich").mkdir()
+    (ws / "rich" / "ansi.py").write_bytes(ANSI_SRC.encode())
+    before = listing(ws)
+    r = edit("rich/ansi.py", OLD_ON_DISK, "(?:\x1b[0-?])|\n(?:\\x1b\\](.*?)")  # old_text matches the file; new_text holds a real ESC
+    assert_refused(r, "new_text contains the control character(s) ESC (U+001B), which edit_file never writes")
+    assert "backslash" not in r.error.lower()  # factual: what was wrong and that nothing changed
+    assert "ZZ_FILE_ONLY_TOKEN" not in r.error and "re_ansi" not in r.error and "was not found" not in r.error and len(r.error) < 900
+    assert (ws / "rich" / "ansi.py").read_bytes() == ANSI_SRC.encode() and listing(ws) == before
+
+
+def test_the_u005c_form_the_worker_prompt_asks_for_edits_the_file_exactly_through_the_real_path(tmp_path, ws, monkeypatch, capsys):
+    # The JSON Unicode escape for a backslash decodes to ONE backslash: the guidance in WORKER_PROMPT, written the way it says, through the real CLI, harness and effGen dispatch.
+    bs = chr(92)
+    u5c = bs + "u005c"  # the six characters backslash-u-0-0-5-c, built here so that nothing mistakes them for an escape in this source file
+    action = ('{"path": "rich/ansi.py", "old_text": "(?:' + u5c + "x1b" + u5c + '](.*?)", "new_text": "(?:' + u5c + "x1b[0-?])|" + bs + "n(?:" + u5c + "x1b" + u5c + '](.*?)"}')
+    assert action.count(u5c) == 5 and json.loads(action)["old_text"] == OLD_ON_DISK  # valid JSON that decodes to the file's text (`\x1b\](.*?)`)
+    received, prompts = worker_edit(tmp_path, ws, monkeypatch, capsys, action)
+    assert received == [("rich/ansi.py", OLD_ON_DISK, NEW_ON_DISK)]  # literal backslashes, no control character, no guard refusal
+    on_disk = (ws / "rich" / "ansi.py").read_bytes()
+    assert on_disk == ANSI_SRC.replace(OLD_ON_DISK, NEW_ON_DISK, 1).encode() and b"\x1b" not in on_disk
+    assert "edited rich/ansi.py: replaced 1 occurrence" in prompts[1].rsplit("Observation:", 1)[1] and GUARD_REFUSAL not in prompts[1]
 
 
 @pytest.mark.parametrize("json_new_text,name", [(r"a\bz", "BS (U+0008)"), (r"a\fz", "FF (U+000C)"), (r"a\u001bz", "ESC (U+001B)"), (r"a\u0007z", "BEL (U+0007)")])
@@ -514,10 +558,17 @@ def test_a_doubled_backslash_before_t_survives_as_two_literal_characters(tmp_pat
 
 # Known limitations, pinned so that they cannot be mistaken for guarantees: escapes that decode to ORDINARY characters are indistinguishable from
 # intended text once parsed, so edit_file cannot detect them. Control-character refusal does not eliminate serialization corruption.
-def test_known_limitation_an_escape_that_becomes_an_ordinary_character_is_written_silently(tmp_path, ws, monkeypatch, capsys):
-    action = r'{"path": "rich/ansi.py", "old_text": "(?:\\x1b\\](.*?)", "new_text": "\x41"}'  # the model meant the four characters \x41
+def test_an_x41_escape_is_now_refused_by_the_json_guard_instead_of_being_written_as_a_letter(tmp_path, ws, monkeypatch, capsys):
+    before = listing(ws)
+    action = r'{"path": "rich/ansi.py", "old_text": "(?:\\x1b\\](.*?)", "new_text": "\x41"}'  # the model meant the four characters \x41; `\x` is not a JSON escape
     received, prompts = worker_edit(tmp_path, ws, monkeypatch, capsys, action)
-    assert received == [("rich/ansi.py", OLD_ON_DISK, "A")]  # literal_eval turned \x41 into A
+    assert_guard_refused(received, prompts, ws, before)  # before the guard, literal_eval turned \x41 into "A" and it was written without complaint
+
+
+def test_known_limitation_a_valid_json_unicode_escape_for_an_ordinary_character_is_written_silently(tmp_path, ws, monkeypatch, capsys):
+    action = r'{"path": "rich/ansi.py", "old_text": "(?:\\x1b\\](.*?)", "new_text": "A"}'  # valid JSON: the guard passes it; the model may have meant the six characters A
+    received, prompts = worker_edit(tmp_path, ws, monkeypatch, capsys, action)
+    assert received == [("rich/ansi.py", OLD_ON_DISK, "A")]  # json.loads turned A into A
     assert (ws / "rich" / "ansi.py").read_bytes() == ANSI_SRC.replace(OLD_ON_DISK, "A", 1).encode()  # and it was written without complaint
 
 
@@ -534,7 +585,8 @@ def test_new_text_control_characters_are_refused_with_a_bounded_diagnostic_and_t
     (ws / "f.txt").write_text("SECRET-FILE-CONTENT target\n")
     before = listing(ws)
     r = edit("f.txt", "target", new)
-    assert_refused(r, "new_text contains the control character(s)", name, "never writes", "in old_text and in new_text")
+    assert_refused(r, "new_text contains the control character(s)", name, "never writes")
+    assert "backslash" not in r.error.lower()
     assert "SECRET-FILE-CONTENT" not in r.error and len(r.error) < 700
     assert ("ESC (U+001B)" in r.error) == ("ESC (U+001B)" in name)  # at most three characters are named: the fourth of the last case is not
     assert (ws / "f.txt").read_bytes() == b"SECRET-FILE-CONTENT target\n" and listing(ws) == before
@@ -544,7 +596,18 @@ def test_the_new_text_check_comes_before_the_filesystem_like_the_other_argument_
     r = edit("no/such/file.txt", "a", "x\x1b")  # the file does not exist, but the argument is refused first
     assert "new_text contains the control character(s) ESC" in r.error and "does not exist" not in r.error
     r = edit("f.txt", "a", "x\x00y")  # NUL keeps its own message
-    assert "new_text must be text without NUL characters" in r.error and "two backslashes" in r.error
+    assert "new_text must be text without NUL characters" in r.error and "backslash" not in r.error.lower()
+
+
+def test_no_refusal_message_gives_escaping_advice(ws, edit):
+    # The worker prompt is the single source of escaping guidance; the tool says only what was wrong and that nothing changed.
+    (ws / "f.txt").write_text("plain target\n")
+    errors = [edit("f.txt", "a\x00b", "x").error, edit("f.txt", "target", "x\x00y").error, edit("f.txt", "target", "x\x1by").error,
+              edit("f.txt", "no\x1bmatch", "x").error, edit("f.txt", "absent", "x").error]
+    for text in errors:
+        assert "Nothing was changed" in text and len(text) < 400, text
+        assert "backslash" not in text.lower() and "JSON" not in text and "escape" not in text.lower(), text
+    assert (ws / "f.txt").read_text() == "plain target\n"
 
 
 def test_tab_lf_and_cr_in_new_text_are_accepted_by_the_tool_directly(ws, edit):

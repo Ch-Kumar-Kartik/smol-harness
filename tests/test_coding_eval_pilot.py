@@ -937,10 +937,10 @@ def test_the_wall_clock_kill_removes_every_process_the_sandboxed_agent_started(t
 
 
 @needs_sandbox
-def test_a_real_run_executes_the_child_in_the_sandbox_and_reaches_the_endpoint_only_through_the_bridge(dataset, tmp_path, monkeypatch, stub_servers):
-    stub = stub_servers()
-    monkeypatch.setattr(pilot, "fetch_model_identity", REAL_FETCH_MODEL_IDENTITY)  # the stand-in answers /api/tags like Ollama
-    record = pilot.run_pilot(cfg_for(dataset, tmp_path, base_url=f"http://127.0.0.1:{stub.server_address[1]}/v1", agent_timeout_s=120), FakeRunner(pytest_output(2)))
+def test_a_real_run_executes_the_child_in_the_sandbox_edits_a_file_and_reaches_the_endpoint_only_through_the_bridge(dataset, tmp_path, monkeypatch):
+    servers = []  # the stand-in answers /api/tags like Ollama and scripts the chat completions (see editing_script): the coder really edits mini/core.py
+    record = run_scripted_endpoint(dataset, tmp_path, monkeypatch, editing_script, server_out=servers)
+    stub = servers[0]
     assert record["status"] == "complete" and record["model_identity"]["available"] is True
     assert record["sandbox"]["kind"].startswith("systemd scope + bubblewrap") and f"127.0.0.1:{stub.server_address[1]}" in record["sandbox"]["network"]
     assert record["agent"]["command"][:4] == ["systemd-run", "--user", "--scope", "--quiet"] and "--unshare-all" in record["agent"]["command"]
@@ -949,7 +949,12 @@ def test_a_real_run_executes_the_child_in_the_sandbox_and_reaches_the_endpoint_o
     run_dir = tmp_path / "out" / record["run_id"]
     config = (run_dir / "agent" / "harness.yaml").read_text()
     assert f"http://127.0.0.1:{stub.server_address[1]}/v1" in config and json.loads((run_dir / "agent" / "params.json").read_text())["bridge"]["socket"] == "/bridge/m.sock"
-    assert record["agent"]["result"] is not None and record["agent"]["result"]["error"] is None and record["agent"]["exit_code"] == 0
+    result = record["agent"]["result"]
+    assert result is not None and result["error"] is None and record["agent"]["exit_code"] == 0
+    # the success path: the edit really happened inside the sandbox, so the harness's own verification accepts the agent's answer and the candidate reaches the evaluator
+    assert result["agent_reported_success"] is True and result["workspace_changed"] is True and result["workers"][0]["status"] == "completed"
+    assert record["candidate"]["included_files"] == ["mini/core.py"] and "+    return a + b" in (run_dir / "candidate.patch").read_text()
+    assert record["evaluation"]["outcome"] == "resolved" and record["resolved"] is True  # (the container is a fake here; this checks the hand-over, not the tests)
     assert not list((run_dir / "agent").glob("*.sock")) and not (run_dir / "agent" / "workspace").exists()  # no socket in the run directory; the workspace was cleaned up
 
 
@@ -1260,36 +1265,22 @@ def test_an_evaluation_without_a_completion_marker_or_with_an_oom_kill_is_an_eva
     assert c["infrastructure_failure"] is (outcome == "error") and c["counts_as_coding_failure"] is (outcome == "unresolved_tests_failed")  # an inner pytest timeout (a candidate whose tests run too long) is its own failure; the outer one is not
 
 
-# ---- B1 end to end: the real driver, the real sandbox, a stand-in endpoint that answers after 12 s --------------------------------------------------
-class _TwelveSecond(_Stub):
-    def do_POST(self):
-        self.server.paths.append(("POST", self.path))
-        self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        if self.path.startswith("/v1/"):
-            time.sleep(self.server.delay)
-        self._send({"id": "x", "object": "chat.completion", "created": 0, "model": "big:1", "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-                    "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "Thought: nothing to do.\nFinal Answer: stub"}}]})
-
-
+# ---- B1 end to end: the real driver, the real sandbox, a stand-in endpoint whose first answer takes 12 s ----------------------------------------------
 @needs_sandbox
-def test_a_sandboxed_run_whose_model_call_takes_twelve_seconds_succeeds_with_exactly_one_request(dataset, tmp_path, monkeypatch):
-    from http.server import ThreadingHTTPServer
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _TwelveSecond)
-    server.daemon_threads, server.paths, server.tag, server.delay = True, [], b"x", 12
+def test_a_sandboxed_run_whose_first_model_call_takes_twelve_seconds_still_succeeds_and_that_call_is_not_retried(dataset, tmp_path, monkeypatch):
+    # The first completion (the orchestrator rewriting mini/core.py through file_operations) arrives after 12 s; the second answers at once. A real change keeps the success path:
+    # `agent_reported_success` needs a workspace change. effGen retries a call that fails, so a cut-off first request would show up as extra POSTs.
+    slow_first = lambda worker, n: ("sleep", 12, _completion(WRITE_CALL)) if n == 1 else _completion(EDITED_ANSWER)  # noqa: E731
     before_bridge_dirs = set(Path(tempfile.gettempdir()).glob("cb-*"))
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    monkeypatch.setattr(pilot, "fetch_model_identity", REAL_FETCH_MODEL_IDENTITY)
-    try:
-        record = pilot.run_pilot(cfg_for(dataset, tmp_path, base_url=f"http://127.0.0.1:{server.server_address[1]}/v1", agent_timeout_s=120, max_iterations=2), FakeRunner(pytest_output(2)))
-    finally:
-        server.shutdown()
-        server.server_close()
+    servers = []
+    record = run_scripted_endpoint(dataset, tmp_path, monkeypatch, slow_first, server_out=servers)
     result = record["agent"]["result"]
-    posts = [p for m, p in server.paths if m == "POST" and p.startswith("/v1/")]
-    assert len(posts) == 1, posts  # before the fix: a connection error at 10 s and a dozen retries
+    posts = [p for m, p in servers[0].paths if m == "POST" and p.startswith("/v1/")]
+    assert len(posts) == 2, posts  # the 12 s call exactly once plus the follow-up that carries its tool result (before the bridge fix: a connection error at 10 s and a dozen retries)
     assert record["agent"]["seconds"] >= 12 and record["agent"]["exit_code"] == 0 and not record["agent"]["timed_out"]
-    assert (result["agent_reported_success"], result["termination"], result["error"], result["model_failure"], result["output"]) == (True, "done", None, None, "stub")
+    assert (result["agent_reported_success"], result["workspace_changed"], result["termination"], result["error"], result["model_failure"]) == (True, True, "done", None, None)
+    assert result["output"] == "add now adds"
+    assert record["candidate"]["included_files"] == ["mini/core.py"]  # the edit made during the slow call reached the candidate
     assert record["classification"]["agent"] == "completed" and record["classification"]["infrastructure_failure"] is False
     assert set(Path(tempfile.gettempdir()).glob("cb-*")) <= before_bridge_dirs  # the driver removed its bridge directory
 
@@ -1324,18 +1315,34 @@ FINAL_ANSWER = "Thought: done.\nFinal Answer: the worker could not finish"
 READ_CALL = 'Thought: read it.\nAction: file_operations\nAction Input: {"operation": "read", "path": "mini/core.py"}'
 
 
+# The success path needs a REAL change: the child's `agent_reported_success` is `result.success and workspace_changed`, and it exits 1 when nothing changed. These scripted stand-ins
+# (not models) make the coder edit mini/core.py through the real edit_file tool, or the orchestrator rewrite it through file_operations, inside the real sandbox.
+EDIT_CALL = "Thought: fix it.\nAction: edit_file\nAction Input: " + json.dumps({"path": "mini/core.py", "old_text": "a - b", "new_text": "a + b"})
+WRITE_CALL = "Thought: fix it.\nAction: file_operations\nAction Input: " + json.dumps({"operation": "write", "path": "mini/core.py", "content": CORE_NEW})
+EDITED_ANSWER = "Thought: done.\nFinal Answer: add now adds"
+
+
+def editing_script(worker, n):
+    """The orchestrator delegates once; the coder REALLY edits mini/core.py through edit_file; both then answer."""
+    if worker:
+        return _completion(EDIT_CALL if n == 1 else EDITED_ANSWER)
+    return _completion(DELEGATE_CALL if n == 1 else EDITED_ANSWER)
+
+
 def _completion(content, finish="stop", reasoning=None):
     message = {"role": "assistant", "content": content, **({"reasoning": reasoning, "reasoning_content": reasoning} if reasoning else {})}
     return {"id": "x", "object": "chat.completion", "created": 0, "model": "big:1", "usage": {"prompt_tokens": 1, "completion_tokens": 5, "total_tokens": 6},
             "choices": [{"index": 0, "finish_reason": finish, "message": message}]}
 
 
-def run_scripted_endpoint(dataset, tmp_path, monkeypatch, script, **cfg):
-    """`script(is_worker, n)` -> a completion body, 'drop' (close without answering) or ('sleep', seconds, body). The worker is told apart by its system prompt."""
+def run_scripted_endpoint(dataset, tmp_path, monkeypatch, script, *, server_out=None, **cfg):
+    """`script(is_worker, n)` -> a completion body, 'drop' (close without answering) or ('sleep', seconds, body). The worker is told apart by its system prompt.
+    `server_out`, when a list, receives the stand-in server (its `.paths` and `.log` stay readable after it is shut down)."""
     from http.server import ThreadingHTTPServer
 
     class Scripted(_Stub):
         def do_POST(self):
+            self.server.paths.append(("POST", self.path))
             raw = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
             worker = pilot.WORKER_PROMPT[:40] in raw
             self.server.log.append("W" if worker else "O")
@@ -1350,6 +1357,8 @@ def run_scripted_endpoint(dataset, tmp_path, monkeypatch, script, **cfg):
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Scripted)
     server.daemon_threads, server.paths, server.tag, server.log, server.script = True, [], b"x", [], script
+    if server_out is not None:
+        server_out.append(server)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     monkeypatch.setattr(pilot, "fetch_model_identity", REAL_FETCH_MODEL_IDENTITY)
     try:
@@ -1365,7 +1374,10 @@ def test_S2b_a_worker_that_hits_its_deadline_leaves_termination_unset_and_the_ru
     record = run_scripted_endpoint(dataset, tmp_path, monkeypatch, slow_worker, worker_timeout_s=3)
     worker = record["agent"]["result"]["workers"][0]
     assert (worker["status"], worker["error_type"], worker["termination"]) == ("timeout", "WorkerTimeout", None)  # the real effGen/driver record: the shape the old check missed
-    assert record["agent"]["result"]["agent_reported_success"] is True  # the orchestrator went on and answered
+    result = record["agent"]["result"]
+    # the orchestrator went on and answered ("done"), but nothing in the workspace changed, so the harness does not accept the answer as a success (the new verification) and the child exits 1
+    assert result["termination"] == "done" and result["workspace_changed"] is False and result["agent_reported_success"] is False
+    assert "no workspace change was detected" in result["output"] and record["agent"]["exit_code"] == 1
     c = record["classification"]
     assert (c["attempt_outcome"], c["counts_as_coding_failure"], c["infrastructure_failure"]) == ("indeterminate", False, False), c
     assert "worker run(s) ['coder']" in c["indeterminate_reasons"][0]
@@ -1381,6 +1393,894 @@ def test_S3_a_worker_transport_failure_followed_by_orchestrator_truncation_is_in
     assert result["agent_reported_success"] is False and result["model_failure"]["category"] == "truncation"  # the orchestrator's own category is preserved
     assert (c["agent"], c["attempt_outcome"], c["counts_as_coding_failure"], c["infrastructure_failure"]) == ("indeterminate", "indeterminate", False, False), c
     assert "worker run(s) ['coder']" in c["indeterminate_reasons"][0]
+
+
+# ---- the Docker agent sandbox: a minimal mount set that never reaches the dataset or the evaluator (no Docker is started here) ------------------------
+GOLD_LINE = r"(?:\x1b[0-?])|"  # the reference fix's added line; it must never be given to the agent
+
+
+def create_kwargs(**over) -> dict:
+    """The name, run id and limits `docker_agent_command` now needs (the limits are the dict that is both passed to docker and recorded)."""
+    return {"name": "smol-agent-t", "run_id": "t", "limits": pilot.docker_limits(pilot.SandboxLimits()), **over}
+
+
+def docker_params(agent_dir: Path) -> dict:
+    (agent_dir / "workspace").mkdir(parents=True, exist_ok=True)
+    return {"config_path": str(agent_dir / "harness.yaml"), "prompt_path": str(agent_dir / "prompt.txt"), "out_dir": str(agent_dir), "workspace": str(agent_dir / "workspace"),
+            "max_tokens": 1, "temperature": 0.1, "seed": 0, "bridge": {"port": 11434, "socket": "unused"}}
+
+
+def docker_mounts(command: list[str]) -> list[tuple[str, str, str]]:
+    out, i = [], 0
+    while i < len(command):
+        if command[i] == "-v":
+            out.append(tuple(command[i + 1].rsplit(":", 2)))
+            i += 2
+        else:
+            i += 1
+    return out
+
+
+def fake_interpreters(tmp_path):
+    """Two fake venvs. `system`: the venv's python links to an interpreter under a fake /usr. `managed`: uv-style, the link goes through an ALIAS directory
+    (cpython-3.12) that is itself a link to the versioned base prefix (cpython-3.12.1), as `~/.local/share/uv/python` does."""
+    root = tmp_path / "fakepy"
+    usr = root / "usr"
+    (usr / "bin").mkdir(parents=True)
+    (usr / "bin" / "python3.12").write_text("#!/bin/sh\n")
+    (usr / "bin" / "python3.12").chmod(0o755)
+    managed = root / "managed"
+    base = managed / "cpython-3.12.1"
+    (base / "bin").mkdir(parents=True)
+    (base / "bin" / "python3.12").write_text("#!/bin/sh\n")
+    (base / "bin" / "python3.12").chmod(0o755)
+    alias = managed / "cpython-3.12"
+    alias.symlink_to(base.name)
+    venvs = {}
+    for kind, target, home in (("system", usr / "bin" / "python3.12", usr / "bin"), ("managed", alias / "bin" / "python3.12", alias / "bin")):
+        venv = root / f"venv-{kind}"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin" / "python").symlink_to(target)
+        (venv / "pyvenv.cfg").write_text(f"home = {home}\nimplementation = CPython\n")
+        venvs[kind] = venv
+    return SimpleNamespace(root=root, usr=usr, base=base, alias=alias, venvs=venvs)
+
+
+def use_env(monkeypatch, env, kind):
+    """Make the driver see the fake `system` or `managed` venv as its own (sys.prefix, sys.base_prefix and the system roots)."""
+    monkeypatch.setattr(sys, "prefix", str(env.venvs[kind]))
+    monkeypatch.setattr(sys, "base_prefix", str(env.usr if kind == "system" else env.base))
+    monkeypatch.setattr(pilot, "SYSTEM_RUNTIME_ROOTS", (str(env.usr),))
+
+
+def test_the_docker_agent_gets_exactly_the_mounts_it_needs_and_never_the_repo_root_or_the_dataset(tmp_path, monkeypatch):
+    use_env(monkeypatch, fake_interpreters(tmp_path), "system")  # an interpreter under the system roots: the mount list is the fixed one, whatever the host's venv is
+    run = tmp_path / "run"
+    agent_dir, bridge_dir = run / "agent", tmp_path / "cb-x"
+    bridge_dir.mkdir()
+    protected = (tmp_path / "ds", run / "evaluator", run / "evaluator" / "pristine")
+    command = pilot.docker_agent_command(agent_dir, bridge_dir, docker_params(agent_dir), protected=protected, **create_kwargs())
+    mounts = docker_mounts(command)
+    by_target = {dst: (src, mode) for src, dst, mode in mounts}
+    assert len(by_target) == len(mounts)  # no target mounted twice
+    expected = {"/agent", "/bridge", "/repo/src", "/repo/experiments/coding_eval/rich3278_pilot.py", "/venv", "/usr", "/lib"} | ({"/lib64"} if Path("/lib64").exists() else set())
+    assert set(by_target) == expected
+    assert sorted(t for t in by_target if t == "/repo" or t.startswith("/repo/")) == ["/repo/experiments/coding_eval/rich3278_pilot.py", "/repo/src"]  # no /repo mount, only these two
+    assert "/python" not in by_target and "/repo" not in by_target
+    assert {t for t, (_, mode) in by_target.items() if mode == "rw"} == {"/agent", "/bridge"}  # everything else is read-only
+    assert by_target["/agent"][0] == str(agent_dir) and by_target["/bridge"][0] == str(bridge_dir)
+    assert by_target["/repo/src"][0] == str(pilot.REPO / "src") and by_target["/venv"][0] == str(Path(sys.prefix).resolve())
+    assert by_target["/repo/experiments/coding_eval/rich3278_pilot.py"][0] == str(Path(pilot.__file__).resolve())
+    # no source may contain, equal or lie inside the repository's real dataset directory (compared as pure paths: the real dataset is never touched)
+    real_dataset = Path(os.path.abspath(pilot.REPO / "dataset"))
+    for src, dst, _ in mounts:
+        resolved = Path(src).resolve()
+        assert resolved != real_dataset and resolved not in real_dataset.parents and real_dataset not in resolved.parents, (src, dst)
+    assert "PYTHONPATH=/repo/src" in command and command[-1].startswith("exec /venv/bin/python /repo/experiments/coding_eval/rich3278_pilot.py agent-child")
+    assert json.loads((agent_dir / "params.docker.json").read_text())["workspace"] == "/agent/workspace"
+
+
+def plan_for(tmp_path, protected=None):
+    run = tmp_path / "run"
+    agent_dir, bridge_dir = run / "agent", tmp_path / "cb-x"
+    bridge_dir.mkdir(exist_ok=True)
+    protected = protected or (tmp_path / "ds", run / "evaluator", run / "evaluator" / "pristine")
+    return pilot.docker_agent_plan(agent_dir, bridge_dir, docker_params(agent_dir), protected=protected, **create_kwargs())
+
+
+def test_an_interpreter_under_the_system_roots_adds_no_mount(tmp_path, monkeypatch):
+    env = fake_interpreters(tmp_path)
+    use_env(monkeypatch, env, "system")
+    plan = plan_for(tmp_path)
+    targets = sorted(dst for _, dst, _ in docker_mounts(plan["argv"]))
+    assert targets == sorted(["/agent", "/bridge", "/repo/src", "/repo/experiments/coding_eval/rich3278_pilot.py", "/venv", "/usr", "/lib"] + (["/lib64"] if Path("/lib64").exists() else []))
+    assert not any(str(env.base) in b for b in plan["expected"]["binds"])
+    assert pilot.agent_interpreter_mount(env.venvs["system"], env.usr, system_roots=(str(env.usr),)) is None
+    own = tmp_path / "own"  # a venv that holds its own interpreter needs nothing either
+    (own / "bin").mkdir(parents=True)
+    (own / "bin" / "python").write_text("x")
+    assert pilot.agent_interpreter_mount(own, tmp_path, system_roots=(str(env.usr),)) is None
+
+
+def test_an_interpreter_outside_the_system_roots_adds_exactly_one_read_only_mount_at_the_path_the_venv_uses(tmp_path, monkeypatch):
+    env = fake_interpreters(tmp_path)
+    use_env(monkeypatch, env, "system")
+    fixed = sorted(dst for _, dst, _ in docker_mounts(plan_for(tmp_path)["argv"]))
+    use_env(monkeypatch, env, "managed")
+    plan = plan_for(tmp_path)
+    mounts = docker_mounts(plan["argv"])
+    assert sorted(dst for _, dst, _ in mounts) == sorted([*fixed, str(env.alias)])  # exactly one more target
+    extra = [(src, dst, mode) for src, dst, mode in mounts if dst == str(env.alias)]
+    assert extra == [(str(env.base), str(env.alias), "ro")]  # the resolved base prefix, read-only, at the alias path the venv's link and pyvenv.cfg name
+    assert f"{env.base}:{env.alias}:ro" in plan["expected"]["binds"] and (str(env.alias), "bind", False) in plan["expected"]["mounts"]  # what verify expects of the real inspect
+    assert inspect_from_create(plan["argv"])["HostConfig"]["Binds"].count(f"{env.base}:{env.alias}:ro") == 1
+    assert pilot.verify_agent_container(inspect_from_create(plan["argv"]), plan["expected"]) == []
+
+
+def test_an_interpreter_outside_the_system_roots_without_an_alias_is_mounted_at_its_own_path(tmp_path, monkeypatch):
+    env = fake_interpreters(tmp_path)
+    venv = tmp_path / "plainvenv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(env.base / "bin" / "python3.12")
+    assert pilot.agent_interpreter_mount(venv, env.base, system_roots=(str(env.usr),)) == (str(env.base), str(env.base))
+
+
+def test_the_extra_mount_is_in_run_json_and_in_the_inspect_read_back(dataset, tmp_path, monkeypatch):
+    env = fake_interpreters(tmp_path)
+    use_env(monkeypatch, env, "managed")
+    events, docker, cfg = docker_pilot(dataset, tmp_path, monkeypatch)
+    record = pilot.run_pilot(cfg, FakeRunner())
+    bind = f"{env.base}:{env.alias}:ro"
+    assert record["status"] == "complete" and bind in record["sandbox"]["isolation"]["Binds"] and bind in [a for a in record["agent"]["command"]]
+
+
+@pytest.mark.parametrize("label,edit", [
+    ("the extra mount missing from the inspect", lambda i, env: (i["HostConfig"].update(Binds=[b for b in i["HostConfig"]["Binds"] if str(env.alias) not in b]),
+                                                                 i.update(Mounts=[m for m in i["Mounts"] if m["Destination"] != str(env.alias)]))),
+    ("an extra mount beyond it", lambda i, env: (i["HostConfig"]["Binds"].append("/home/x:/h:ro"), i["Mounts"].append({"Type": "bind", "Source": "/home/x", "Destination": "/h", "Mode": "ro", "RW": False}))),
+    ("the extra mount writable", lambda i, env: (i["HostConfig"].update(Binds=[b[:-3] + ":rw" if str(env.alias) in b else b for b in i["HostConfig"]["Binds"]]),
+                                                 [m.update(RW=True) for m in i["Mounts"] if m["Destination"] == str(env.alias)])),
+])
+def test_verify_agent_container_refuses_a_read_back_that_differs_in_the_interpreter_mount(tmp_path, monkeypatch, label, edit):
+    env = fake_interpreters(tmp_path)
+    use_env(monkeypatch, env, "managed")
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch, edit=lambda info: edit(info, env))
+    with pytest.raises(pilot.PilotError, match="refusing to start"):
+        run()
+    assert "start" not in events and events[2:] == ["kill", "rm", "inspect"], label
+
+
+def _early_case(tmp_path, name):
+    """A venv whose python links to <tmp>/<name>/bin/python3 (a real executable), plus the directories the checks compare against."""
+    base = tmp_path / name
+    (base / "bin").mkdir(parents=True, exist_ok=True)
+    exe = base / "bin" / "python3"
+    exe.write_text("x")
+    exe.chmod(0o755)
+    venv = tmp_path / f"venv-{name}"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(exe)
+    return venv, base
+
+
+def test_early_check_a_the_interpreter_must_be_under_a_mounted_location(tmp_path):
+    venv, base = _early_case(tmp_path, "py")
+    elsewhere = tmp_path / "other-base"
+    elsewhere.mkdir()
+    with pytest.raises(pilot.PilotError, match="not under any location mounted") as caught:
+        pilot.agent_interpreter_mount(venv, elsewhere, system_roots=("/nonexistent",), home=tmp_path / "h", repo=tmp_path / "r")
+    assert str(base / "bin" / "python3") in str(caught.value)
+    dangling = tmp_path / "venv-dangling"
+    (dangling / "bin").mkdir(parents=True)
+    (dangling / "bin" / "python").symlink_to(tmp_path / "gone" / "python3")
+    with pytest.raises(pilot.PilotError, match="does not exist") as caught:
+        pilot.agent_interpreter_mount(dangling, base, system_roots=("/nonexistent",))
+    assert str(dangling / "bin" / "python") in str(caught.value)
+    host_path = tmp_path / "venv-hostlink"  # an absolute link to the venv's own host path would not exist inside the container (/venv)
+    (host_path / "bin").mkdir(parents=True)
+    (host_path / "bin" / "real").write_text("x")
+    (host_path / "bin" / "python").symlink_to(host_path / "bin" / "real")
+    with pytest.raises(pilot.PilotError, match="host path of the venv"):
+        pilot.agent_interpreter_mount(host_path, base, system_roots=("/nonexistent",))
+
+
+@pytest.mark.parametrize("label,base_of,home_of,repo_of", [
+    ("the filesystem root", lambda t, b: Path("/"), lambda t, b: t / "home" / "u", lambda t, b: t / "repo"),
+    ("the home directory", lambda t, b: b, lambda t, b: b, lambda t, b: t / "repo"),
+    ("a parent of the home directory (such as /home)", lambda t, b: b, lambda t, b: b / "sub" / "u", lambda t, b: t / "repo"),
+    ("the repository root", lambda t, b: b, lambda t, b: t / "home" / "u", lambda t, b: b),
+    ("a directory that contains the repository", lambda t, b: b, lambda t, b: t / "home" / "u", lambda t, b: b / "work" / "repo"),
+])
+def test_early_check_b_the_base_prefix_is_never_the_root_home_a_parent_of_home_or_the_repository(tmp_path, label, base_of, home_of, repo_of):
+    venv, base = _early_case(tmp_path, "py")
+    with pytest.raises(pilot.PilotError, match="refusing to mount the base prefix") as caught:
+        pilot.agent_interpreter_mount(venv, base_of(tmp_path, base), system_roots=("/nonexistent",), home=home_of(tmp_path, base), repo=repo_of(tmp_path, base))
+    assert str(base_of(tmp_path, base).resolve()) in str(caught.value), label
+
+
+@pytest.mark.parametrize("guarded", ["equals", "inside"])
+def test_early_check_b_the_base_prefix_never_equals_or_contains_a_protected_directory(tmp_path, guarded):
+    venv, base = _early_case(tmp_path, "py")
+    protected = base if guarded == "equals" else base / "ds"
+    with pytest.raises(pilot.PilotError, match="protected directory"):
+        pilot.agent_interpreter_mount(venv, base, protected=(protected,), system_roots=("/nonexistent",), home=tmp_path / "h", repo=tmp_path / "r")
+
+
+def test_early_check_c_the_base_prefix_must_hold_a_python_executable(tmp_path):
+    base = tmp_path / "nobin"
+    (base / "lib").mkdir(parents=True)
+    exe = base / "lib" / "python3"
+    exe.write_text("x")
+    exe.chmod(0o755)
+    venv = tmp_path / "venv-nobin"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(exe)
+    with pytest.raises(pilot.PilotError, match="not a directory with a python executable") as caught:
+        pilot.agent_interpreter_mount(venv, base, system_roots=("/nonexistent",), home=tmp_path / "h", repo=tmp_path / "r")
+    assert str(base) in str(caught.value)
+    (base / "bin").mkdir()
+    (base / "bin" / "python3").write_text("x")  # present but not executable
+    with pytest.raises(pilot.PilotError, match="not a directory with a python executable"):
+        pilot.agent_interpreter_mount(venv, base, system_roots=("/nonexistent",), home=tmp_path / "h", repo=tmp_path / "r")
+
+
+def test_the_early_checks_fire_before_any_docker_call_and_before_anything_is_written(tmp_path, monkeypatch):
+    env = fake_interpreters(tmp_path)
+    use_env(monkeypatch, env, "managed")
+    monkeypatch.setattr(pilot.os.path, "expanduser", lambda p: str(env.base) if p == "~" else p)  # the base prefix IS the home directory
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch)
+    with pytest.raises(pilot.PilotError, match="refusing to mount the base prefix"):
+        run()
+    assert events == [] and not (tmp_path / "run" / "agent" / "params.docker.json").exists()
+
+
+def test_a_refused_run_prints_the_reason_on_stderr_and_keeps_the_exit_code_and_the_json_line(tmp_path, monkeypatch, capsys):
+    record = {"run_id": "r", "status": "refused", "error": "the agent sandbox is unavailable (bwrap not found); refusing to run the agent as the plain host user", "resolved": False}
+    monkeypatch.setattr(pilot, "run_pilot", lambda cfg, runner, **kw: record)
+    code = pilot.main(["run", "--out", str(tmp_path / "out"), "--dataset-dir", str(tmp_path / "ds"), "--model", "m:1", "--allow-model-call"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.err.strip() == f"refused: {record['error']}"
+    assert json.loads(captured.out.strip().splitlines()[-1])["status"] == "refused" and "refused:" not in captured.out
+    record.update(status="complete", error=None)
+    assert pilot.main(["run", "--out", str(tmp_path / "out"), "--dataset-dir", str(tmp_path / "ds"), "--model", "m:1", "--allow-model-call"]) == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_a_missing_python_dir_error_names_the_flag_and_the_unverified_system_python_alternative(tmp_path, monkeypatch):
+    with pytest.raises(pilot.PilotError, match="--python-dir") as caught:
+        pilot.prepare_env(tmp_path / "nope", tmp_path / "wheels", tmp_path / "out" / "site")
+    assert "--python-dir /usr" in str(caught.value) and "unverified" in str(caught.value) and str(tmp_path / "nope") in str(caught.value)
+
+    class CopyFails(FakeDocker):
+        def __call__(self, args, **kw):
+            import subprocess
+
+            if args[1] == "cp" and args[-1].endswith(":/opt/python"):
+                self.calls.append(list(args))
+                return subprocess.CompletedProcess(args, 1, "", "no such file or directory")
+            return super().__call__(args, **kw)
+
+    monkeypatch.setattr(pilot.subprocess, "run", CopyFails())
+    with pytest.raises(pilot.PilotError, match=r"docker cp to /opt/python failed.*--python-dir .*--python-dir /usr"):
+        docker_runner(tmp_path).run(tmp_path / "ws", "true", "cand", tmp_path / "logs")
+
+
+# ---- sandbox-check: the agent container with its real mounts, no model -------------------------------------------------------------
+def happy_observation(plan: dict) -> dict:
+    """What the in-container diagnostic would write in a correctly configured container (the stand-in for the real container's answer)."""
+    mount = plan.get("interpreter_mount")
+    interp = {"added": False} if not mount else {"added": True, "source": mount["source"], "destination": mount["destination"], "exists": True, "mounted": True, "read_only": True,
+                                                   "write_probe": {"writable": False, "errno": 30}}
+    return {"machine": "x86_64", "python": {"executable": "/venv/bin/python", "prefix": "/venv", "base_prefix": "/usr", "version": "3.12.3"},
+            "interpreter": {"venv_python": "/venv/bin/python", "realpath": "/usr/bin/python3.12", "exists": True, "executable": True}, "interpreter_mount": interp,
+            "stdlib": {"ok": True}, "ssl": "OpenSSL 3.0", "smol_harness": {"ok": True, "version": "0.1"}, "effgen": {"ok": True, "version": "1.3.0"}, "driver": {"ok": True},
+            "repo": ["experiments", "src"], "repo_src": ["smol_harness"],
+            "absent_paths": {p: False for p in ("/repo/dataset", "/repo/.git", "/repo/gemma_eval_runs", "/repo/new_gemma_eval_runs", "/repo/docs")},
+            "cwd": "/agent", "data_mount": {"mount_point": "/data", "options": ["rw"], "fstype": "tmpfs"},
+            "writable": {"/agent": {"writable": True}, "/repo": {"writable": False}, "/venv": {"writable": False}, "/usr": {"writable": False}},
+            "network": {"route_table": ["Iface\tDestination"], "route_entries": 0, "connected": False, "connect_error": "OSError: [Errno 101] Network is unreachable", "connect_seconds": 0.0,
+                        "target": "192.0.2.1:9"},
+            "env_names": ["HOME", "PATH", "PYTHONPATH"], "ids": "1000:1000"}
+
+
+def sandbox_check_run(tmp_path, monkeypatch, capsys, *, kind="system", mutate=None, write=True, exit_code=0, phase_raises=None, **stub):
+    """pilot.main(["sandbox-check", ...]) with the stubbed docker and a stubbed `docker start` that writes what the diagnostic would have written. Returns (code, events, docker, record)."""
+    env = fake_interpreters(tmp_path)
+    use_env(monkeypatch, env, kind)
+    events = []
+    docker = AgentDocker(events, **stub)
+    monkeypatch.setattr(pilot.subprocess, "run", docker)
+    identity_calls = []
+    monkeypatch.setattr(pilot, "fetch_model_identity", lambda *a, **k: identity_calls.append(a) or {"available": True})
+
+    def fake_phase(agent_dir, params, timeout_s, cmd=None):
+        events.append("start")
+        if phase_raises:
+            raise phase_raises
+        if write:
+            observed = happy_observation(json.loads((agent_dir / "sandbox_check_plan.json").read_text()))
+            if mutate:
+                mutate(observed)
+            (agent_dir / "sandbox_check.json").write_text(json.dumps(observed))
+        return {"command": cmd, "exit_code": exit_code, "timed_out": False, "seconds": 0.1}
+
+    monkeypatch.setattr(pilot, "run_agent_phase", fake_phase)
+    out = tmp_path / "out"
+    argv = ["sandbox-check", "--out", str(out), "--dataset-dir", str(tmp_path / "no-dataset-here")]  # no --allow-model-call, no --model, no --base-url, no dataset
+    code, error = None, None
+    try:
+        code = pilot.main(argv)
+    except BaseException as exc:  # noqa: BLE001
+        error = exc
+    written = sorted(out.glob("sandbox-check-*/sandbox_check.json"))
+    record = json.loads(written[-1].read_text()) if written else None
+    docker.identity_calls, docker.error, docker.env = identity_calls, error, env
+    return code, events, docker, record
+
+
+def test_a_correct_container_with_a_system_interpreter_passes_with_no_extra_mount_and_needs_no_model_flag_or_dataset(tmp_path, monkeypatch, capsys):
+    code, events, docker, record = sandbox_check_run(tmp_path, monkeypatch, capsys)
+    assert code == 0 and docker.error is None and record["overall"] == "PASS" and record["status"] == "complete"
+    assert events == ["version", "create", "inspect", "start", "kill", "rm", "inspect"]  # the run's create -> inspect -> verify -> start -> kill -> rm -> gone path
+    assert docker.identity_calls == []  # the model-identity code is never reached
+    assert record["interpreter_mount"] is None and any(c["name"] == "no interpreter mount is needed" and c["ok"] for c in record["checks"])
+    assert record["verify"] == "passed" and record["cleanup"]["gone"] is True and record["inspect_file"] == "agent_container_inspect.json"
+    assert all(c["ok"] for c in record["checks"]) and all("expected" in c and "observed" in c for c in record["checks"])
+    host = record["host"]
+    assert host["uname_m"] and "Client: stub" in host["docker_version"] and host["interpreter_realpath"] and host["sys_prefix"] and record["image"] == "redis:7"
+    shown = capsys.readouterr().out
+    assert "OVERALL: PASS" in shown and len([ln for ln in shown.splitlines() if ln.startswith("PASS  ")]) == len(record["checks"]) and "FAIL" not in shown
+    assert not any("model" in k or "dataset" in k for k in record)  # no model or dataset information is written
+    assert (tmp_path / "no-dataset-here").exists() is False
+
+
+def test_a_non_usr_interpreter_gets_one_read_only_mount_reported_in_the_result_and_the_mount_list_equals_the_real_runs(tmp_path, monkeypatch, capsys):
+    code, events, docker, record = sandbox_check_run(tmp_path, monkeypatch, capsys, kind="managed")
+    env = docker.env
+    assert code == 0 and record["overall"] == "PASS"
+    assert record["interpreter_mount"] == {"source": str(env.base), "destination": str(env.alias), "mode": "ro"}
+    check = next(c for c in record["checks"] if c["name"].startswith("the interpreter mount"))
+    assert check["ok"] and check["observed"]["read_only"] is True and check["observed"]["exists"] is True
+    # the mount list the check passed to `docker create` is the one a real run passes: same plan, same function, only the command differs
+    run = tmp_path / "prod"
+    agent_dir, bridge_dir = run / "agent", tmp_path / "cb-prod"
+    bridge_dir.mkdir()
+    real = pilot.docker_agent_plan(agent_dir, bridge_dir, docker_params(agent_dir), protected=(tmp_path / "ds", run / "evaluator", run / "evaluator" / "pristine"), **create_kwargs())
+    key = lambda argv: sorted((dst, mode) for _, dst, mode in docker_mounts(argv))  # noqa: E731  (the host sources differ: another run directory)
+    assert key(docker.argv) == key(real["argv"]) and (str(env.alias), "ro") in key(docker.argv)
+    real_env = sorted(real["argv"][i + 1] for i, x in enumerate(real["argv"]) if x == "-e")
+    assert sorted(docker.flag("-e")) == real_env and "PYTHONPATH=/repo/src" in real_env  # the same environment as the real child
+    assert docker.flag("--entrypoint") == ["bash"] and docker.argv[-1] == pilot.SANDBOX_CHECK_COMMAND and real["argv"][-1] == pilot.AGENT_CONTAINER_SCRIPT
+
+
+FAILING = [
+    ("the interpreter does not resolve", "system", lambda o: o["interpreter"].update(exists=False), "interpreter resolves"),
+    ("the interpreter is not executable", "system", lambda o: o["interpreter"].update(executable=False), "interpreter resolves"),
+    ("a standard-library import fails", "system", lambda o: o.update(stdlib={"ok": False, "error": "ModuleNotFoundError: encodings"}), "standard library"),
+    ("smol_harness does not import", "system", lambda o: o.update(smol_harness={"ok": False}), "smol_harness imports"),
+    ("effgen does not import", "system", lambda o: o.update(effgen={"ok": False}), "effgen imports"),
+    ("the driver does not import", "system", lambda o: o.update(driver={"ok": False}), "the driver imports"),
+    ("/repo/dataset exists", "system", lambda o: o["absent_paths"].update({"/repo/dataset": True}), "expected-absent"),
+    ("/repo/.git exists", "system", lambda o: o["absent_paths"].update({"/repo/.git": True}), "expected-absent"),
+    ("/repo/docs exists", "system", lambda o: o["absent_paths"].update({"/repo/docs": True}), "expected-absent"),
+    ("an absent-path answer is missing", "system", lambda o: o["absent_paths"].pop("/repo/docs"), "expected-absent"),
+    ("/repo holds something else", "system", lambda o: o.update(repo=["docs", "experiments", "src"]), "/repo holds only"),
+    ("the working directory is not /agent", "system", lambda o: o.update(cwd="/"), "working directory"),
+    ("/data is not a tmpfs", "system", lambda o: o.update(data_mount={"fstype": "overlay"}), "/data is a tmpfs"),
+    ("/data is not mounted at all", "system", lambda o: o.update(data_mount=None), "/data is a tmpfs"),
+    ("/agent is not writable", "system", lambda o: o["writable"].update({"/agent": {"writable": False}}), "/agent is writable"),
+    ("/repo is writable", "system", lambda o: o["writable"].update({"/repo": {"writable": True}}), "/repo is not writable"),
+    ("/venv is writable", "system", lambda o: o["writable"].update({"/venv": {"writable": True}}), "/venv is not writable"),
+    ("/usr is writable", "system", lambda o: o["writable"].update({"/usr": {"writable": True}}), "/usr is not writable"),
+    ("the route table is not empty", "system", lambda o: o["network"].update(route_entries=1), "no route out"),
+    ("the TEST-NET connect succeeds", "system", lambda o: o["network"].update(connected=True, connect_error=None), "TCP connect"),
+    ("the connect takes longer than 3 seconds", "system", lambda o: o["network"].update(connect_seconds=9.0), "TCP connect"),
+    ("an interpreter mount is not read-only", "managed", lambda o: o["interpreter_mount"].update(read_only=False), "interpreter mount"),
+    ("an interpreter mount can be written to", "managed", lambda o: o["interpreter_mount"].update(write_probe={"writable": True}), "interpreter mount"),
+    ("an interpreter mount destination is missing in the container", "managed", lambda o: o["interpreter_mount"].update(exists=False, mounted=False), "interpreter mount"),
+    ("the diagnostic saw no interpreter mount where the plan has one", "managed", lambda o: o.update(interpreter_mount={"added": False}), "interpreter mount"),
+    ("the diagnostic saw an interpreter mount where the plan has none", "system", lambda o: o.update(interpreter_mount={"added": True, "destination": "/x"}), "no interpreter mount"),
+]
+
+
+@pytest.mark.parametrize("label,kind,mutate,failing", FAILING, ids=[f[0] for f in FAILING])
+def test_each_failed_expectation_turns_the_overall_result_to_fail_and_the_exit_code_to_non_zero(tmp_path, monkeypatch, capsys, label, kind, mutate, failing):
+    code, events, docker, record = sandbox_check_run(tmp_path, monkeypatch, capsys, kind=kind, mutate=mutate)
+    assert code == 1 and record["overall"] == "FAIL", label
+    failed = [c for c in record["checks"] if not c["ok"]]
+    assert failed and any(failing in c["name"] for c in failed), (label, [c["name"] for c in failed])
+    shown = capsys.readouterr().out
+    assert "FAIL  " in shown and "OVERALL: FAIL" in shown
+    assert events[-3:] == ["kill", "rm", "inspect"] and docker.removed  # the container is removed even when a check fails
+
+
+def test_a_diagnostic_that_produced_no_result_is_a_fail(tmp_path, monkeypatch, capsys):
+    code, events, docker, record = sandbox_check_run(tmp_path, monkeypatch, capsys, write=False, exit_code=127)
+    assert code == 1 and record["overall"] == "FAIL"
+    assert [c["name"] for c in record["checks"] if not c["ok"]][:1] == ["the diagnostic produced its result"]
+
+
+def test_a_diagnostic_that_exits_non_zero_is_a_fail_even_if_its_file_looks_right(tmp_path, monkeypatch, capsys):
+    code, events, docker, record = sandbox_check_run(tmp_path, monkeypatch, capsys, exit_code=1)
+    assert code == 1 and record["overall"] == "FAIL" and any(c["name"] == "the diagnostic exited cleanly" and not c["ok"] for c in record["checks"])
+
+
+def test_a_verify_mismatch_refuses_to_start_the_diagnostic_and_the_check_fails(tmp_path, monkeypatch, capsys):
+    code, events, docker, record = sandbox_check_run(tmp_path, monkeypatch, capsys, edit=lambda info: info["HostConfig"].update(NetworkMode="bridge"))
+    assert code == 1 and record["overall"] == "FAIL" and record["status"] == "refused"
+    assert "start" not in events and events == ["version", "create", "inspect", "kill", "rm", "inspect"] and docker.removed
+    assert "NetworkMode" in record["error"] and "NetworkMode" in json.dumps(record["verify"])
+    assert (next((tmp_path / "out").glob("sandbox-check-*")) / "agent_container_inspect.json").exists()  # the evidence is kept
+
+
+def test_the_container_is_killed_and_removed_when_the_diagnostic_phase_raises(tmp_path, monkeypatch, capsys):
+    code, events, docker, record = sandbox_check_run(tmp_path, monkeypatch, capsys, phase_raises=RuntimeError("boom"))
+    assert isinstance(docker.error, RuntimeError) and events[-3:] == ["kill", "rm", "inspect"] and docker.removed
+    assert record["status"] == "failed" and record["overall"] == "FAIL" and "boom" in record["error"]
+
+
+@pytest.mark.parametrize("stub", [{"kill": (1, "Error response from daemon: permission denied")}, {"survives": True}])
+def test_a_cleanup_failure_is_a_non_zero_exit_with_no_pass(tmp_path, monkeypatch, capsys, stub):
+    code, events, docker, record = sandbox_check_run(tmp_path, monkeypatch, capsys, **stub)
+    assert code == 1 and record["overall"] == "FAIL" and record["status"] == "refused" and "could not be stopped and removed" in record["error"]
+    assert "error" in record["cleanup"] and "OVERALL: FAIL" in capsys.readouterr().out
+
+
+def test_the_subcommand_exists_clashes_with_no_other_and_refuses_an_out_directory_inside_the_repository(tmp_path, capsys):
+    parser = pilot.build_parser()
+    args = parser.parse_args(["sandbox-check", "--out", str(tmp_path / "o")])
+    assert args.command == "sandbox-check" and args.agent_image == "redis:7" and not hasattr(args, "allow_model_call") and not hasattr(args, "model")
+    for other in ("run", "evaluate", "reference-check", "prepare-env", "agent-child"):
+        assert parser.parse_args([other, *(["--out", str(tmp_path / "o")] if other != "agent-child" else ["--params", "p"]),
+                                  *(["--model", "m"] if other == "run" else []), *(["--patch", "p"] if other == "evaluate" else [])]).command == other
+    assert pilot.main(["sandbox-check", "--out", str(pilot.REPO / "inside-the-repo")]) == 2 and "must be outside" in capsys.readouterr().err
+    assert not (pilot.REPO / "inside-the-repo").exists()
+
+
+def test_the_diagnostic_script_runs_for_real_writes_every_key_and_records_environment_names_only(tmp_path):
+    import subprocess
+
+    script, out, plan = tmp_path / "diag.py", tmp_path / "result.json", tmp_path / "plan.json"
+    script.write_text(pilot.SANDBOX_CHECK_SCRIPT)
+    plan.write_text(json.dumps({"interpreter_mount": None}))
+    env = {"PATH": os.environ.get("PATH", ""), "PYTHONPATH": str(pilot.REPO / "src"), "SMOL_SECRET_PROBE": "hunter2-value-must-not-appear"}
+    done = subprocess.run([sys.executable, str(script), str(out), str(plan), "127.0.0.1:1"], capture_output=True, text=True, env=env, timeout=60)  # a local, refused connect: no packet leaves the host
+    assert done.returncode == 0, done.stderr
+    text = out.read_text()
+    seen = json.loads(text)
+    for key in ("machine", "python", "interpreter", "interpreter_mount", "stdlib", "smol_harness", "effgen", "driver", "repo", "repo_src", "absent_paths", "cwd", "data_mount", "writable", "network",
+                "env_names", "ids"):
+        assert key in seen, key
+    assert "SMOL_SECRET_PROBE" in seen["env_names"] and "hunter2" not in text  # names only, never values
+    assert seen["stdlib"] == {"ok": True} and seen["interpreter_mount"] == {"added": False} and seen["network"]["connected"] is False
+    assert any(not c["ok"] for c in pilot.evaluate_sandbox_check(seen, None))  # on the host the container expectations do not hold: the judge is not vacuous
+
+
+def test_a_mount_source_that_equals_contains_or_lies_inside_a_protected_directory_is_refused(tmp_path):
+    repo = tmp_path / "repo"
+    dataset, evaluator = repo / "dataset", tmp_path / "run" / "evaluator"
+    pristine = evaluator / "pristine"
+    for d in (dataset / "sub", pristine / "rich", tmp_path / "other"):
+        d.mkdir(parents=True)
+    (tmp_path / "link").symlink_to(dataset)
+    protected = (dataset, evaluator, pristine)
+    for label, source in (("a repository root that holds the dataset", repo), ("a higher ancestor of the dataset", tmp_path), ("the dataset itself", dataset), ("a directory inside the dataset", dataset / "sub"),
+                          ("a symlink to the dataset", tmp_path / "link"), ("the evaluator directory", evaluator), ("the pristine copy", pristine), ("a directory inside the pristine copy", pristine / "rich")):
+        try:
+            pilot.check_mount_sources([(str(source), "/x")], protected)
+        except pilot.PilotError as exc:
+            assert "protected directory" in str(exc), label
+        else:
+            pytest.fail(f"not refused: {label}")
+    pilot.check_mount_sources([(str(tmp_path / "other"), "/o"), ("/usr", "/usr")], protected)  # unrelated sources pass
+    pilot.check_mount_sources([(str(repo), "/repo")], ())  # (the caller must pass the protected set; docker_agent_command requires it)
+
+
+def test_docker_agent_command_refuses_before_writing_anything_when_a_mount_conflicts(tmp_path):
+    agent_dir, bridge_dir = tmp_path / "run" / "agent", tmp_path / "cb-x"
+    agent_dir.mkdir(parents=True)
+    bridge_dir.mkdir()
+    params = docker_params(agent_dir)
+    with pytest.raises(pilot.PilotError, match="protected directory"):
+        pilot.docker_agent_command(agent_dir, bridge_dir, params, protected=(pilot.REPO / "src",), **create_kwargs())  # the src mount equals a protected directory
+    with pytest.raises(pilot.PilotError, match="protected directory"):
+        pilot.docker_agent_command(agent_dir, bridge_dir, params, protected=(agent_dir.parent,), **create_kwargs())  # the agent directory lies inside one
+    assert not (agent_dir / "params.docker.json").exists()  # refused before the parameters file was written
+    with pytest.raises(TypeError):
+        pilot.docker_agent_command(agent_dir, bridge_dir, params)  # `protected` is required: the check cannot be forgotten
+
+
+@needs_patch
+def test_a_docker_run_passes_the_dataset_the_evaluator_and_the_pristine_copy_as_protected_directories(dataset, tmp_path, monkeypatch):
+    seen = {}
+
+    def spy(agent_dir, bridge_dir, params, timeout_s, **kw):
+        seen.update(kw)
+        return {"command": ["docker", "create"], "exit_code": 0, "timed_out": False, "seconds": 0.0,
+                "container": {"name": kw["name"], "inspect_file": "x.json", "isolation": {}, "cleanup": {}}}
+
+    monkeypatch.setattr(pilot, "run_agent_container", spy)
+    cfg = cfg_for(dataset, tmp_path, agent_sandbox="docker")
+    record = pilot.run_pilot(cfg, FakeRunner())
+    run_dir = tmp_path / "out" / record["run_id"]
+    assert [Path(p).resolve() for p in seen["protected"]] == [Path(cfg.dataset_dir).resolve(), (run_dir / "evaluator").resolve(), (run_dir / "evaluator" / "pristine").resolve()]
+    assert seen["image"] == cfg.agent_image and seen["name"] == f"smol-agent-{record['run_id']}" and seen["limits"] == pilot.docker_limits(cfg.sandbox_limits)
+
+
+def test_the_rendered_worker_and_orchestrator_prompts_do_not_contain_the_reference_fix_line():
+    import yaml
+
+    cfg = yaml.safe_load(pilot.render_config(Path("/agent/workspace"), {"provider": "ollama", "model": "m:1", "context_length": 8192, "base_url": "http://127.0.0.1:11434/v1",
+                                                                        "worker_timeout_s": 300, "max_iterations": 8}))
+    worker, orchestrator = cfg["workers"][0]["system_prompt"], cfg["orchestrator"]["system_prompt"]
+    for name, text in (("worker", worker), ("orchestrator", orchestrator), ("WORKER_PROMPT", pilot.WORKER_PROMPT)):
+        assert GOLD_LINE not in text, name
+        assert "For this task, insert" not in text and "one-line alternative" not in text, name
+    assert "\\u005c" in worker and "After a successful edit_file call" in worker and "with no extra Action or Observation text. After a successful" in worker  # the rest is unchanged
+
+
+# ---- the Docker agent container: create -> inspect -> verify -> start, and ALWAYS killed and removed (a stubbed docker CLI: no container exists) --------
+REAL_RUN = pilot.subprocess.run  # captured before any test patches subprocess.run; the stub below hands every non-docker command to it
+
+
+def inspect_from_create(argv: list[str]) -> dict:
+    """What a real `docker inspect` would show of the container this `docker create` command describes (the stub's idea of Docker's honest answer)."""
+    def values(flag):
+        return [argv[i + 1] for i, a in enumerate(argv) if a == flag]
+
+    def size(text):
+        return int(text) if text.isdigit() else int(text[:-1]) * {"k": 1024, "m": 1024**2, "g": 1024**3}[text[-1].lower()]
+
+    ulimits = []
+    for item in values("--ulimit"):
+        name, _, rest = item.partition("=")
+        soft, _, hard = rest.partition(":")
+        ulimits.append({"Name": name, "Soft": int(soft), "Hard": int(hard or soft)})
+    binds = values("-v")
+    return {"HostConfig": {"NetworkMode": values("--network")[0], "IpcMode": values("--ipc")[0], "Privileged": False, "ReadonlyRootfs": "--read-only" in argv,
+                           "CapDrop": values("--cap-drop"), "SecurityOpt": values("--security-opt"), "Init": "--init" in argv, "Memory": size(values("--memory")[0]),
+                           "MemorySwap": size(values("--memory-swap")[0]), "PidsLimit": int(values("--pids-limit")[0]), "NanoCpus": round(float(values("--cpus")[0]) * 1e9),
+                           "Ulimits": ulimits, "Tmpfs": dict(t.split(":", 1) for t in values("--tmpfs")), "Binds": binds, "Devices": None, "PortBindings": {}},
+            "Mounts": [{"Type": "bind", "Source": b.split(":")[0], "Destination": b.split(":")[1], "Mode": b.split(":")[2], "RW": b.split(":")[2] == "rw"} for b in binds],
+            "Config": {"User": values("--user")[0], "WorkingDir": values("-w")[0], "Entrypoint": [values("--entrypoint")[0]], "Cmd": ["-c", argv[-1]]}}
+
+
+class AgentDocker:
+    """A stand-in for the docker CLI, patched over subprocess.run (every non-docker command runs for real). Appends each docker verb to `events`.
+
+    `edit(info)` changes what `docker inspect` reports; `kill` / `rm` / `create` are (returncode, stderr); `survives=True` makes `docker rm` succeed while the container stays.
+    `create` prints a container ID (`id-<name>`); kill, rm and inspect only know that ID. `targets` records (verb, argument) for every call; `touched_other` is set when
+    kill or rm is aimed at anything that is not this run's container (for example the name that a stale container holds)."""
+
+    def __init__(self, events, *, edit=None, kill=(0, ""), rm=(0, ""), create=(0, ""), survives=False, create_stdout=None):
+        self.events, self.edit, self.kill, self.rm, self.create, self.survives, self.create_stdout = events, edit, kill, rm, create, survives, create_stdout
+        self.argv, self.removed, self.cid, self.targets, self.touched_other = None, False, None, [], False
+
+    def __call__(self, args, **kw):
+        if args[0] != "docker":
+            return REAL_RUN(args, **kw)
+        verb = args[1]
+        self.events.append(verb)
+        self.targets.append((verb, args[-1]))
+        done = lambda code=0, out="", err="": pilot.subprocess.CompletedProcess(args, code, out, err)  # noqa: E731
+        if verb == "create":
+            if self.create[0] == 0:
+                self.argv = list(args)
+                name = args[args.index("--name") + 1]
+                self.cid = name if self.create_stdout == "" else "id-" + name  # no ID printed: the driver falls back to the name its own successful create made
+            return done(self.create[0], (self.create_stdout if self.create_stdout is not None else self.cid + "\n") if self.create[0] == 0 else "", self.create[1])
+        if verb in ("kill", "rm") and args[-1] != self.cid:
+            self.touched_other = True
+        if verb == "inspect":
+            if self.argv is None or self.removed or args[-1] != self.cid:
+                return done(1, "", f"Error: No such object: {args[-1]}")
+            info = inspect_from_create(self.argv)
+            if self.edit:
+                self.edit(info)
+            return done(0, json.dumps([info]))
+        if verb in ("kill", "rm") and args[-1] != self.cid:
+            return done(1, "", f"Error: No such container: {args[-1]}")
+        if verb == "version":
+            return done(0, "Client: stub 1.0\nServer: stub 1.0\n")
+        if verb == "kill":
+            return done(self.kill[0], "", self.kill[1])
+        if verb == "rm":
+            if self.rm[0] == 0 and not self.survives:
+                self.removed = True
+            return done(self.rm[0], "", self.rm[1])
+        raise AssertionError(f"an unexpected docker call: {args}")
+
+    def flag(self, name):
+        return [self.argv[i + 1] for i, a in enumerate(self.argv) if a == name]
+
+
+def docker_pilot(dataset, tmp_path, monkeypatch, *, phase=None, cfg_over=None, **stub):
+    """run_pilot with the Docker agent sandbox, a stubbed docker CLI and a stubbed `docker start` (run_agent_phase). Returns (events, docker, cfg).
+
+    `events` is the order of everything that matters: docker verbs, "start" (the agent phase) and "collect" (candidate collection)."""
+    events = []
+    docker = AgentDocker(events, **stub)
+    monkeypatch.setattr(pilot.subprocess, "run", docker)
+    default = lambda cmd: {"command": cmd, "exit_code": 0, "timed_out": False, "seconds": 0.1}  # noqa: E731
+    monkeypatch.setattr(pilot, "run_agent_phase", lambda agent_dir, params, timeout_s, cmd=None: (events.append("start"), (phase or default)(cmd))[1])
+    real_collect = pilot.collect_patch
+    monkeypatch.setattr(pilot, "collect_patch", lambda *a, **k: (events.append("collect"), real_collect(*a, **k))[1])
+    return events, docker, cfg_for(dataset, tmp_path, agent_sandbox="docker", **(cfg_over or {}))
+
+
+def test_the_docker_create_command_has_the_name_init_matching_memory_and_swap_tmpfs_and_workdir(tmp_path):
+    agent_dir, bridge_dir = tmp_path / "run" / "agent", tmp_path / "cb-x"
+    bridge_dir.mkdir()
+    argv = pilot.docker_agent_command(agent_dir, bridge_dir, docker_params(agent_dir), protected=(tmp_path / "ds",), **create_kwargs(name="smol-agent-abc", run_id="abc"))
+    assert argv[:2] == ["docker", "create"] and "run" not in argv[:3] and "--rm" not in argv  # created, not run: the driver reads it back, starts it and removes it itself
+
+    def values(flag):
+        return [argv[i + 1] for i, a in enumerate(argv) if a == flag]
+
+    assert values("--name") == ["smol-agent-abc"] and "--init" in argv and "run=abc" in values("--label")
+    assert values("--memory") == ["2g"] and values("--memory-swap") == ["2g"] and values("--memory-swap") != ["0"]  # swap limited to the memory limit: "0" would mean "unset"
+    assert sorted(t.split(":")[0] for t in values("--tmpfs")) == ["/data", "/tmp"] and values("-w") == ["/agent"]  # the image's VOLUME /data is masked; the cwd is the agent directory
+    assert values("--cpus") == ["2"] and values("--pids-limit") == ["256"] and "nofile=1024:1024" in values("--ulimit") and "core=0" in values("--ulimit")
+    custom = pilot.docker_limits(pilot.SandboxLimits(memory_max="3G", tasks_max=100, cpu_quota="150%", fsize_bytes=12345, nofile=77))
+    argv = pilot.docker_agent_command(agent_dir, bridge_dir, docker_params(agent_dir), protected=(tmp_path / "ds",), **create_kwargs(limits=custom))
+    assert [argv[i + 1] for i, a in enumerate(argv) if a in ("--memory", "--memory-swap", "--cpus", "--pids-limit")] == ["3g", "3g", "1.5", "100"]
+
+
+@pytest.mark.parametrize("how", ["normal", "timeout"])
+def test_the_container_is_killed_then_removed_and_confirmed_gone_before_the_candidate_is_collected(dataset, tmp_path, monkeypatch, how):
+    phase = None if how == "normal" else (lambda cmd: {"command": cmd, "exit_code": None, "timed_out": True, "seconds": 5.0})
+    events, docker, cfg = docker_pilot(dataset, tmp_path, monkeypatch, phase=phase)
+    record = pilot.run_pilot(cfg, FakeRunner())
+    assert events == ["create", "inspect", "start", "kill", "rm", "inspect", "collect"]  # kill, then rm, then the confirmation, then (only then) the candidate
+    assert record["status"] == "complete" and record["agent"]["timed_out"] is (how == "timeout")
+    assert record["agent"]["container"]["name"] == f"smol-agent-{record['run_id']}" and record["agent"]["container"]["cleanup"]["gone"] is True
+
+
+def test_the_container_is_killed_and_removed_when_the_agent_phase_raises_and_no_candidate_is_collected(dataset, tmp_path, monkeypatch):
+    def boom(cmd):
+        raise RuntimeError("boom")
+
+    events, docker, cfg = docker_pilot(dataset, tmp_path, monkeypatch, phase=boom)
+    with pytest.raises(RuntimeError, match="boom"):
+        pilot.run_pilot(cfg, FakeRunner())
+    assert events == ["create", "inspect", "start", "kill", "rm", "inspect"] and docker.removed  # the finally path ran; collection never did
+
+
+@pytest.mark.parametrize("stub,message", [
+    ({"kill": (1, "Error response from daemon: permission denied")}, "docker kill failed"),
+    ({"kill": (127, "OSError: docker vanished")}, "docker kill failed"),
+    ({"survives": True}, "not confirmed gone"),
+    ({"rm": (1, "Error: removal of container x is already in progress"), "survives": True}, "not confirmed gone"),
+])
+def test_a_container_that_cannot_be_stopped_and_removed_blocks_candidate_collection_with_an_infrastructure_error(dataset, tmp_path, monkeypatch, stub, message):
+    events, docker, cfg = docker_pilot(dataset, tmp_path, monkeypatch, **stub)
+    record = pilot.run_pilot(cfg, FakeRunner())
+    assert record["status"] == "refused" and message in record["error"] and "the candidate is not collected" in record["error"]
+    assert "collect" not in events and record["candidate"] is None and record["evaluation"] is None and "rm" in events  # removal was still attempted after a failed kill
+    c = record["classification"]
+    assert (c["infrastructure_failure"], c["counts_as_coding_failure"], c["attempt_outcome"]) == (True, False, "infrastructure_failure")
+    assert record["agent"]["exit_code"] == 0  # what is known about the agent phase is kept
+
+
+@pytest.mark.parametrize("kill_error", ["Error response from daemon: cannot kill container: abc: Container 123 is not running", "Error: No such container: abc"])
+def test_a_container_that_already_stopped_or_never_existed_is_not_a_cleanup_failure(dataset, tmp_path, monkeypatch, kill_error):
+    events, docker, cfg = docker_pilot(dataset, tmp_path, monkeypatch, kill=(1, kill_error))
+    record = pilot.run_pilot(cfg, FakeRunner())
+    assert record["status"] == "complete" and events[-1] == "collect"
+
+
+def test_a_missing_docker_binary_during_cleanup_is_a_cleanup_failure_not_a_pass(monkeypatch):
+    def no_docker(args, **kw):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(pilot.subprocess, "run", no_docker)
+    with pytest.raises(pilot.ContainerCleanupError, match="docker kill failed"):
+        pilot.remove_agent_container("smol-agent-x")
+
+
+def direct_container_run(tmp_path, monkeypatch, **stub):
+    """pilot.run_agent_container with the stubbed docker; the agent phase must only run when the read-back accepted the container."""
+    events = []
+    docker = AgentDocker(events, **stub)
+    monkeypatch.setattr(pilot.subprocess, "run", docker)
+    monkeypatch.setattr(pilot, "run_agent_phase", lambda agent_dir, params, timeout_s, cmd=None: (events.append("start"), {"command": cmd, "exit_code": 0, "timed_out": False, "seconds": 0.1})[1])
+    agent_dir, bridge_dir = tmp_path / "run" / "agent", tmp_path / "cb-x"
+    bridge_dir.mkdir(exist_ok=True)
+    inspect_path = tmp_path / "run" / "agent_container_inspect.json"
+    kwargs = dict(name="smol-agent-t", run_id="t", protected=(tmp_path / "ds",), image="img:1", limits=pilot.docker_limits(pilot.SandboxLimits()), inspect_path=inspect_path)
+    return events, docker, inspect_path, lambda: pilot.run_agent_container(agent_dir, bridge_dir, docker_params(agent_dir), 5, **kwargs)
+
+
+def test_an_untouched_inspect_result_passes_the_read_back_and_the_container_is_started_and_recorded(tmp_path, monkeypatch):
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch)
+    result = run()
+    assert events == ["create", "inspect", "start", "kill", "rm", "inspect"]
+    assert result["container"]["isolation"]["NetworkMode"] == "none" and result["container"]["isolation"]["MemorySwap"] == result["container"]["isolation"]["Memory"]
+    assert result["container"]["inspect_file"] == inspect_path.name and json.loads(inspect_path.read_text())["HostConfig"]["ReadonlyRootfs"] is True
+    assert result["command"][:2] == ["docker", "create"] and result["start_command"] == ["docker", "start", "-a", "smol-agent-t"]
+
+
+def _extra_mount(info):
+    info["HostConfig"]["Binds"].append("/home/x:/h:rw")
+    info["Mounts"].append({"Type": "bind", "Source": "/home/x", "Destination": "/h", "Mode": "rw", "RW": True})
+
+
+@pytest.mark.parametrize("label,edit,field", [
+    ("an extra bind mount", _extra_mount, "Binds"),
+    ("an extra (image) volume", lambda i: i["Mounts"].append({"Type": "volume", "Destination": "/data", "RW": True}), "Mounts"),
+    ("a read-only mount made writable", lambda i: i["HostConfig"].update(Binds=[b[:-3] + ":rw" if b.endswith(":ro") else b for b in i["HostConfig"]["Binds"]]), "Binds"),
+    ("network not none", lambda i: i["HostConfig"].update(NetworkMode="bridge"), "NetworkMode"),
+    ("ipc not none", lambda i: i["HostConfig"].update(IpcMode="host"), "IpcMode"),
+    ("swap unset", lambda i: i["HostConfig"].update(MemorySwap=0), "MemorySwap"),
+    ("swap unlimited", lambda i: i["HostConfig"].update(MemorySwap=-1), "MemorySwap"),
+    ("memory differs", lambda i: i["HostConfig"].update(Memory=1 << 40), "Memory"),
+    ("pids limit differs", lambda i: i["HostConfig"].update(PidsLimit=-1), "PidsLimit"),
+    ("cpus differ", lambda i: i["HostConfig"].update(NanoCpus=0), "NanoCpus"),
+    ("privileged", lambda i: i["HostConfig"].update(Privileged=True), "Privileged"),
+    ("writable root filesystem", lambda i: i["HostConfig"].update(ReadonlyRootfs=False), "ReadonlyRootfs"),
+    ("capabilities not dropped", lambda i: i["HostConfig"].update(CapDrop=[]), "CapDrop"),
+    ("no-new-privileges missing", lambda i: i["HostConfig"].update(SecurityOpt=[]), "SecurityOpt"),
+    ("no init", lambda i: i["HostConfig"].update(Init=False), "Init"),
+    ("a device", lambda i: i["HostConfig"].update(Devices=[{"PathOnHost": "/dev/kvm"}]), "Devices"),
+    ("a published port", lambda i: i["HostConfig"].update(PortBindings={"80/tcp": [{"HostPort": "80"}]}), "PortBindings"),
+    ("no /data tmpfs", lambda i: i["HostConfig"]["Tmpfs"].pop("/data"), "Tmpfs"),
+    ("running as root", lambda i: i["Config"].update(User="0:0"), "User"),
+    ("another working directory", lambda i: i["Config"].update(WorkingDir="/data"), "WorkingDir"),
+    ("another entrypoint", lambda i: i["Config"].update(Entrypoint=["sh"]), "Entrypoint"),
+])
+def test_an_inspect_read_back_that_differs_from_the_configuration_refuses_to_start_and_still_cleans_up(tmp_path, monkeypatch, label, edit, field):
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch, edit=edit)
+    with pytest.raises(pilot.PilotError, match="refusing to start") as caught:
+        run()
+    assert field in str(caught.value), (label, str(caught.value))
+    assert "start" not in events and events[:2] == ["create", "inspect"] and events[2:] == ["kill", "rm", "inspect"] and docker.removed  # never started; the created container was removed
+    assert inspect_path.exists()  # the evidence is kept even for a refusal
+
+
+def test_a_failed_docker_create_never_starts_anything_and_cleans_nothing_up(tmp_path, monkeypatch):
+    # The earlier version of this test asserted ["create", "kill", "rm", "inspect"]: cleanup BY NAME after a failed create, which is the bug
+    # (it would kill and remove whichever other container held the name).
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch, create=(125, "Error: image not found locally"))
+    with pytest.raises(pilot.PilotError, match="docker create failed: Error: image not found locally"):
+        run()
+    assert events == ["create"] and not inspect_path.exists() and not docker.touched_other
+
+
+def test_a_name_conflict_on_create_leaves_the_other_container_untouched(tmp_path, monkeypatch):
+    conflict = 'docker: Error response from daemon: Conflict. The container name "/smol-agent-t" is already in use by container "9f3c". You have to remove (or rename) that container to be able to reuse that name.'
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch, create=(125, conflict))
+    with pytest.raises(pilot.PilotError, match="docker create failed: .*already in use"):
+        run()
+    assert events == ["create"] and "kill" not in events and "rm" not in events and "inspect" not in events
+    assert docker.touched_other is False and docker.removed is False and not inspect_path.exists()  # the stale container that holds the name was neither killed nor removed
+
+
+def test_after_a_successful_create_inspect_kill_and_rm_address_the_printed_id_in_order(tmp_path, monkeypatch):
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch)
+    result = run()
+    assert docker.cid == "id-smol-agent-t" and result["container"]["id"] == docker.cid and result["container"]["name"] == "smol-agent-t"
+    assert events == ["create", "inspect", "start", "kill", "rm", "inspect"]
+    assert [t for t in docker.targets if t[0] != "create"] == [("inspect", docker.cid), ("kill", docker.cid), ("rm", docker.cid), ("inspect", docker.cid)]
+    assert docker.removed and not docker.touched_other
+
+
+def test_a_successful_create_that_prints_no_id_is_cleaned_up_by_the_name_it_created(tmp_path, monkeypatch):
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch, create_stdout="")
+    run()
+    assert docker.cid == "smol-agent-t" and [t for t in docker.targets if t[0] in ("kill", "rm")] == [("kill", "smol-agent-t"), ("rm", "smol-agent-t")] and docker.removed
+
+
+@pytest.mark.parametrize("how", ["timeout", "raises", "refused"])
+def test_cleanup_after_a_created_container_uses_the_id_and_keeps_its_order_on_every_exit(tmp_path, monkeypatch, how):
+    events, docker, inspect_path, run = direct_container_run(tmp_path, monkeypatch, edit=(lambda i: i["HostConfig"].update(NetworkMode="bridge")) if how == "refused" else None)
+    if how == "timeout":
+        monkeypatch.setattr(pilot, "run_agent_phase", lambda agent_dir, params, timeout_s, cmd=None: (events.append("start"), {"command": cmd, "exit_code": None, "timed_out": True, "seconds": 5.0})[1])
+    if how == "raises":
+        def boom(*a, **k):
+            events.append("start")
+            raise RuntimeError("boom")
+        monkeypatch.setattr(pilot, "run_agent_phase", boom)
+    if how == "timeout":
+        assert run()["timed_out"] is True
+    else:
+        with pytest.raises((RuntimeError, pilot.PilotError)):
+            run()
+    tail = events[events.index("start") + 1:] if "start" in events else events[2:]
+    assert tail == ["kill", "rm", "inspect"] and docker.removed and not docker.touched_other
+    assert [t for t in docker.targets if t[0] in ("kill", "rm")] == [("kill", docker.cid), ("rm", docker.cid)]
+
+
+def test_run_json_limits_equal_the_values_passed_to_docker_and_the_inspect_evidence_is_recorded(dataset, tmp_path, monkeypatch):
+    custom = pilot.SandboxLimits(memory_max="3G", tasks_max=100, cpu_quota="150%", fsize_bytes=12345, nofile=77)
+    events, docker, cfg = docker_pilot(dataset, tmp_path, monkeypatch, cfg_over={"sandbox_limits": custom})
+    record = pilot.run_pilot(cfg, FakeRunner())
+    run_dir = tmp_path / "out" / record["run_id"]
+    saved = json.loads((run_dir / "run.json").read_text())["sandbox"]["limits"]
+    passed = {"memory": docker.flag("--memory")[0], "memory_swap": docker.flag("--memory-swap")[0], "cpus": docker.flag("--cpus")[0], "pids_limit": int(docker.flag("--pids-limit")[0]),
+              "nofile": int(next(u for u in docker.flag("--ulimit") if u.startswith("nofile=")).split("=")[1].split(":")[0]),
+              "fsize_bytes": int(next(u for u in docker.flag("--ulimit") if u.startswith("fsize=")).split("=")[1])}
+    assert passed == {"memory": "3g", "memory_swap": "3g", "cpus": "1.5", "pids_limit": 100, "nofile": 77, "fsize_bytes": 12345}  # what the command carries
+    assert {k: saved[k] for k in passed} == passed == {k: record["sandbox"]["limits"][k] for k in passed}  # and what run.json says: the same values, not a second copy of the config
+    assert record["sandbox"]["isolation"]["Memory"] == 3 * 1024**3 == record["sandbox"]["isolation"]["MemorySwap"]
+    evidence = json.loads((run_dir / "agent_container_inspect.json").read_text())
+    assert evidence["HostConfig"]["NetworkMode"] == "none" and not (run_dir / "agent" / "agent_container_inspect.json").exists()  # kept beside run.json, not where the agent can read it
+
+
+# ---- --tool-calling-mode: chosen on the command line, passed to the agent child, recorded in run.json (default react: unchanged) --------------------
+def test_the_driver_accepts_exactly_the_effgen_tool_calling_modes_and_defaults_to_react():
+    import smol_harness.harness as harness_mod
+
+    assert pilot.TOOL_CALLING_MODES == harness_mod.TOOL_CALLING_MODES  # the driver's list cannot drift from the harness's
+    base = ["run", "--out", "/tmp/x", "--model", "m:1"]
+    assert pilot.build_parser().parse_args(base).tool_calling_mode == "react"
+    for mode in pilot.TOOL_CALLING_MODES:
+        assert pilot.build_parser().parse_args([*base, "--tool-calling-mode", mode]).tool_calling_mode == mode
+    with pytest.raises(SystemExit):
+        pilot.build_parser().parse_args([*base, "--tool-calling-mode", "telepathy"])
+    assert pilot.RunConfig(out_dir=Path("/tmp/x")).tool_calling_mode == "react"
+
+
+def test_main_passes_the_chosen_mode_into_the_run_config(tmp_path, monkeypatch, capsys):
+    seen = {}
+
+    def fake_run_pilot(cfg, runner, **kw):
+        seen["cfg"] = cfg
+        return {"run_id": "r", "status": "complete", "resolved": False}
+
+    monkeypatch.setattr(pilot, "run_pilot", fake_run_pilot)
+    base = ["run", "--out", str(tmp_path / "out"), "--dataset-dir", str(tmp_path / "ds"), "--model", "m:1", "--allow-model-call"]  # a temporary dataset path: the real one is never touched
+    assert pilot.main(base) == 0
+    assert seen["cfg"].tool_calling_mode == "react"
+    assert pilot.main([*base, "--tool-calling-mode", "hybrid"]) == 0
+    assert seen["cfg"].tool_calling_mode == "hybrid"
+    capsys.readouterr()
+
+
+@needs_patch
+@pytest.mark.parametrize("mode", [None, "react", "hybrid"])
+def test_run_json_params_and_the_child_result_record_the_tool_calling_mode(dataset, tmp_path, mode):
+    over = {} if mode is None else {"tool_calling_mode": mode}
+    record = pilot.run_pilot(cfg_for(dataset, tmp_path, **over), FakeRunner(), agent_cmd=fake_agent())
+    expected = mode or "react"  # not given: the default, exactly what the harness used before the option existed
+    run_dir = tmp_path / "out" / record["run_id"]
+    saved = json.loads((run_dir / "run.json").read_text())
+    assert record["config"]["tool_calling_mode"] == expected and saved["config"]["tool_calling_mode"] == expected  # next to the other run settings
+    assert record["provenance"]["tool_calling_mode"] == expected and saved["provenance"]["tool_calling_mode"] == expected  # and in the provenance
+    assert json.loads((run_dir / "agent" / "params.json").read_text())["tool_calling_mode"] == expected  # the child receives it through the same params file as every other setting
+
+
+@pytest.mark.parametrize("params_mode,expected", [(None, "react"), ("hybrid", "hybrid"), ("auto", "auto")])
+def test_the_agent_child_builds_the_harness_with_the_requested_mode_and_records_it(tmp_path, monkeypatch, params_mode, expected):
+    import smol_harness.harness as harness_mod
+
+    seen = {}
+
+    def stop_here(config, **kw):  # records what the child asked the builder for, then ends the run deterministically
+        seen.update(kw)
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(harness_mod, "build_harness_from_config", stop_here)
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    (agent_dir / "harness.yaml").write_text(pilot.render_config(agent_dir / "workspace", {"provider": "ollama", "model": BIG, "context_length": 8192, "base_url": "http://127.0.0.1:11434/v1",
+                                                                                           "worker_timeout_s": 60, "max_iterations": 6}))
+    (agent_dir / "prompt.txt").write_text("task")
+    (agent_dir / "workspace").mkdir()
+    params = {"config_path": str(agent_dir / "harness.yaml"), "prompt_path": str(agent_dir / "prompt.txt"), "out_dir": str(agent_dir), "max_tokens": 1, "temperature": 0.1, "seed": 0,
+              "workspace": str(agent_dir / "workspace")}
+    if params_mode is not None:
+        params["tool_calling_mode"] = params_mode
+    assert pilot.run_agent(params) == 3  # the stand-in builder raised: recorded, not raised past the driver
+    assert seen["tool_calling_mode"] == expected  # reached the harness builder (the default is react: the value the builder itself defaults to)
+    result = json.loads((agent_dir / "agent_result.json").read_text())
+    assert result["tool_calling_mode"] == expected and result["error"] == "RuntimeError: stop"
+
+
+def test_an_unknown_tool_calling_mode_is_refused_before_anything_starts(dataset, tmp_path):
+    record = pilot.run_pilot(cfg_for(dataset, tmp_path, tool_calling_mode="telepathy"), FakeRunner(), agent_cmd=fake_agent())
+    assert record["status"] == "refused" and "unknown tool calling mode" in record["error"] and record["agent"] is None
+    assert record["classification"]["infrastructure_failure"] is True and record["classification"]["counts_as_coding_failure"] is False
 
 
 # ---- the real harness through its public API, with a scripted model --------------------------------------------------------------
@@ -1404,6 +2304,7 @@ def test_the_agent_phase_runs_the_real_harness_with_a_scripted_model_and_records
                for c in fake.instances[BIG].calls)  # and was offered it, with its contract
     result = json.loads((agent_dir / "agent_result.json").read_text())
     assert result["agent_reported_success"] is True and result["workers"][0]["worker"] == "coder" and result["workers"][0]["status"] == "completed"
+    assert result["workspace_changed"] is True  # the verification the success flag now rests on
     assert result["generation_overrides_requested"] == {"max_tokens": 321, "temperature": 0.2, "seed": 7} and "U17" in result["note"]
     assert (Path(result["history_dir"]) / "trace.jsonl").exists()
     text, meta = pilot.collect_patch(_pristine(dataset, tmp_path), ws)
@@ -1413,6 +2314,32 @@ def test_the_agent_phase_runs_the_real_harness_with_a_scripted_model_and_records
     assert len(calls) == 4 and any(STATEMENT in str(c.prompt) for c in calls)  # the task statement reached the model...
     assert all(GOLD not in str(c.prompt) and TEST_PATCH not in str(c.prompt) and DECOY not in str(c.prompt) for c in calls)  # ...and nothing evaluator-only did
     assert {c.config.max_tokens for c in calls} == {321} and {c.config.seed for c in calls} == {7}  # the requested generation settings really reached every call
+
+
+@needs_patch
+def test_an_agent_that_answers_without_changing_the_workspace_is_not_a_success_and_the_child_exits_1(dataset, spec, tmp_path, monkeypatch):
+    # The harness verifies the claim: `agent_reported_success = result.success and workspace_changed`. Here effGen itself sees a normal answer (termination "done"), but the
+    # coder never calls edit_file and the workspace is byte-identical, so the child records a failure, says why in the output and exits 1.
+    fake = FakeModels()
+    fake.scripts[BIG] = [delegate("coder", "fix add in mini/core.py"), "Thought: looked.\nFinal Answer: I changed add to add", FINAL]
+    monkeypatch.setattr(models_mod, "build_model", fake.build)
+    agent_dir, ws = tmp_path / "agent", tmp_path / "agent" / "workspace"
+    root, sha = dataset
+    pilot.extract_snapshot(root / "snapshots" / "mini_1.tgz", ws, sha, include_git=False)
+    (agent_dir / "prompt.txt").write_text(pilot.build_prompt(spec))
+    (agent_dir / "harness.yaml").write_text(pilot.render_config(ws, {"provider": "ollama", "model": BIG, "context_length": 8192, "base_url": "http://127.0.0.1:11434/v1",
+                                                                      "worker_timeout_s": 60, "max_iterations": 6}))
+    params = {"config_path": str(agent_dir / "harness.yaml"), "prompt_path": str(agent_dir / "prompt.txt"), "out_dir": str(agent_dir),
+              "max_tokens": 321, "temperature": 0.2, "seed": 7, "workspace": str(ws)}
+    assert pilot.run_agent(params) == 1  # not 0: the run did not do what it claims
+    result = json.loads((agent_dir / "agent_result.json").read_text())
+    assert result["error"] is None and result["termination"] == "done"  # effGen saw an ordinary answer...
+    assert result["workspace_changed"] is False and result["agent_reported_success"] is False  # ...the harness did not accept it
+    assert result["output"].startswith("all done") and result["output"].endswith("Harness verification: no workspace change was detected; the edit is unresolved.")
+    assert result["workers"][0]["status"] == "completed" and result["workers"][0]["tool_calls"] == 0  # the coder really made no tool call
+    assert (ws / "mini/core.py").read_text() == CORE_OLD
+    _, meta = pilot.collect_patch(_pristine(dataset, tmp_path), ws)
+    assert meta["included_files"] == []
 
 
 def _pristine(dataset, tmp_path) -> Path:

@@ -18,3 +18,7 @@ AGENTS.md
 /dataset/
 /embeddings
 /pilot-results/
+
+# Gemma pilot run artifacts: run directories hold agent workspaces and local absolute paths; keep them out of Git
+/gemma_eval_runs/
+/new_gemma_eval_runs/
