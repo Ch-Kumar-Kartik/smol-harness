@@ -42,6 +42,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 SCHEMA_VERSION = 1
 TASK_ID = "rich_3278"
+MAX_TEST_REPAIR_ATTEMPTS = 1
 SNAPSHOT_SHA256 = {"rich_3278": "bda96e09e9e02fa372b2cf6c5f3f2760f97d292fb531cc631564632940d6a453"}
 EVAL_PACKAGES = ("pytest==8.3.4", "pygments", "markdown-it-py")  # what rich_3278's tests need; installed offline from the dataset's wheels
 MAX_CHANGED_FILES, MAX_PATCH_BYTES = 50, 2_000_000
@@ -479,6 +480,9 @@ def evaluate(spec: TaskSpec, candidate: str, work_dir: Path, runner, *, label: s
         parsed = parse_pytest(ran["stdout"])
         resolved, problems = judge(parsed, ran["exit_code"], spec.required_tests)
         rec["result"] = {k: v for k, v in ran.items() if k not in ("stdout", "stderr")} | {k: v for k, v in parsed.items() if k != "node_status"}
+        rec["result"]["failed_tests"] = sorted(
+            name for name, status in parsed["node_status"].items() if status in ("FAILED", "ERROR")
+        )
         rec["result"]["stdout_sha256"] = sha256_bytes(ran["stdout"].encode())
         rec["result"]["output_tail"] = ran["stdout"][-1500:]
         if ran.get("timed_out"):  # the OUTER timeout (`docker start` was killed, its output discarded): no marker can exist. The INNER one (`timeout` inside the script) prints the marker and is judged below.
@@ -793,6 +797,28 @@ def run_agent(params: dict) -> int:
     result_doc.update(seconds=round(time.monotonic() - started, 2), finished=now())
     write_json(out / "agent_result.json", result_doc)
     return code
+
+
+def build_repair_prompt(original_prompt: str, evaluation: dict) -> str:
+    """Give one repair pass bounded test feedback without exposing test source or assertions."""
+    result = evaluation.get("result") or {}
+    feedback = [
+        "The independent harness evaluator ran your candidate, but the tests did not all pass.",
+        f"Evaluator outcome: {evaluation.get('outcome')}.",
+        f"Pytest exit code: {result.get('pytest_exit')}; passed: {result.get('passed', 0)}; "
+        f"failed: {result.get('failed', 0)}; errors: {result.get('errors', 0)}.",
+    ]
+    failed_tests = result.get("failed_tests") or []
+    if failed_tests:
+        feedback.append("Failing test node IDs (names only; test source and assertions are not provided):")
+        feedback.extend(f"- {name}" for name in failed_tests)
+    feedback.extend(
+        [
+            "Review your source change and make the smallest correction that fixes the failures while preserving existing behavior.",
+            "Do not modify tests or configuration files. This is the only repair attempt; if unresolved, report that honestly.",
+        ]
+    )
+    return f"{original_prompt.rstrip()}\n\nHarness test feedback:\n" + "\n".join(feedback) + "\n"
 
 
 def run_agent_phase(agent_dir: Path, params: dict, timeout_s: float, cmd: list[str] | None = None) -> dict:
@@ -1575,7 +1601,8 @@ def run_pilot(cfg: RunConfig, runner, *, agent_cmd: list[str] | None = None) -> 
     record: dict = {"schema_version": SCHEMA_VERSION, "run_id": run_id, "task_id": spec.task_id, "started": now(), "snapshot_sha256": spec.snapshot_sha256,
                     "declared_base_commit": spec.base_commit, "deviations": list(DEVIATIONS), "config": {k: str(v) if isinstance(v, Path) else v for k, v in vars(cfg).items() if k not in ("limits", "sandbox_limits")},
                     "container_limits": vars(cfg.limits), "basis": BASIS.get(cfg.task_id), "provenance": {**collect_provenance(), "tool_calling_mode": cfg.tool_calling_mode}, "model_identity": None, "sandbox": None,
-                    "agent": None, "candidate": None, "evaluation": None, "resolved": False, "status": "started"}
+                    "agent": None, "candidate": None, "evaluation": None, "resolved": False, "status": "started",
+                    "repair": {"max_attempts": MAX_TEST_REPAIR_ATTEMPTS, "attempts": []}}
     sandboxed = agent_cmd is None  # an injected command is for tests only; a real run is ALWAYS sandboxed, or refused
     try:
         if cfg.tool_calling_mode not in TOOL_CALLING_MODES:  # refused here, not as a harness error after the agent was started
@@ -1614,45 +1641,106 @@ def run_pilot(cfg: RunConfig, runner, *, agent_cmd: list[str] | None = None) -> 
             raise PilotError(f"the model identity could not be established, so the agent was not started: {record['model_identity']['reason']}")
         params = {"config_path": str(agent_dir / "harness.yaml"), "prompt_path": str(agent_dir / "prompt.txt"), "out_dir": str(agent_dir),
                   "max_tokens": cfg.max_tokens, "temperature": cfg.temperature, "seed": cfg.seed, "workspace": str(workspace), "tool_calling_mode": cfg.tool_calling_mode}
-        if sandboxed and cfg.agent_sandbox == "bwrap":
-            bridge_dir = Path(tempfile.mkdtemp(prefix="cb-"))  # a short path: unix socket paths are limited to about 100 characters
-            try:
-                with ModelBridge(bridge_dir, *endpoint):
-                    params["bridge"] = {"port": endpoint[1], "socket": "/bridge/m.sock"}
-                    inner = [sys.executable, str(Path(__file__).resolve()), "agent-child", "--params", str(agent_dir / "params.json")]
-                    record["agent"] = run_agent_phase(agent_dir, params, cfg.agent_timeout_s, sandbox_command(agent_dir, inner, cfg.sandbox_limits, extra_binds=((str(bridge_dir), "/bridge"),)))
-            finally:
-                shutil.rmtree(bridge_dir, ignore_errors=True)
-        elif sandboxed and cfg.agent_sandbox == "docker":
-            bridge_dir = Path(tempfile.mkdtemp(prefix="cb-"))
-            try:
-                harness_config = agent_dir / "harness.yaml"
-                harness_config.write_text(harness_config.read_text().replace(str(workspace), "/agent/workspace"))
-                with ModelBridge(bridge_dir, *endpoint):
-                    params["bridge"] = {"port": endpoint[1], "socket": "/bridge/m.sock"}
-                    limits = docker_limits(cfg.sandbox_limits)  # builds the docker command AND is what run.json records
-                    record["sandbox"] = {"kind": "Docker", "network": "none; a unix-socket bridge to the configured model endpoint only",
-                                         "image": cfg.agent_image, "limits": limits, "container": f"smol-agent-{run_id}"}
-                    try:
-                        record["agent"] = run_agent_container(agent_dir, bridge_dir, params, cfg.agent_timeout_s, name=record["sandbox"]["container"], run_id=run_id,
-                                                              protected=(cfg.dataset_dir, eval_dir, pristine), image=cfg.agent_image, limits=limits,
-                                                              inspect_path=run_dir / "agent_container_inspect.json")
-                    except ContainerCleanupError as exc:  # the candidate is NOT collected; what is known about the agent phase is kept
-                        record["agent"] = exc.agent_result
-                        raise
-                    record["sandbox"]["isolation"] = record["agent"]["container"]["isolation"]
-            finally:
-                shutil.rmtree(bridge_dir, ignore_errors=True)
-        else:
+        def run_agent_attempt(attempt_number: int, attempt_params: dict) -> dict:
+            if sandboxed and cfg.agent_sandbox == "bwrap":
+                bridge_dir = Path(tempfile.mkdtemp(prefix="cb-"))
+                try:
+                    with ModelBridge(bridge_dir, *endpoint):
+                        attempt_params["bridge"] = {"port": endpoint[1], "socket": "/bridge/m.sock"}
+                        inner = [sys.executable, str(Path(__file__).resolve()), "agent-child", "--params", str(agent_dir / "params.json")]
+                        return run_agent_phase(
+                            agent_dir,
+                            attempt_params,
+                            cfg.agent_timeout_s,
+                            sandbox_command(agent_dir, inner, cfg.sandbox_limits, extra_binds=((str(bridge_dir), "/bridge"),)),
+                        )
+                finally:
+                    shutil.rmtree(bridge_dir, ignore_errors=True)
+            if sandboxed and cfg.agent_sandbox == "docker":
+                bridge_dir = Path(tempfile.mkdtemp(prefix="cb-"))
+                try:
+                    harness_config = agent_dir / "harness.yaml"
+                    harness_config.write_text(harness_config.read_text().replace(str(workspace), "/agent/workspace"))
+                    with ModelBridge(bridge_dir, *endpoint):
+                        attempt_params["bridge"] = {"port": endpoint[1], "socket": "/bridge/m.sock"}
+                        limits = docker_limits(cfg.sandbox_limits)
+                        name = f"smol-agent-{run_id}" if attempt_number == 0 else f"smol-agent-{run_id}-repair-{attempt_number}"
+                        record["sandbox"].update(kind="Docker", image=cfg.agent_image, limits=limits, container=name)
+                        try:
+                            phase = run_agent_container(
+                                agent_dir,
+                                bridge_dir,
+                                attempt_params,
+                                cfg.agent_timeout_s,
+                                name=name,
+                                run_id=run_id,
+                                protected=(cfg.dataset_dir, eval_dir, pristine),
+                                image=cfg.agent_image,
+                                limits=limits,
+                                inspect_path=run_dir / ("agent_container_inspect.json" if attempt_number == 0 else f"agent_container_inspect-repair-{attempt_number}.json"),
+                            )
+                        except ContainerCleanupError as exc:
+                            record["agent"] = exc.agent_result
+                            raise
+                        record["sandbox"]["isolation"] = phase["container"]["isolation"]
+                        return phase
+                finally:
+                    shutil.rmtree(bridge_dir, ignore_errors=True)
             if sandboxed:
                 raise PilotError(f"unknown agent sandbox {cfg.agent_sandbox!r}")
-            record["agent"] = run_agent_phase(agent_dir, params, cfg.agent_timeout_s, agent_cmd)
-        result_path = agent_dir / "agent_result.json"
-        record["agent"]["result"] = json.loads(result_path.read_text()) if result_path.exists() else None
-        patch, meta = collect_patch(pristine, workspace, frozenset(spec.test_files))  # fails closed on links, binary files, too many files
+            return run_agent_phase(agent_dir, attempt_params, cfg.agent_timeout_s, agent_cmd)
+
+        attempt_params = dict(params)
+        for attempt_number in range(MAX_TEST_REPAIR_ATTEMPTS + 1):
+            (agent_dir / "agent_result.json").unlink(missing_ok=True)
+            phase = run_agent_attempt(attempt_number, attempt_params)
+            result_path = agent_dir / "agent_result.json"
+            agent_result = json.loads(result_path.read_text()) if result_path.exists() else None
+            record["agent"] = {**phase, "result": agent_result}
+            patch, meta = collect_patch(pristine, workspace, frozenset(spec.test_files))  # fails closed on links, binary files, too many files
+            evaluation = evaluate(
+                spec,
+                patch,
+                eval_dir / f"eval-{attempt_number + 1}",
+                runner,
+                label="candidate" if attempt_number == 0 else f"candidate-repair-{attempt_number}",
+                limits=cfg.limits,
+            )
+            attempt_id = f"{attempt_number + 1:02d}"
+            (run_dir / f"candidate-attempt-{attempt_id}.patch").write_text(patch)
+            write_json(run_dir / f"evaluation-attempt-{attempt_id}.json", evaluation)
+            record["repair"]["attempts"].append(
+                {
+                    "attempt": attempt_number + 1,
+                    "agent": {
+                        "exit_code": phase.get("exit_code"),
+                        "timed_out": phase.get("timed_out"),
+                        "seconds": phase.get("seconds"),
+                        "agent_reported_success": (agent_result or {}).get("agent_reported_success"),
+                        "termination": (agent_result or {}).get("termination"),
+                        "model_failure": (agent_result or {}).get("model_failure"),
+                        "workers": (agent_result or {}).get("workers", []),
+                    },
+                    "prompt_sha256": sha256_file(Path(attempt_params["prompt_path"])),
+                    "candidate": meta,
+                    "evaluation": {
+                        "outcome": evaluation["outcome"],
+                        "resolved": evaluation["resolved"],
+                        "problems": evaluation["problems"],
+                        "failed_tests": (evaluation.get("result") or {}).get("failed_tests", []),
+                    },
+                }
+            )
+            record["candidate"] = meta
+            record["evaluation"] = evaluation
+            if evaluation["outcome"] != "unresolved_tests_failed" or attempt_number >= MAX_TEST_REPAIR_ATTEMPTS:
+                break
+
+            repair_prompt = agent_dir / f"repair-prompt-{attempt_number + 1:02d}.txt"
+            repair_prompt.write_text(build_repair_prompt((agent_dir / "prompt.txt").read_text(), evaluation))
+            attempt_params = {**params, "prompt_path": str(repair_prompt)}
+
         (run_dir / "candidate.patch").write_text(patch)
-        record["candidate"] = meta
-        record["evaluation"] = evaluate(spec, patch, eval_dir / "eval", runner, limits=cfg.limits)
         write_json(run_dir / "evaluation.json", record["evaluation"])
         record["resolved"] = bool(record["evaluation"]["resolved"])  # the evaluator's verdict; the agent's own success flag is recorded but never used
         record["status"] = "complete"
