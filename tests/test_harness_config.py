@@ -239,6 +239,16 @@ def test_the_effgen_settings_that_matter_are_stated_not_defaulted(tmp_path, mode
         assert isinstance(a.config.model, ScriptedModel)  # an instance: effGen never loads a model by itself
 
 
+def test_ollama_request_timeout_and_client_retries_reach_the_model_builder_per_model(tmp_path, models):
+    custom = {"provider": "ollama", "model": BIG, "context_length": 8192, "request_timeout_s": 240, "client_max_retries": 1}
+    with build_harness_from_config(make_config(tmp_path, orchestrator={"model": custom})):
+        pass
+    by_model = {spec.model: spec for spec in models.loads}
+    assert (by_model[BIG].request_timeout_s, by_model[BIG].client_max_retries) == (240, 1)
+    assert (by_model[SMALL].request_timeout_s, by_model[SMALL].client_max_retries) == (60, 3)  # omitted keys keep today's behaviour
+    assert (by_model[TINY].request_timeout_s, by_model[TINY].client_max_retries) == (60, 3)  # hf carries the inert defaults
+
+
 def test_ollama_context_length_becomes_the_agent_side_limit_and_hf_gets_none(tmp_path, models, agents):
     # AGENT-side prompt budget only. It does not, and cannot, set the Ollama server's own context window (review F4).
     models.scripts[BIG] = [delegate("reader", "READ-TASK-MARKER"), delegate("thinker", "think"), FINAL]

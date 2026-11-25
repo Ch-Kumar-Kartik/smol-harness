@@ -29,7 +29,14 @@ from effgen.models import load_model
 from effgen.models.base import BaseModel, ModelType
 from effgen.models.openai_compatible_adapter import OpenAICompatibleAdapter
 
-from smol_harness.config import HF_QUANTIZATIONS, OLLAMA_QUANTIZATIONS, ModelSpec, hf_placement_problem
+from smol_harness.config import (
+    DEFAULT_CLIENT_MAX_RETRIES,
+    DEFAULT_REQUEST_TIMEOUT_S,
+    HF_QUANTIZATIONS,
+    OLLAMA_QUANTIZATIONS,
+    ModelSpec,
+    hf_placement_problem,
+)
 
 # config quantization -> effGen `quantization_bits` (audit §1.7). Exhaustive on purpose: no default.
 HF_QUANTIZATION_BITS: dict[str, int | None] = {"none": None, "bnb-8bit": 8, "bnb-4bit-nf4": 4}
@@ -100,6 +107,9 @@ def loader_args(spec: ModelSpec) -> tuple[str, dict[str, Any]]:
             "provider": "openai_compatible",
             "base_url": spec.base_url,
             "context_length": spec.context_length,
+            # OpenAICompatibleAdapter(timeout=, max_retries=) -> OpenAI(timeout=, max_retries=); the defaults are effGen's own (60, 3).
+            "timeout": spec.request_timeout_s,
+            "max_retries": spec.client_max_retries,
         }
 
     if spec.provider == "hf":
@@ -108,6 +118,8 @@ def loader_args(spec: ModelSpec) -> tuple[str, dict[str, Any]]:
                              "(bnb-4bit-fp4 is not supported: effGen hard-codes NF4)")
         if spec.base_url is not None or spec.context_length is not None:
             raise ValueError("base_url / context_length do not apply to hf models")
+        if spec.request_timeout_s != DEFAULT_REQUEST_TIMEOUT_S or spec.client_max_retries != DEFAULT_CLIENT_MAX_RETRIES:
+            raise ValueError("request_timeout_s / client_max_retries do not apply to hf models")
         problem = hf_placement_problem(spec.device, spec.quantization, spec.dtype)
         if problem:
             raise ValueError(f"unsupported hf placement: {problem}")
