@@ -2404,6 +2404,126 @@ def test_run_json_and_the_harness_yaml_carry_the_request_settings_when_given_and
     assert saved["hashes"]["harness_yaml_sha256"] == pilot.sha256_file(run_dir / "agent" / "harness.yaml")
 
 
+# ---- --worker-timeout-s: replaces the worker timeout (limits.worker_timeout_s, default 300); absent = nothing changes ---------------------------------
+def test_the_worker_timeout_flag_defaults_to_not_given_and_parses_as_a_float():
+    base = ["run", "--out", "/tmp/x", "--model", "m:1"]
+    assert pilot.build_parser().parse_args(base).worker_timeout_s is None
+    assert pilot.build_parser().parse_args([*base, "--worker-timeout-s", "120"]).worker_timeout_s == 120.0
+    assert pilot.build_parser().parse_args([*base, "--worker-timeout-s", "0.5"]).worker_timeout_s == 0.5
+    with pytest.raises(SystemExit):
+        pilot.build_parser().parse_args([*base, "--worker-timeout-s", "soon"])
+    assert pilot.RunConfig(out_dir=Path("/tmp/x")).worker_timeout_s == 300  # the value every recorded run used
+
+
+def test_without_the_worker_timeout_flag_the_yaml_limit_is_300_and_the_golden_render_is_unchanged(tmp_path):
+    import yaml
+
+    text = pilot.render_config(Path("/agent/workspace"), RENDER_ARGS)
+    assert yaml.safe_load(text)["limits"] == {"worker_timeout_s": 300}
+    assert pilot.sha256_bytes(text.encode()) == ORIGINAL_RENDER_SHA256
+
+
+def test_with_the_worker_timeout_the_value_is_in_the_yaml_limits_and_the_config_loads(tmp_path):
+    import yaml
+
+    from smol_harness.config import loads_config
+
+    (tmp_path / "ws").mkdir()
+    text = pilot.render_config(tmp_path / "ws", {**RENDER_ARGS, "worker_timeout_s": 120.5})
+    assert yaml.safe_load(text)["limits"] == {"worker_timeout_s": 120.5}
+    assert loads_config(text, tmp_path).limits.worker_timeout_s == 120.5
+    assert pilot.sha256_bytes(text.encode()) != ORIGINAL_RENDER_SHA256
+
+
+def test_main_uses_300_without_the_worker_timeout_flag_and_the_given_value_with_it(tmp_path, monkeypatch, capsys):
+    seen = {}
+
+    def fake_run_pilot(cfg, runner, **kw):
+        seen["cfg"] = cfg
+        return {"run_id": "r", "status": "complete", "resolved": False}
+
+    monkeypatch.setattr(pilot, "run_pilot", fake_run_pilot)
+    base = ["run", "--out", str(tmp_path / "out"), "--dataset-dir", str(tmp_path / "ds"), "--model", "m:1", "--allow-model-call"]
+    assert pilot.main(base) == 0 and seen["cfg"].worker_timeout_s == 300
+    assert pilot.main([*base, "--worker-timeout-s", "90"]) == 0 and seen["cfg"].worker_timeout_s == 90.0
+    capsys.readouterr()
+
+
+def test_the_driver_worker_timeout_bounds_agree_with_the_harness_config(tmp_path):
+    from smol_harness import config as harness_config
+
+    assert pilot.WORKER_TIMEOUT_S_MAX == harness_config.MAX_WORKER_TIMEOUT_S
+    (tmp_path / "ws").mkdir()
+
+    def config_accepts(value):
+        try:
+            harness_config.loads_config(pilot.render_config(tmp_path / "ws", {**RENDER_ARGS, "worker_timeout_s": value}), tmp_path)
+        except harness_config.ConfigError:
+            return False
+        return True
+
+    def driver_accepts(value):
+        try:
+            pilot.check_worker_timeout(value)
+        except pilot.PilotError:
+            return False
+        return True
+
+    top = pilot.WORKER_TIMEOUT_S_MAX
+    for value in (0, 0.0, 1e-9, 0.001, 1, 300, 86399.9, top, top + 0.001, top + 1, -1, -0.5):
+        assert driver_accepts(value) == config_accepts(value), value  # the two accept exactly the same values, on both sides of both bounds
+    assert driver_accepts(top) and driver_accepts(1e-9) and not driver_accepts(0) and not driver_accepts(top + 0.001)
+
+
+@pytest.mark.parametrize("value, fragment", [
+    (0, "worker_timeout_s must be a finite number > 0 and <= 86400, got 0"), (0.0, "got 0.0"), (-1, "got -1"), (86400.5, "got 86400.5"),
+    (float("inf"), "got inf"), (float("nan"), "got nan"),
+    (True, "worker_timeout_s must be a number of seconds"), (False, "worker_timeout_s must be a number of seconds"),
+    ("300", "worker_timeout_s must be a number of seconds, got str"), (None, "worker_timeout_s must be a number of seconds"),
+])
+def test_invalid_worker_timeouts_are_refused_before_anything_starts(dataset, tmp_path, value, fragment):
+    runner = FakeRunner()
+    record = pilot.run_pilot(cfg_for(dataset, tmp_path, worker_timeout_s=value), runner, agent_cmd=fake_agent())
+    assert record["status"] == "refused" and fragment in record["error"], record["error"]
+    assert record["agent"] is None and record["sandbox"] is None and record["model_identity"] is None and runner.calls == []  # no sandbox, no model query, no container
+    assert not (tmp_path / "out" / record["run_id"] / "agent" / "harness.yaml").exists()  # not even the harness YAML was written
+    assert record["classification"]["infrastructure_failure"] is True and record["classification"]["counts_as_coding_failure"] is False
+
+
+def test_a_worker_timeout_above_the_agent_timeout_is_refused_by_main_before_the_run_starts(tmp_path, monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(pilot, "run_pilot", lambda cfg, runner, **kw: calls.append(cfg) or {"run_id": "r", "status": "complete", "resolved": False})
+    base = ["run", "--out", str(tmp_path / "out"), "--dataset-dir", str(tmp_path / "ds"), "--model", "m:1", "--allow-model-call"]
+    assert pilot.main([*base, "--worker-timeout-s", "1800.5"]) == 2  # above the default agent timeout (1800)
+    assert "must not exceed the agent timeout" in capsys.readouterr().err
+    assert pilot.main([*base, "--agent-timeout-s", "100", "--worker-timeout-s", "100.5"]) == 2 and "must not exceed the agent timeout" in capsys.readouterr().err
+    for bad in ("0", "-5", "86401", "inf", "nan"):
+        assert pilot.main([*base, "--agent-timeout-s", "100000", "--worker-timeout-s", bad]) == 2 and "worker_timeout_s must be" in capsys.readouterr().err, bad
+    assert calls == []  # run_pilot, and with it the sandbox, the snapshot and the model, was never reached
+    assert pilot.main([*base, "--agent-timeout-s", "100", "--worker-timeout-s", "100"]) == 0 and calls[-1].worker_timeout_s == 100.0  # equal is allowed
+    capsys.readouterr()
+
+
+def test_the_boundary_worker_timeouts_are_accepted_by_the_early_check():
+    for worker, agent in ((1e-9, None), (0.5, None), (300, None), (86400, None), (86400.0, 86400.0), (1800, 1800.0), (299.9, 300)):
+        pilot.check_worker_timeout(worker, agent)  # does not raise
+    with pytest.raises(pilot.PilotError, match="must not exceed the agent timeout"):
+        pilot.check_worker_timeout(1800.1, 1800.0)
+
+
+@needs_patch
+@pytest.mark.parametrize("given, expected", [({}, 300), ({"worker_timeout_s": 45.5}, 45.5)])
+def test_run_json_config_and_the_harness_yaml_carry_the_worker_timeout_and_300_when_not_given(dataset, tmp_path, given, expected):
+    import yaml
+
+    record = pilot.run_pilot(cfg_for(dataset, tmp_path, **given), FakeRunner(), agent_cmd=fake_agent())
+    run_dir = tmp_path / "out" / record["run_id"]
+    saved = json.loads((run_dir / "run.json").read_text())
+    assert record["config"]["worker_timeout_s"] == expected and saved["config"]["worker_timeout_s"] == expected
+    assert yaml.safe_load((run_dir / "agent" / "harness.yaml").read_text())["limits"] == {"worker_timeout_s": expected}
+    assert saved["hashes"]["harness_yaml_sha256"] == pilot.sha256_file(run_dir / "agent" / "harness.yaml")
+
+
 # ---- the real harness through its public API, with a scripted model --------------------------------------------------------------
 @needs_patch
 def test_the_agent_phase_runs_the_real_harness_with_a_scripted_model_and_records_everything(dataset, spec, tmp_path, monkeypatch):
