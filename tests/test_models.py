@@ -104,6 +104,7 @@ def test_ollama_loader_arguments_are_exact(loader):
     build_model(ollama())
     assert loader.calls == [(OLLAMA_TAG, {
         "provider": "openai_compatible", "base_url": "http://127.0.0.1:11434/v1", "context_length": 8192,
+        "timeout": 60, "max_retries": 3,  # effGen's own defaults, now passed explicitly
     })]  # nothing about quantization, engine, dtype or devices: the server owns the weights
 
 
@@ -122,6 +123,44 @@ def test_ollama_endpoint_and_context_length_propagate(loader, url, ctx):
     build_model(ollama(url=url, ctx=ctx))
     _, kwargs = loader.calls[0]
     assert kwargs["base_url"] == url and kwargs["context_length"] == ctx
+
+
+def test_ollama_request_timeout_and_client_retries_default_to_effgens_own_values():
+    spec = ollama()
+    assert (spec.request_timeout_s, spec.client_max_retries) == (60, 3)
+    import inspect
+
+    params = inspect.signature(OpenAICompatibleAdapter.__init__).parameters  # the defaults the harness reproduces
+    assert (params["timeout"].default, params["max_retries"].default) == (60, 3)
+
+
+def test_ollama_default_loader_arguments_carry_timeout_60_and_max_retries_3(loader):
+    build_model(ollama())
+    _, kwargs = loader.calls[0]
+    assert kwargs["timeout"] == 60 and kwargs["max_retries"] == 3
+
+
+@pytest.mark.parametrize("timeout, retries", [(1, 0), (30, 1), (600, 10), (3600, 5)])
+def test_ollama_explicit_request_timeout_and_client_retries_pass_through(loader, timeout, retries):
+    build_model(ollama(request_timeout_s=timeout, client_max_retries=retries))
+    _, kwargs = loader.calls[0]
+    assert kwargs["timeout"] == timeout and kwargs["max_retries"] == retries
+    assert kwargs["base_url"] == DEFAULT_OLLAMA_URL and kwargs["context_length"] == 8192  # the rest is untouched
+
+
+def test_specs_that_differ_only_in_timeout_or_retries_do_not_share_a_cached_model(loader):
+    cache = ModelCache()
+    assert cache.get(ollama()) is not cache.get(ollama(request_timeout_s=300))
+    assert cache.get(ollama()) is not cache.get(ollama(client_max_retries=0))
+    assert cache.get(ollama()) is cache.get(ollama(request_timeout_s=60, client_max_retries=3))
+    assert len(loader.calls) == 3
+
+
+@pytest.mark.parametrize("over", [{"request_timeout_s": 61}, {"client_max_retries": 2}])
+def test_hf_spec_with_ollama_only_request_settings_is_refused_before_loading(loader, over):
+    with pytest.raises(ValueError, match="request_timeout_s / client_max_retries do not apply to hf models"):
+        build_model(ModelSpec("hf", HF_ID, "bnb-4bit-nf4", **over))
+    assert loader.calls == []
 
 
 # ---- 3-5: explicit quantization mapping --------------------------------------------------------------
@@ -518,7 +557,8 @@ def test_cpu_mode_does_not_need_cuda(loader, monkeypatch):
 def test_ollama_never_consults_cuda(loader, monkeypatch):
     monkeypatch.setattr(models_mod, "_cuda_available", lambda: (_ for _ in ()).throw(AssertionError("asked")))
     build_model(ollama())
-    assert loader.calls[0][1] == {"provider": "openai_compatible", "base_url": DEFAULT_OLLAMA_URL, "context_length": 8192}
+    assert loader.calls[0][1] == {"provider": "openai_compatible", "base_url": DEFAULT_OLLAMA_URL, "context_length": 8192,
+                                  "timeout": 60, "max_retries": 3}
 
 
 def test_cache_is_device_sensitive(loader):

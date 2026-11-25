@@ -136,6 +136,72 @@ class DelegateInputGuard(AgentMiddleware):
 class StructuredToolInputGuard(AgentMiddleware):
     """Reject concatenated or otherwise malformed JSON before structured tools validate it."""
 
+    @staticmethod
+    def _recover_edit_file_backslashes(text: str) -> str | None:
+        """Convert raw backslash sequences and literal control characters into valid JSON.
+
+        A model in React mode copies file text with single backslashes (e.g. \\x1b from the file
+        read back) directly into the JSON Action Input. Two problems make the result invalid JSON:
+        1. Raw backslash sequences (\\x, \\]) that JSON does not recognise → doubled to \\\\ so they
+           survive json.loads and reach the tool as literal backslashes, matching the file.
+        2. Literal C0 control characters (e.g. ESC = U+001B from the model interpreting \\x1b as an
+           escape byte) → escaped as \\uXXXX so json.loads accepts them and the tool can then report
+           the control character clearly (line 549 in tools.py names it in the refusal message).
+        """
+        chars: list[str] = []
+        i = 0
+        recovered = False
+        while i < len(text):
+            c = text[i]
+            # Literal C0 control characters other than TAB, LF, CR are invalid in JSON strings.
+            # Escape them as \\uXXXX so json.loads accepts the input; the tool will then see the
+            # control character in old_text or new_text and name it in a clear refusal message.
+            if c != "\\" and ord(c) < 0x20 and c not in "\t\n\r":
+                chars.append(f"\\u{ord(c):04x}")
+                recovered = True
+                i += 1
+                continue
+
+            if c != "\\":
+                chars.append(c)
+                i += 1
+                continue
+
+            if i + 1 >= len(text):
+                chars.append("\\\\")
+                recovered = True
+                i += 1
+                continue
+
+            following = text[i + 1]
+            if following in '"\\/bfnrt':
+                chars.append("\\")
+                chars.append(following)
+                i += 2
+                continue
+            if following == "u" and i + 6 <= len(text):
+                digits = text[i + 2:i + 6]
+                if len(digits) == 4 and all(c in "0123456789abcdefABCDEF" for c in digits):
+                    chars.append(text[i:i + 6])
+                    i += 6
+                    continue
+
+            chars.append("\\\\")
+            chars.append(following)
+            recovered = True
+            i += 2
+
+        if not recovered:
+            return None
+        candidate = "".join(chars)
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        return candidate
+
     def before_tool_call(self, ctx: Any) -> str | None:
         if ctx.tool_name not in STRUCTURED_TOOL_NAMES or not isinstance(ctx.tool_input, str):
             return None
@@ -144,6 +210,11 @@ class StructuredToolInputGuard(AgentMiddleware):
         try:
             json.loads(ctx.tool_input)
         except json.JSONDecodeError:
+            if ctx.tool_name == "edit_file":
+                recovered = self._recover_edit_file_backslashes(ctx.tool_input)
+                if recovered is not None:
+                    ctx.tool_input = recovered
+                    return None
             return (f"Error: the {ctx.tool_name} call was NOT run because its input was malformed JSON. "
                     "No file or command operation occurred. Retry with exactly one JSON object and no additional Action or Observation text.")
         return None

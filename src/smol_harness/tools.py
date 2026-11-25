@@ -80,9 +80,39 @@ class WorkspaceFileOperations(FileOperations):
     """
 
     executes_every_call = True  # a repeated read/write must reach the disk; see STATEFUL_TOOL_MARKER
+    LIST_LIMIT = 40
+    RESULT_CHAR_LIMIT = 6000
+
+    @classmethod
+    def _bounded_text(cls, text: str) -> str:
+        if len(text) <= cls.RESULT_CHAR_LIMIT:
+            return text
+        return text[:cls.RESULT_CHAR_LIMIT] + f"\n...[truncated; {len(text) - cls.RESULT_CHAR_LIMIT} more characters]"
 
     async def _execute(self, **kwargs: Any) -> dict[str, Any]:
         out = await super()._execute(**kwargs)
+        operation = kwargs.get("operation")
+        data = out.get("data")
+
+        if operation in {"read", "search"} and isinstance(data, str):
+            out = {**out, "data": self._bounded_text(data)}
+        elif operation in {"list", "search"} and isinstance(data, list):
+            compact = []
+            for item in data[:self.LIST_LIMIT]:
+                if isinstance(item, dict):
+                    compact.append({
+                        k: item[k]
+                        for k in ("path", "name", "type")
+                        if k in item
+                    })
+                else:
+                    compact.append(str(item)[:200])
+            if len(data) > self.LIST_LIMIT:
+                compact.append({"truncated": True, "omitted": len(data) - self.LIST_LIMIT})
+            out = {**out, "data": compact}
+        elif isinstance(data, str):
+            out = {**out, "data": self._bounded_text(data)}
+
         if kwargs.get("operation") == "write" and out.get("success") and isinstance(out.get("data"), str):
             try:
                 written = Path(out["data"])
@@ -364,9 +394,8 @@ class EditFileTool(BaseTool):
     MAX_FILE_BYTES = FileOperations.DEFAULT_MAX_FILE_SIZE  # the limit `file_operations` applies to reads
     MAX_TEXT_CHARS = 10_000  # effGen cuts any tool input at 10,000 characters anyway (audit Part 3, 2026-10-28)
     MAX_SHOWN_LINES = 5
-    # A tool call's JSON input that is not valid JSON (a file's `\x1b` copied with ONE backslash) never reaches this tool in a harness run:
-    # `StructuredToolInputGuard` (delegation.py) refuses it first. Called directly, a text with a real control character is refused below, and
-    # the refusal states what was found; how to write the call is the worker prompt's business, not this tool's (review P1-1).
+    # A harness call is normalized by `StructuredToolInputGuard` when raw backslashes represent file text.
+    # Called directly, a text with a real control character is refused below, and the refusal states what was found.
     _CONTROL_NAMES = {0x07: "BEL", 0x08: "BS", 0x0B: "VT", 0x0C: "FF", 0x1B: "ESC"}
     # The same mistake in `new_text` is worse than in `old_text`: the call would MATCH and the control character would be written into the
     # file, so `new_text` may not contain C0 control characters other than TAB, LF and CR. Escapes that decode to ordinary characters

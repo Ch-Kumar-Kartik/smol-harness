@@ -42,6 +42,11 @@ DEFAULT_MAX_REPORT_CHARS = 4000
 MAX_REPORT_CHARS_CEILING = 1_000_000
 DEFAULT_WORKER_TIMEOUT_S = 300.0
 MAX_WORKER_TIMEOUT_S = 86_400.0
+# ollama only: effGen's OpenAI-compatible adapter defaults (`timeout=60`, `max_retries=3`), so an omitted key reproduces them exactly.
+DEFAULT_REQUEST_TIMEOUT_S = 60
+MAX_REQUEST_TIMEOUT_S = 3600
+DEFAULT_CLIENT_MAX_RETRIES = 3
+MAX_CLIENT_MAX_RETRIES = 10
 
 
 class ConfigError(ValueError):
@@ -57,6 +62,10 @@ class ModelSpec:
     context_length: int | None = None  # ollama only (effGen cannot ask the server)
     dtype: str | None = None  # hf only: "bf16" | "fp16" | "fp32"; None = effGen's automatic choice (cuda only)
     device: str | None = None  # hf only: "cuda" (default) | "cpu"; always None for ollama
+    # ollama only: seconds one HTTP request may take, and how many times the OpenAI client retries it (it makes 1 + this many attempts
+    # per call; effGen's agent loop then repeats the whole call up to 3 times). Other providers must keep the defaults.
+    request_timeout_s: int = DEFAULT_REQUEST_TIMEOUT_S
+    client_max_retries: int = DEFAULT_CLIENT_MAX_RETRIES
 
     def __post_init__(self) -> None:
         if self.provider == "hf" and self.device is None:
@@ -216,7 +225,8 @@ def _model(value: Any, path: str) -> ModelSpec:
     if provider == "ollama":
         # context_length is required: effGen cannot ask Ollama for its window and would silently
         # assume 32768 (audit §1.5), which can be larger than the server really serves.
-        _keys(m, path, ("provider", "model", "context_length"), ("quantization", "base_url"))
+        _keys(m, path, ("provider", "model", "context_length"),
+              ("quantization", "base_url", "request_timeout_s", "client_max_retries"))
         quant = _quantization(m.get("quantization", "server"), provider, _join(path, "quantization"))
         url = m.get("base_url", DEFAULT_OLLAMA_URL)
         url_path = _join(path, "base_url")
@@ -226,6 +236,10 @@ def _model(value: Any, path: str) -> ModelSpec:
         return ModelSpec(
             provider, _text(m["model"], _join(path, "model"), "model id", no_space=True), quant, base_url=url,
             context_length=_int(m["context_length"], _join(path, "context_length"), 256, 10_000_000),
+            request_timeout_s=_int(m.get("request_timeout_s", DEFAULT_REQUEST_TIMEOUT_S), _join(path, "request_timeout_s"),
+                                   1, MAX_REQUEST_TIMEOUT_S),
+            client_max_retries=_int(m.get("client_max_retries", DEFAULT_CLIENT_MAX_RETRIES), _join(path, "client_max_retries"),
+                                    0, MAX_CLIENT_MAX_RETRIES),
         )
 
     # hf: quantization is required. If it were omitted effGen would pick 4/8-bit from free VRAM

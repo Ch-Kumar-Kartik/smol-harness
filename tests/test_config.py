@@ -181,6 +181,34 @@ def test_context_length_validated(value):
     bad(cfg(workers=[worker(model={**OLLAMA, "context_length": value})]), "context_length")
 
 
+def test_ollama_request_timeout_and_client_retries_default_to_60_and_3():
+    spec = parse_config(cfg(workers=[worker(model=OLLAMA)])).workers[0].model
+    assert (spec.request_timeout_s, spec.client_max_retries) == (60, 3)
+
+
+@pytest.mark.parametrize("timeout, retries", [(1, 0), (60, 3), (600, 10), (3600, 1)])
+def test_ollama_request_timeout_and_client_retries_are_read(timeout, retries):
+    spec = parse_config(cfg(workers=[worker(model={**OLLAMA, "request_timeout_s": timeout, "client_max_retries": retries})])).workers[0].model
+    assert (spec.request_timeout_s, spec.client_max_retries) == (timeout, retries)
+
+
+@pytest.mark.parametrize("value", [0, 3601, -1, True, False, "5", 1.5, 60.0, None])
+def test_request_timeout_s_validated(value):
+    msg = bad(cfg(workers=[worker(model={**OLLAMA, "request_timeout_s": value})]), "request_timeout_s")
+    assert msg.startswith("workers[0].model.request_timeout_s")
+
+
+@pytest.mark.parametrize("value", [-1, 11, 3601, True, False, "5", 1.5, 3.0, None])
+def test_client_max_retries_validated(value):
+    msg = bad(cfg(workers=[worker(model={**OLLAMA, "client_max_retries": value})]), "client_max_retries")
+    assert msg.startswith("workers[0].model.client_max_retries")
+
+
+@pytest.mark.parametrize("key", ["request_timeout_s", "client_max_retries"])
+def test_request_settings_are_rejected_for_hf_like_the_other_ollama_only_keys(key):
+    bad(cfg(workers=[worker(model={**HF_NF4, key: 5})]), f"unknown key {key!r}")
+
+
 @pytest.mark.parametrize("url", ["127.0.0.1:11434", "ftp://x/v1", "http://a b/v1", "", 5])
 def test_base_url_validated(url):
     bad(cfg(workers=[worker(model={**OLLAMA, "base_url": url})]), "base_url")
