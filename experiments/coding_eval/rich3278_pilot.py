@@ -47,6 +47,10 @@ MAX_CHANGED_FILES, MAX_PATCH_BYTES = 50, 2_000_000
 WORKER = "coder"
 # effGen's `AgentConfig.tool_calling_mode` values (smol_harness.harness.TOOL_CALLING_MODES; a test pins that they agree). "react" is the default and the only mode any recorded run used.
 TOOL_CALLING_MODES = ("auto", "native", "react", "hybrid")
+# The accepted ranges of the optional ollama model keys `request_timeout_s` and `client_max_retries` (smol_harness.config.MAX_REQUEST_TIMEOUT_S / MAX_CLIENT_MAX_RETRIES; a test pins that they agree).
+# Duplicated on purpose: the host side of this driver imports nothing from smol_harness (only the agent child does), and a bad value must be refused before any work starts.
+REQUEST_TIMEOUT_S_RANGE = (1, 3600)
+CLIENT_MAX_RETRIES_RANGE = (0, 10)
 # Added when edit_file was introduced (the file_operations write tool can only rewrite a whole file, which does not fit a small output limit).
 WORKER_PROMPT = ("You change code in a repository. Read the relevant file first with file_operations, then change it with edit_file: copy a short piece of the file exactly "
                  "as old_text (it must occur once) and give its replacement as new_text. Prefer the smallest replacement that avoids backslashes and control characters; "
@@ -718,6 +722,9 @@ def render_config(workspace: Path, a: dict) -> str:
     import yaml
 
     model = {"provider": a["provider"], "model": a["model"], "context_length": a["context_length"], "base_url": a["base_url"]}
+    for key in ("request_timeout_s", "client_max_retries"):  # only when given: an omitted key leaves the rendered YAML (and its hash) exactly as it was
+        if a.get(key) is not None:
+            model[key] = a[key]
     return yaml.safe_dump({
         "workspace": str(workspace),
         "limits": {"worker_timeout_s": a["worker_timeout_s"]},
@@ -1517,8 +1524,21 @@ class RunConfig:
     agent_sandbox: str = "bwrap"
     agent_image: str = "redis:7"
     tool_calling_mode: str = "react"  # how the agents' tool calls are read; recorded in run.json (config and provenance)
+    request_timeout_s: int | None = None  # None: not written to the harness YAML (the harness default, 60, applies); recorded in run.json config
+    client_max_retries: int | None = None  # None: not written to the harness YAML (the harness default, 3, applies); recorded in run.json config
     limits: ContainerLimits = ContainerLimits()
     sandbox_limits: SandboxLimits = SandboxLimits()
+
+
+def check_request_settings(request_timeout_s: object, client_max_retries: object) -> None:
+    """Refuse a value the harness config would refuse (None means not given). bool is an int subclass and is refused like any non-integer."""
+    for name, value, (lo, hi) in (("request_timeout_s", request_timeout_s, REQUEST_TIMEOUT_S_RANGE), ("client_max_retries", client_max_retries, CLIENT_MAX_RETRIES_RANGE)):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise PilotError(f"{name} must be an integer, got {type(value).__name__} ({value!r})")
+        if not lo <= value <= hi:
+            raise PilotError(f"{name} must be between {lo} and {hi}, got {value}")
 
 
 def check_out_dir(out: Path, dataset: Path) -> Path:
@@ -1546,6 +1566,7 @@ def run_pilot(cfg: RunConfig, runner, *, agent_cmd: list[str] | None = None) -> 
     try:
         if cfg.tool_calling_mode not in TOOL_CALLING_MODES:  # refused here, not as a harness error after the agent was started
             raise PilotError(f"unknown tool calling mode {cfg.tool_calling_mode!r}; choose one of {', '.join(TOOL_CALLING_MODES)}")
+        check_request_settings(cfg.request_timeout_s, cfg.client_max_retries)  # refused here too: before snapshot extraction, the sandbox check, the harness YAML, the model identity or any container (load_task has already read and hashed the snapshot)
         if sandboxed and cfg.agent_sandbox == "bwrap":
             problem = sandbox_problem(cfg.sandbox_limits)
             if problem:
@@ -1569,6 +1590,7 @@ def run_pilot(cfg: RunConfig, runner, *, agent_cmd: list[str] | None = None) -> 
         record["workspace_files"] = len(manifest(workspace))
         (agent_dir / "prompt.txt").write_text(build_prompt(spec))
         a = {"provider": cfg.provider, "model": cfg.model, "context_length": cfg.context_length, "base_url": f"http://127.0.0.1:{endpoint[1]}/v1" if sandboxed else cfg.base_url, "worker_timeout_s": cfg.worker_timeout_s, "max_iterations": cfg.max_iterations}
+        a.update({k: v for k, v in (("request_timeout_s", cfg.request_timeout_s), ("client_max_retries", cfg.client_max_retries)) if v is not None})  # only when given
         (agent_dir / "harness.yaml").write_text(render_config(workspace, a))
         record["hashes"] = {"prompt_sha256": sha256_file(agent_dir / "prompt.txt"), "harness_yaml_sha256": sha256_file(agent_dir / "harness.yaml"),
                             "worker_prompt_sha256": sha256_bytes(WORKER_PROMPT.encode()), "task_statement_sha256": sha256_bytes(spec.statement.encode())}
@@ -1679,6 +1701,12 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--agent-image", default="redis:7")
     r.add_argument("--tool-calling-mode", choices=list(TOOL_CALLING_MODES), default="react",
                    help="how the agents' tool calls are read (effGen tool_calling_mode); react is the default and the only mode any recorded run used")
+    r.add_argument("--request-timeout-s", type=int, default=None,
+                   help="seconds one HTTP request to the model endpoint may take (integer 1-3600); written as `request_timeout_s` into the orchestrator's and the worker's model block. "
+                        "Not given: the key is not written and the harness default (60) applies")
+    r.add_argument("--client-max-retries", type=int, default=None,
+                   help="how many times the OpenAI client retries a failed request (integer 0-10, so up to 1 + this many attempts per call); written as `client_max_retries` into the "
+                        "orchestrator's and the worker's model block. Not given: the key is not written and the harness default (3) applies. effGen's own outer retries are not affected")
     r.add_argument("--allow-model-call", action="store_true", help="required: confirms a real model may be called")
     e = sub.add_parser("evaluate", parents=[common], help="evaluate an existing candidate patch (no agent, no model)")
     e.add_argument("--out", type=Path, required=True)
@@ -1715,7 +1743,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise PilotError("refusing to call a model without --allow-model-call")
             rec = run_pilot(RunConfig(out, args.dataset_dir, args.task_id, None, args.provider, args.model, args.context_length, args.base_url, args.max_tokens, args.temperature,
                                       args.seed, args.max_iterations, 300, args.agent_timeout_s, args.keep_workspaces,
-                                      agent_sandbox=args.agent_sandbox, agent_image=args.agent_image, tool_calling_mode=args.tool_calling_mode), runner)
+                                      agent_sandbox=args.agent_sandbox, agent_image=args.agent_image, tool_calling_mode=args.tool_calling_mode,
+                                      request_timeout_s=args.request_timeout_s, client_max_retries=args.client_max_retries), runner)
             print(json.dumps({k: rec.get(k) for k in ("run_id", "status", "resolved")} | {"outcome": (rec.get("evaluation") or {}).get("outcome")}
                              | {k: (rec.get("classification") or {}).get(k) for k in ("attempt_outcome", "infrastructure_failure", "counts_as_coding_failure")}))
             if rec["status"] != "complete":
