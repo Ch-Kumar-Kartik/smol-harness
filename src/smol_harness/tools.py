@@ -16,11 +16,9 @@ import errno
 import hashlib
 import math
 import os
-import platform
 import re
 import secrets
 import shlex
-import shutil
 import stat
 import tempfile
 import time
@@ -33,6 +31,7 @@ from effgen.tools.base_tool import BaseTool, ParameterSpec, ParameterType, ToolC
 from effgen.tools.builtin.file_ops import FileOperations
 
 from smol_harness.delegation import DELEGATE_TOOL_NAME, STATEFUL_TOOL_MARKER, remaining_worker_seconds
+from smol_harness.platform import OS_NAME, shell_unavailable_reason
 
 
 class ToolBuildError(ValueError):
@@ -142,16 +141,15 @@ def _file_operations(workspace: Path) -> BaseTool:
 
 
 def require_shell_host() -> None:
-    """Fail closed unless this host can run effGen's Linux-namespace sandbox (checked statically)."""
-    if platform.system() != "Linux":
-        # effGen's SubprocessSandbox returns an *unsandboxed* `bash -c` plan off Linux, and
-        # DockerSandbox does not mount the workspace, so neither is usable (audit §1.9, T4.2).
-        raise ToolBuildError(f"tool 'shell' needs Linux (found {platform.system()!r}): effGen's subprocess "
-                             "sandbox provides no isolation elsewhere. On Windows, run the harness inside WSL2 "
-                             "(not tested).")
-    missing = [b for b in ("bash", "unshare", "timeout") if shutil.which(b) is None]
-    if missing:
-        raise ToolBuildError(f"tool 'shell' needs {', '.join(missing)} on PATH (bash, util-linux unshare, GNU timeout)")
+    """Fail closed unless this host can run effGen's Linux-namespace sandbox (checked statically).
+
+    Uses :func:`smol_harness.platform.shell_unavailable_reason`, which auto-detects the OS
+    and reports why the shell cannot be enforced (Windows: needs WSL2; non-Linux: no
+    isolation; Linux: missing ``bash``/``unshare``/``timeout``).
+    """
+    reason = shell_unavailable_reason()
+    if reason is not None:
+        raise ToolBuildError(f"tool 'shell' needs Linux (found {OS_NAME!r}): {reason}")
 
 
 # effGen's network namespace does not stop *pathname* Unix sockets, which are reached through the filesystem
@@ -403,7 +401,9 @@ class EditFileTool(BaseTool):
 
     def __init__(self, workspace: Path | str) -> None:
         if not (hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY") and os.open in os.supports_dir_fd and os.rename in os.supports_dir_fd and os.unlink in os.supports_dir_fd):
-            raise ToolBuildError("edit_file needs POSIX file APIs (O_NOFOLLOW and directory file descriptors) and is unavailable on this platform")
+            raise ToolBuildError(
+                f"edit_file needs POSIX file APIs (O_NOFOLLOW and directory file descriptors) and is unavailable on {OS_NAME!r}"
+            )
         self._workspace = resolve_workspace(workspace)
         super().__init__(metadata=ToolMetadata(
             name="edit_file",

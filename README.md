@@ -60,7 +60,7 @@ Required:
 
 - Python 3.12 (the project pins `>=3.12,<3.13`).
 - [uv](https://docs.astral.sh/uv/) for environment and dependency management.
-- Linux, if you want the `shell` tool (see below).
+- The OS is auto-detected at start-up (`smol_harness.platform`): the `shell` tool is only available on Linux with `bash`, `unshare` and GNU `timeout`; on Windows and macOS it is refused with a clear message. The `file_operations` tool and the scripted tests are not Linux specific.
 - Disk space and bandwidth for the locked environment. `uv sync --locked` installs effGen with PyTorch and the NVIDIA wheels, a multi-gigabyte download.
 
 Optional, depending on the backends you configure:
@@ -69,7 +69,7 @@ Optional, depending on the backends you configure:
 - **Hugging Face backend:** model weights downloadable or cached locally. With `device: cuda` (the default) an NVIDIA GPU with a working CUDA PyTorch is required; the harness does not fall back to CPU. With `device: cpu`, only `quantization: none` is accepted and an explicit `dtype` is required.
 - **4-bit and 8-bit quantization:** `bitsandbytes` and a CUDA GPU. `bitsandbytes` is not in the lock file; install a pinned version yourself if you need it. (The old RTX 4070 package that did this is historical and not an active target.)
 
-Native Windows is not supported for the `shell` tool: building it there fails closed with an error. The `file_operations` tool and the scripted tests are not Linux specific, but nothing in this repository has been verified on Windows or WSL2 for the shell.
+Native Windows is not supported for the `shell` tool: building it there fails closed with an error (run the harness inside WSL2 for the shell; not tested). The `file_operations` tool and the scripted tests are not Linux specific, but nothing in this repository has been verified on native Windows or WSL2.
 
 ## Installation
 
